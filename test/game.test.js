@@ -25,6 +25,15 @@ function join(game, name) {
   return player;
 }
 
+/** Поставить жильца вплотную к объекту текущей сцены (как будто он туда дошёл). */
+function walkTo(game, p, test) {
+  const o = game.sceneOf(p).objects.find(test);
+  assert.ok(o, 'такой объект есть в сцене');
+  p.pos = { x: o.spot.x, y: o.spot.y, d: 'up' };
+  return o;
+}
+const type = (t) => (o) => o.type === t;
+
 test('новосёл получает пустую квартиру на первом жилом этаже', () => {
   const { game } = makeWorld();
   const a = join(game, 'Иван');
@@ -52,40 +61,107 @@ test('квартира погибшего достаётся следующем�
   assert.equal(b.apartment.number, a.apartment.number);
 });
 
-test('поездка на лифте занимает время, сломанный лифт — застревание', () => {
+test('путь в столовую: к двери, в коридор, к лифту, вниз, к двери столовой', () => {
   const { game, advance } = makeWorld();
   const p = join(game, 'Иван');
-  assert.equal(game.move(p, { place: 'canteen' }).ok, true);
+  const canteenFloor = C.FACILITIES.canteen.floor;
+
+  walkTo(game, p, type('bed'));
+  assert.equal(game.move(p, { place: 'corridor' }).ok, false, 'от кровати в коридор не выйти');
+  walkTo(game, p, type('hermodoor'));
+  assert.equal(game.move(p, { place: 'corridor' }).ok, true);
+  assert.equal(game.locationKey(p), `corridor:${p.apartment.floor}`);
+  const door = game.sceneOf(p).objects.find((o) => o.type === 'apt' && o.number === p.apartment.number);
+  assert.ok(Math.hypot(p.pos.x - door.spot.x, p.pos.y - door.spot.y) < 0.01, 'вышел у своей двери');
+
+  assert.equal(game.move(p, { place: 'canteen' }).ok, false, 'столовая на другом этаже');
+  assert.equal(game.move(p, { place: 'corridor', floor: canteenFloor }).ok, false, 'надо подойти к лифту');
+  walkTo(game, p, type('lift'));
+  assert.equal(game.move(p, { place: 'corridor', floor: p.apartment.floor }).ok, false, 'уже на этом этаже');
+  assert.equal(game.move(p, { place: 'corridor', floor: canteenFloor }).ok, true);
   assert.equal(p.location.place, 'lift');
+
   game.admin('breakdown', { key: 'lift', broken: true });
   advance(10000);
   assert.equal(p.location.place, 'lift');
-  assert.equal(p.travel.stuck, true);
+  assert.equal(p.travel.stuck, true, 'застрял');
   game.admin('breakdown', { key: 'lift', broken: false });
   advance(10000);
+  assert.equal(game.locationKey(p), `corridor:${canteenFloor}`);
+
+  walkTo(game, p, (o) => o.type === 'facility' && o.facility === 'canteen');
+  assert.equal(game.move(p, { place: 'canteen' }).ok, true);
   assert.equal(p.location.place, 'canteen');
-  assert.equal(p.location.floor, C.FACILITIES.canteen.floor);
+  walkTo(game, p, type('exit'));
+  assert.equal(game.move(p, { place: 'corridor' }).ok, true);
+  assert.equal(game.locationKey(p), `corridor:${canteenFloor}`);
 });
 
-test('без лифта — по лестнице, это стоит сил; с переломом ноги нельзя', () => {
+test('лестница стоит сил; сломанный лифт не везёт; с переломом ноги по лестнице нельзя', () => {
   const { game } = makeWorld();
   const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
   game.admin('breakdown', { key: 'lift', broken: true });
+  walkTo(game, p, type('lift'));
+  assert.equal(game.move(p, { place: 'corridor', floor: 96, via: 'lift' }).ok, false);
+  assert.equal(game.move(p, { place: 'corridor', floor: 96, via: 'stairs' }).ok, false, 'лестница в другом конце коридора');
+  walkTo(game, p, type('stairs'));
   const before = p.stats.energy;
-  assert.equal(game.move(p, { place: 'factory' }).ok, true);
+  assert.equal(game.move(p, { place: 'corridor', floor: 96, via: 'stairs' }).ok, true);
   assert.equal(p.travel.via, 'stairs');
   assert.ok(p.stats.energy < before);
 
   const q = join(game, 'Пётр');
+  game.admin('teleport', { id: q.id, place: 'corridor', floor: 101 });
+  walkTo(game, q, type('stairs'));
   game.addCondition(q, 'leg');
-  const res = game.move(q, { place: 'factory' });
-  assert.equal(res.ok, false);
+  assert.equal(game.move(q, { place: 'corridor', floor: 96, via: 'stairs' }).ok, false);
+});
+
+test('домой — только с своего этажа и от своей двери; задраенная дверь не выпускает', () => {
+  const { game } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 102 });
+  assert.equal(game.move(p, { place: 'home' }).ok, false);
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  walkTo(game, p, (o) => o.type === 'apt' && o.number !== p.apartment.number);
+  assert.equal(game.move(p, { place: 'home' }).ok, false, 'чужая дверь');
+  walkTo(game, p, (o) => o.type === 'apt' && o.number === p.apartment.number);
+  assert.equal(game.move(p, { place: 'home' }).ok, true);
+  walkTo(game, p, type('hermodoor'));
+  assert.equal(game.seal(p, true).ok, true);
+  assert.equal(game.move(p, { place: 'corridor' }).ok, false);
+  assert.equal(game.seal(p, false).ok, true);
+  assert.equal(game.move(p, { place: 'corridor' }).ok, true);
+});
+
+test('движение: сквозь стены и прыжками ходить нельзя', () => {
+  const { game, clock } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  const start = { ...p.pos };
+  clock.t += 100;
+  assert.equal(game.setPos(p, start.x + 0.4, start.y, 'right'), true, 'обычный шаг');
+  clock.t += 100;
+  assert.equal(game.setPos(p, start.x + 0.4, 0.5, 'up'), false, 'в стену');
+  clock.t += 100;
+  assert.equal(game.setPos(p, start.x + 15, start.y, 'right'), false, 'телепорт');
+  assert.equal(game.setPos(p, 'abc', 1, 'up'), false);
+  // за секунду можно уйти на несколько клеток
+  for (let i = 1; i <= 10; i++) {
+    clock.t += 100;
+    assert.equal(game.setPos(p, start.x + 0.4 + i * 0.4, start.y, 'right'), true, `шаг ${i}`);
+  }
 });
 
 test('работа: смена тратит силы, правильные ответы дают талоны', () => {
   const { game, clock } = makeWorld();
   const p = join(game, 'Иван');
   game.admin('teleport', { id: p.id, place: 'factory' });
+  assert.equal(game.workStart(p, 'sort').ok, false, 'надо подойти к станку');
+  walkTo(game, p, (o) => o.type === 'station' && o.game === 'meter');
+  assert.equal(game.workStart(p, 'sort').ok, false, 'это другой станок');
+  walkTo(game, p, (o) => o.type === 'station' && o.game === 'sort');
   const energy = p.stats.energy;
   const res = game.workStart(p, 'sort');
   assert.equal(res.ok, true);
@@ -102,6 +178,7 @@ test('работа недоступна со сломанной рукой и п
   const { game } = makeWorld();
   const p = join(game, 'Иван');
   game.admin('teleport', { id: p.id, place: 'factory' });
+  walkTo(game, p, (o) => o.type === 'station' && o.game === 'sort');
   game.addCondition(p, 'arm');
   assert.equal(game.workStart(p, 'sort').ok, false);
   game.cureCondition(p, 'arm');
@@ -113,7 +190,11 @@ test('столовая: покупка за талоны; после кражи 
   const { game } = makeWorld();
   const p = join(game, 'Иван');
   game.admin('teleport', { id: p.id, place: 'canteen' });
-  assert.equal(game.buy(p, 'canteen', 'bread').ok, false); // нет денег
+  p.money = 20;
+  assert.equal(game.buy(p, 'canteen', 'bread').ok, false, 'надо подойти к раздаче');
+  walkTo(game, p, type('counter'));
+  p.money = 0;
+  assert.equal(game.buy(p, 'canteen', 'bread').ok, false, 'нет денег');
   p.money = 20;
   assert.equal(game.buy(p, 'canteen', 'bread').ok, true);
   assert.equal(p.inventory.bread, 1);
@@ -132,6 +213,7 @@ test('туман: снаружи калечит, за задраенной ге�
   const outside = join(game, 'Снаружи');
   const inside = join(game, 'Внутри');
   game.admin('teleport', { id: outside.id, place: 'corridor', floor: outside.apartment.floor });
+  walkTo(game, inside, type('hermodoor'));
   assert.equal(game.seal(inside, true).ok, true);
   game.admin('fog', { from: 100, to: 110, warnSec: 5, durationMin: 6, intensity: 1 });
   advance(5000);
@@ -201,9 +283,65 @@ test('обмен: подарок сразу, обмен — после согл�
   assert.equal(a.inventory.bread, 1);
   assert.equal(b.inventory.bread, 1);
 
-  game.admin('teleport', { id: b.id, place: 'canteen' });
-  assert.equal(game.tradeOffer(a, b.id, { money: 1 }, {}).ok, false, 'не рядом');
   assert.equal(game.tradeOffer(a, b.id, { money: 100 }, {}).ok, false, 'нет денег');
+  walkTo(game, b, type('stairs'));
+  assert.equal(game.tradeOffer(a, b.id, { money: 1 }, {}).ok, false, 'далеко в коридоре');
+  game.admin('teleport', { id: b.id, place: 'canteen' });
+  assert.equal(game.tradeOffer(a, b.id, { money: 1 }, {}).ok, false, 'вообще в другом месте');
+});
+
+test('стук в дверь слышит хозяин, если он дома', () => {
+  const { game, clock } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  const notes = [];
+  game.on('notify', (n) => notes.push(n));
+  game.admin('teleport', { id: a.id, place: 'corridor', floor: 101 });
+  assert.equal(game.knock(a, b.apartment.number).ok, false, 'надо подойти');
+  walkTo(game, a, (o) => o.type === 'apt' && o.number === b.apartment.number);
+  const res = game.knock(a, b.apartment.number);
+  assert.equal(res.ok, true);
+  assert.ok(notes.some((n) => n.to.includes(b.id) && n.title === 'Стук в дверь'));
+  assert.equal(game.knock(a, b.apartment.number).ok, false, 'не так часто');
+  clock.t += 4000;
+  game.admin('teleport', { id: b.id, place: 'canteen' });
+  assert.match(game.knock(a, b.apartment.number).message, /нет дома/);
+});
+
+test('мусоропровод: иногда находка, потом пауза', () => {
+  const { game, clock } = makeWorld({ random: () => 0.1 });
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  walkTo(game, p, type('chute'));
+  assert.equal(game.searchChute(p).ok, true);
+  assert.equal(p.inventory.rusk, 1);
+  assert.equal(game.searchChute(p).ok, false, 'надо подождать');
+  clock.t += 6 * 60000;
+  assert.equal(game.searchChute(p).ok, true);
+});
+
+test('доска объявлений показывает сообщения радиоточки', () => {
+  const { game } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('announce', { text: 'Завтра отключат воду.' });
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  assert.equal(game.readBoard(p).ok, false);
+  walkTo(game, p, type('board'));
+  const res = game.readBoard(p);
+  assert.equal(res.ok, true);
+  assert.equal(res.notes[0].text, 'Завтра отключат воду.');
+});
+
+test('сон — у кровати; ушедший из игры засыпает у себя в кровати', () => {
+  const { game } = makeWorld();
+  const p = join(game, 'Иван');
+  assert.equal(game.sleep(p, true).ok, false);
+  walkTo(game, p, type('bed'));
+  assert.equal(game.sleep(p, true).ok, true);
+  game.admin('teleport', { id: p.id, place: 'factory' });
+  game.setOnline(p.id, false);
+  assert.equal(p.location.place, 'home');
+  assert.ok(game.nearTo(p, type('bed')), 'лежит у кровати');
 });
 
 test('админ: несчастный случай, смерть и воскрешение', () => {

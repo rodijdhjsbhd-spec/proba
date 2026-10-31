@@ -16,7 +16,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
-const { Game } = require('./game');
+const { Game, WORLD_CONFIG } = require('./game');
 const storage = require('./storage');
 const { BALANCE, ITEMS } = require('./content');
 
@@ -120,7 +120,8 @@ function bind(ws, player) {
   clearTimeout(offlineTimers.get(player.id));
   offlineTimers.delete(player.id);
   game.setOnline(player.id, true);
-  send(ws, { t: 'welcome', id: player.id, token: player.token, catalog: ITEM_CATALOG });
+  send(ws, { t: 'welcome', id: player.id, token: player.token, catalog: ITEM_CATALOG, world: WORLD_CONFIG });
+  lastActors.delete(player.id);
   send(ws, { t: 'chat_history', ...game.chatHistory(player) });
   pushView(player.id);
 }
@@ -200,6 +201,9 @@ game.on('log', (entry) => {
 // ---- игроки ----
 const PLAYER_ACTIONS = {
   move: (p, a) => game.move(p, a),
+  knock: (p, a) => game.knock(p, a.apt),
+  search: (p) => game.searchChute(p),
+  board: (p) => game.readBoard(p),
   seal: (p, a) => game.seal(p, a.on),
   sleep: (p, a) => game.sleep(p, a.on),
   use: (p, a) => game.useItem(p, a.item),
@@ -240,6 +244,16 @@ playerWss.on('connection', (ws) => {
         return;
       }
       bind(ws, res.player);
+      return;
+    }
+
+    if (msg.t === 'pos') {
+      const p = ws.playerId ? game.getPlayer(ws.playerId) : null;
+      if (!p) return;
+      const now = Date.now();
+      if (now - (ws.lastPosAt || 0) < 30) return;
+      ws.lastPosAt = now;
+      if (!game.setPos(p, msg.x, msg.y, msg.d)) send(ws, { t: 'pos_fix', x: p.pos.x, y: p.pos.y, seq: p.posSeq });
       return;
     }
 
@@ -339,6 +353,28 @@ setInterval(() => {
     for (const ws of admins) send(ws, { t: 'snapshot', snapshot });
   }
 }, BALANCE.tickMs);
+
+// Кто где стоит — рассылаем каждому жильцу состав его сцены (только если что-то изменилось).
+const lastActors = new Map(); // playerId → подпись последней отправки
+setInterval(() => {
+  const byScene = new Map();
+  for (const [id] of socketsByPlayer) {
+    const p = game.getPlayer(id);
+    if (!p || !p.alive) continue;
+    const key = game.locationKey(p);
+    if (!byScene.has(key)) byScene.set(key, []);
+    byScene.get(key).push(id);
+  }
+  for (const [key, ids] of byScene) {
+    const actors = game.sceneActors(key);
+    const sig = key + JSON.stringify(actors);
+    for (const id of ids) {
+      if (lastActors.get(id) === sig) continue;
+      lastActors.set(id, sig);
+      sendToPlayer(id, { t: 'actors', key, actors });
+    }
+  }
+}, 100);
 
 function persist() {
   try {

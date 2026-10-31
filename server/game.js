@@ -15,6 +15,7 @@ const { EventEmitter } = require('events');
 const crypto = require('crypto');
 const C = require('./content');
 const MG = require('./minigames');
+const World = require('../public/shared/world.js');
 
 const B = C.BALANCE;
 const STAT_KEYS = ['health', 'hunger', 'energy', 'sanity'];
@@ -27,6 +28,14 @@ const toInt = (v, def = 0) => {
   return Number.isFinite(n) ? n : def;
 };
 const newId = (prefix) => `${prefix}_${crypto.randomBytes(5).toString('hex')}`;
+
+/** Настройки карт мира — одинаковые для сервера и браузера (отдаются клиенту при входе). */
+const WORLD_CONFIG = {
+  firstResidentialFloor: C.BUILDING.firstResidentialFloor,
+  facilities: Object.fromEntries(Object.entries(C.FACILITIES).map(([k, v]) => [k, v.floor])),
+  facilityNames: Object.fromEntries(Object.entries(C.FACILITIES).map(([k, v]) => [k, v.name])),
+};
+const SEARCH_COOLDOWN_MS = 5 * 60000;
 
 function sanitizeText(raw, max) {
   return String(raw ?? '')
@@ -84,7 +93,14 @@ class Game extends EventEmitter {
     this.lastChatAt = new Map();
     this.localChat = new Map(); // key → последние сообщения (только в памяти)
     this.byToken = new Map();
-    for (const p of Object.values(this.state.players)) this.byToken.set(p.token, p.id);
+    this.map = World.create(WORLD_CONFIG);
+    this.lastKnock = new Map();
+    for (const p of Object.values(this.state.players)) {
+      this.byToken.set(p.token, p.id);
+      const scene = this.sceneOf(p);
+      if (!p.pos || !World.canStand(scene, p.pos.x, p.pos.y)) p.pos = { ...this.map.spawn(scene.key), d: 'down' };
+      p.posSeq = p.posSeq || 1;
+    }
   }
 
   static normalize(state) {
@@ -146,8 +162,8 @@ class Game extends EventEmitter {
       if (p.job) p.job = null;
       if (p.location.place !== 'home') {
         p.travel = null;
-        p.location = { place: 'home', floor: p.apartment.floor };
         p.sealed = false;
+        this.relocate(p, { place: 'home', floor: p.apartment.floor }, 'bed');
       }
       p.sleeping = !this.hasCondition(p, 'insomnia');
     }
@@ -270,6 +286,73 @@ class Game extends EventEmitter {
     return this.alivePlayers().filter((q) => q.id !== p.id && this.isOnline(q.id) && this.locationKey(q) === key);
   }
 
+  sceneOf(p) {
+    return this.map.scene(this.locationKey(p));
+  }
+
+  /** Перенести жильца в другое место (сцену) — он появится у нужного входа. */
+  relocate(p, location, entry = 'default') {
+    p.location = { place: location.place, floor: location.floor };
+    p.pos = { ...this.map.spawn(this.locationKey(p), entry), d: 'down' };
+    p.posSeq = (p.posSeq || 0) + 1;
+    p.posAt = this.now();
+    p.moveBudget = 1;
+  }
+
+  /** Объект сцены рядом с жильцом, подходящий под условие (или null). */
+  nearTo(p, test) {
+    return this.sceneOf(p).objects.find((o) => test(o) && World.nearObject(o, p.pos)) || null;
+  }
+
+  distance(a, b) {
+    return Math.hypot(a.pos.x - b.pos.x, a.pos.y - b.pos.y);
+  }
+
+  /**
+   * Клиент сообщает, куда дошёл жилец. Сервер проверяет стены и скорость
+   * («бюджет» шагов копится со временем, поэтому пачка сообщений не страшна).
+   * Возвращает false, если шаг невозможен — тогда клиенту отправят поправку.
+   */
+  setPos(p, x, y, dir) {
+    if (!p.alive) return false;
+    x = Number(x);
+    y = Number(y);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+    const now = this.now();
+    const dt = Math.min(2000, Math.max(0, now - (p.posAt || 0)));
+    p.posAt = now;
+    p.moveBudget = Math.min(2.5, (p.moveBudget || 0) + World.SPEED * 1.5 * (dt / 1000));
+    const dist = Math.hypot(x - p.pos.x, y - p.pos.y);
+    if (dist > p.moveBudget + 0.3 || !World.canStand(this.sceneOf(p), x, y)) return false;
+    p.moveBudget = Math.max(0, p.moveBudget - dist);
+    p.pos = { x: Math.round(x * 100) / 100, y: Math.round(y * 100) / 100, d: ['up', 'down', 'left', 'right'].includes(dir) ? dir : p.pos.d };
+    if (dist > 0.01) {
+      p.movedAt = now;
+      if (p.sleeping && dist > 0.1) p.sleeping = false;
+    }
+    return true;
+  }
+
+  /** Кого видно в сцене: живые жильцы в сети. */
+  sceneActors(key) {
+    const now = this.now();
+    return this.alivePlayers()
+      .filter((p) => this.isOnline(p.id) && this.locationKey(p) === key)
+      .map((p) => ({
+        id: p.id,
+        name: p.name,
+        apt: p.apartment.number,
+        x: p.pos.x,
+        y: p.pos.y,
+        d: p.pos.d,
+        m: now - (p.movedAt || 0) < 300,
+        sick: p.conditions.some((c) => C.CONDITIONS[c.id]?.kind === 'disease'),
+        hurt: p.conditions.some((c) => C.CONDITIONS[c.id]?.kind === 'injury'),
+        sleep: !!p.sleeping,
+        mask: this.hasItem(p, 'gasmask') && this.inFog(p.location.floor),
+      }));
+  }
+
   isDark(floor) {
     const pw = this.world.power;
     return !!pw && floor >= pw.from && floor <= pw.to;
@@ -332,6 +415,8 @@ class Game extends EventEmitter {
       inventory: {},
       gasmaskCharge: 100,
       location: { place: 'home', floor: apartment.floor },
+      pos: { ...this.map.spawn(`home:${apartment.number}`, 'default'), d: 'up' },
+      posSeq: 1,
       travel: null,
       sealed: false,
       sleeping: false,
@@ -523,54 +608,81 @@ class Game extends EventEmitter {
   // =========================================================================
   // Перемещение
   // =========================================================================
+  /**
+   * Перемещение между сценами. Всё — только «ногами»: надо стоять у нужной двери.
+   *   { place: 'home' }                       — войти к себе (у своей двери в коридоре)
+   *   { place: 'canteen'|'medpost'|'factory' } — войти в учреждение (у его двери в коридоре)
+   *   { place: 'corridor' }                   — выйти в коридор (у двери квартиры/учреждения)
+   *   { place: 'corridor', floor, via }       — поехать на лифте (via: 'lift') или пойти по лестнице ('stairs')
+   */
   move(p, dest = {}) {
     if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
     if (p.travel) return { ok: false, error: p.travel.stuck ? 'Вы застряли в лифте.' : 'Вы уже в пути.' };
     const place = dest.place;
     if (!MOVE_PLACES.includes(place)) return { ok: false, error: 'Туда не пройти.' };
+    const here = p.location;
+    const fail = (error) => ({ ok: false, error });
 
-    let floor;
-    if (place === 'home') floor = p.apartment.floor;
-    else if (place === 'corridor') floor = dest.floor == null ? p.location.floor : toInt(dest.floor, -1);
-    else floor = C.FACILITIES[place].floor;
-    if (floor < C.BUILDING.minFloor || floor > C.BUILDING.maxFloor) {
-      return { ok: false, error: `Этажи — с ${C.BUILDING.minFloor} по ${C.BUILDING.maxFloor}.` };
+    let target;
+    let entry;
+    if (place === 'corridor' && here.place === 'corridor') {
+      const floor = toInt(dest.floor, -1);
+      if (floor < C.BUILDING.minFloor || floor > C.BUILDING.maxFloor) return fail(`Этажи — с ${C.BUILDING.minFloor} по ${C.BUILDING.maxFloor}.`);
+      if (floor === here.floor) return fail('Вы и так на этом этаже.');
+      const via = dest.via === 'stairs' ? 'stairs' : 'lift';
+      if (!this.nearTo(p, (o) => o.type === via)) return fail(via === 'lift' ? 'Подойдите к лифту.' : 'Подойдите к лестнице.');
+      if (via === 'lift' && this.world.breakdowns.lift) return fail('Лифт не работает. Только по лестнице.');
+      return this.startTravel(p, floor, via);
     }
-    if (p.location.place === place && p.location.floor === floor) return { ok: false, error: 'Вы уже здесь.' };
-
-    const from = p.location.floor;
-    const diff = Math.abs(floor - from);
-    const liftWorks = !this.world.breakdowns.lift;
-    const via = diff === 0 ? 'walk' : dest.via === 'stairs' || !liftWorks ? 'stairs' : 'lift';
-
-    if (via === 'stairs') {
-      if (this.hasBlock(p, 'stairs')) {
-        return { ok: false, error: 'С переломом ноги по лестнице не пройти. Ждите лифт или лечитесь.' };
-      }
-      const cost = diff * B.stairsEnergyPerFloor;
-      if (p.stats.energy < cost) {
-        return { ok: false, error: `Не хватит сил на ${diff} эт. по лестнице (нужно ${Math.ceil(cost)} сил).` };
-      }
-      p.stats.energy -= cost;
+    if (place === 'corridor') {
+      if (!['home', ...Object.keys(C.FACILITIES)].includes(here.place)) return fail('Отсюда в коридор не выйти.');
+      if (!this.nearTo(p, (o) => o.type === 'exit' || o.type === 'hermodoor')) return fail('Подойдите к двери.');
+      if (here.place === 'home' && p.sealed) return fail('Гермодверь задраена. Сначала откройте её.');
+      target = { place: 'corridor', floor: here.floor };
+      entry = here.place === 'home' ? `apt:${p.apartment.number}` : 'facility';
+    } else if (place === 'home') {
+      if (here.place !== 'corridor' || here.floor !== p.apartment.floor) return fail(`Ваша квартира — на ${p.apartment.floor} этаже.`);
+      if (!this.nearTo(p, (o) => o.type === 'apt' && o.number === p.apartment.number)) return fail('Подойдите к своей двери.');
+      target = { place: 'home', floor: p.apartment.floor };
+      entry = 'default';
+    } else {
+      const fac = C.FACILITIES[place];
+      if (here.place !== 'corridor' || here.floor !== fac.floor) return fail(`${fac.name} — на ${fac.floor} этаже.`);
+      if (!this.nearTo(p, (o) => o.type === 'facility' && o.facility === place)) return fail('Подойдите к двери.');
+      target = { place, floor: fac.floor };
+      entry = 'default';
     }
 
-    // уходим
+    const witnesses = this.leaveScene(p);
+    this.relocate(p, target, entry);
+    this.dirty([...witnesses, ...this.othersAt(p)].map((q) => q.id));
+    return { ok: true };
+  }
+
+  /** Общее для любого ухода из сцены: просыпаемся, бросаем смену. */
+  leaveScene(p) {
     p.sleeping = false;
     if (p.job) {
       p.job = null;
       this.journal(p, 'Вы ушли со смены, не закончив её.', 'warn');
     }
-    if (p.location.place === 'home' && p.sealed) p.sealed = false;
-    const witnesses = this.othersAt(p);
+    return this.othersAt(p);
+  }
 
-    if (via === 'walk') {
-      p.location = { place, floor };
-    } else {
-      const sec = via === 'lift' ? B.liftBaseSec + diff * B.liftSecPerFloor : diff * B.stairsSecPerFloor;
-      const now = this.now();
-      p.travel = { via, toPlace: place, toFloor: floor, fromFloor: from, startedAt: now, arriveAt: now + sec * 1000 };
-      p.location = { place: via, floor: from };
+  startTravel(p, floor, via) {
+    const from = p.location.floor;
+    const diff = Math.abs(floor - from);
+    if (via === 'stairs') {
+      if (this.hasBlock(p, 'stairs')) return { ok: false, error: 'С переломом ноги по лестнице не пройти. Ждите лифт или лечитесь.' };
+      const cost = diff * B.stairsEnergyPerFloor;
+      if (p.stats.energy < cost) return { ok: false, error: `Не хватит сил на ${diff} эт. по лестнице (нужно ${Math.ceil(cost)} сил).` };
+      p.stats.energy -= cost;
     }
+    const witnesses = this.leaveScene(p);
+    const sec = via === 'lift' ? B.liftBaseSec + diff * B.liftSecPerFloor : diff * B.stairsSecPerFloor;
+    const now = this.now();
+    p.travel = { via, toPlace: 'corridor', toFloor: floor, fromFloor: from, startedAt: now, arriveAt: now + sec * 1000 };
+    this.relocate(p, { place: via, floor: from });
     this.dirty([...witnesses, ...this.othersAt(p)].map((q) => q.id));
     return { ok: true };
   }
@@ -596,8 +708,9 @@ class Game extends EventEmitter {
   arrive(p) {
     const t = p.travel;
     p.travel = null;
-    p.location = { place: t.toPlace, floor: t.toFloor };
-    this.dirty([p.id, ...this.othersAt(p).map((q) => q.id)]);
+    const witnesses = this.othersAt(p);
+    this.relocate(p, { place: t.toPlace, floor: t.toFloor }, t.via);
+    this.dirty([p.id, ...witnesses.map((q) => q.id), ...this.othersAt(p).map((q) => q.id)]);
   }
 
   // =========================================================================
@@ -606,6 +719,7 @@ class Game extends EventEmitter {
   seal(p, on) {
     if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
     if (p.location.place !== 'home') return { ok: false, error: 'Гермодверь есть только у вас дома.' };
+    if (!this.nearTo(p, (o) => o.type === 'hermodoor')) return { ok: false, error: 'Подойдите к гермодвери.' };
     p.sealed = !!on;
     this.journal(p, on ? 'Вы задраили гермодверь.' : 'Вы открыли гермодверь.');
     return { ok: true };
@@ -615,6 +729,7 @@ class Game extends EventEmitter {
     if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
     if (on) {
       if (p.location.place !== 'home') return { ok: false, error: 'Спать можно только дома.' };
+      if (!this.nearTo(p, (o) => o.type === 'bed')) return { ok: false, error: 'Подойдите к кровати.' };
       if (this.hasCondition(p, 'insomnia')) return { ok: false, error: 'Бессонница. Глаза не закрываются.' };
     }
     p.sleeping = !!on;
@@ -651,6 +766,52 @@ class Game extends EventEmitter {
   }
 
   // =========================================================================
+  // Коридор: стук в дверь, мусоропровод, доска объявлений
+  // =========================================================================
+  knock(p, number) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    const door = this.nearTo(p, (o) => o.type === 'apt' && o.number === String(number));
+    if (!door) return { ok: false, error: 'Подойдите к двери.' };
+    if (door.number === p.apartment.number) return { ok: false, error: 'Это ваша дверь.' };
+    const now = this.now();
+    if (now - (this.lastKnock.get(p.id) || 0) < 3000) return { ok: false, error: 'Не так часто.' };
+    this.lastKnock.set(p.id, now);
+    const owner = this.alivePlayers().find((q) => q.apartment.number === door.number);
+    if (owner && this.isOnline(owner.id) && owner.location.place === 'home') {
+      this.notify([owner], { title: 'Стук в дверь', text: `В глазок видно: ${p.name} из кв. ${p.apartment.number}.`, style: 'knock', journal: false });
+      return { ok: true, message: 'Вы постучали. За дверью кто-то шевелится.' };
+    }
+    return { ok: true, message: owner ? 'Тишина. Похоже, хозяина нет дома.' : 'Тишина. Квартира пустует.' };
+  }
+
+  searchChute(p) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (!this.nearTo(p, (o) => o.type === 'chute')) return { ok: false, error: 'Подойдите к мусоропроводу.' };
+    const now = this.now();
+    const wait = (p.searchedAt || 0) + SEARCH_COOLDOWN_MS - now;
+    if (wait > 0) return { ok: false, error: `Здесь вы уже рылись. Загляните через ${Math.ceil(wait / 60000)} мин.` };
+    p.searchedAt = now;
+    const roll = this.random();
+    let found = null;
+    if (roll < 0.2) found = 'rusk';
+    else if (roll < 0.3) found = 'bulb';
+    else if (roll < 0.38) found = 'fork';
+    if (found) {
+      this.addItem(p, found, 1);
+      this.journal(p, `В мусоропроводе нашлось: ${C.ITEMS[found].name}.`, 'good');
+      return { ok: true, message: `Среди очистков нашлось: ${C.ITEMS[found].name}.` };
+    }
+    this.journal(p, 'Вы порылись в мусоропроводе. Только запах.');
+    return { ok: true, message: 'Ничего, кроме запаха.' };
+  }
+
+  readBoard(p) {
+    if (!this.nearTo(p, (o) => o.type === 'board')) return { ok: false, error: 'Подойдите к доске объявлений.' };
+    const notes = this.state.chatGlobal.filter((m) => m.from?.system).slice(-8).reverse().map((m) => ({ ts: m.ts, from: m.from.name, text: m.text }));
+    return { ok: true, notes };
+  }
+
+  // =========================================================================
   // Магазины: столовая и медпункт
   // =========================================================================
   shopEntries(shopId) {
@@ -664,6 +825,7 @@ class Game extends EventEmitter {
     if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
     if (!C.SHOPS[shopId]) return { ok: false, error: 'Такого места нет.' };
     if (p.location.place !== shopId) return { ok: false, error: 'Вы не там.' };
+    if (!this.nearTo(p, (o) => o.shop === shopId)) return { ok: false, error: shopId === 'canteen' ? 'Подойдите к раздаче.' : 'Подойдите к окошку фельдшера.' };
     const status = this.facilityStatus(shopId);
     if (!status.open) return { ok: false, error: status.reason };
     const entry = this.shopEntries(shopId).find((e) => e.key === key);
@@ -693,6 +855,8 @@ class Game extends EventEmitter {
     const status = this.facilityStatus('factory');
     if (!status.open) return { ok: false, error: status.reason };
     if (p.job) return { ok: false, error: 'Вы уже на смене.' };
+    if (!MG.GAMES[gameId]) return { ok: false, error: 'Такой работы нет.' };
+    if (!this.nearTo(p, (o) => o.type === 'station' && o.game === gameId)) return { ok: false, error: 'Подойдите к рабочему месту.' };
     if (this.hasBlock(p, 'work')) return { ok: false, error: 'С такой травмой мастер к станку не допустит.' };
     if (p.stats.energy < B.workEnergyCost) return { ok: false, error: 'Нет сил работать. Поспите.' };
     const job = MG.createJob(gameId);
@@ -816,6 +980,7 @@ class Game extends EventEmitter {
     const q = this.getPlayer(toId);
     if (!q || !q.alive || q.id === p.id) return { ok: false, error: 'Некому предлагать.' };
     if (!this.isOnline(q.id) || this.locationKey(q) !== this.locationKey(p)) return { ok: false, error: 'Этого жильца нет рядом.' };
+    if (this.distance(p, q) > 3) return { ok: false, error: `Подойдите ближе к ${q.name}.` };
     const give = this.normalizeBundle(rawGive);
     const want = this.normalizeBundle(rawWant);
     if (this.bundleEmpty(give) && this.bundleEmpty(want)) return { ok: false, error: 'Пустой обмен.' };
@@ -859,6 +1024,7 @@ class Game extends EventEmitter {
     if (!a.alive || !this.isOnline(a.id) || this.locationKey(a) !== this.locationKey(b)) {
       return { ok: false, error: `${a.name} уже ушёл.` };
     }
+    if (this.distance(a, b) > 3) return { ok: false, error: `Подойдите ближе к ${a.name}.` };
     if (!this.hasBundle(a, t.give)) return { ok: false, error: `У ${a.name} уже нет обещанного.` };
     if (!this.hasBundle(b, t.want)) return { ok: false, error: 'У вас нет того, что просят.' };
     this.moveBundle(a, b, t.give);
@@ -1195,7 +1361,8 @@ const ADMIN_COMMANDS = {
     p.diedAt = null;
     p.conditions = [];
     p.stats = { health: 50, hunger: 50, energy: 50, sanity: 40 };
-    p.location = { place: 'home', floor: p.apartment.floor };
+    p.travel = null;
+    this.relocate(p, { place: 'home', floor: p.apartment.floor }, 'bed');
     this.notify([p], { title: 'Вы очнулись', text: `Вы лежите у себя в кв. ${p.apartment.number}. Вы не помните, как здесь оказались.`, style: 'whisper' });
     this.log(`${p.name} воскрешён`, 'admin', p.id);
     this.systemChat(`Жилец ${p.name} снова замечен в коридорах. Не задавайте ему вопросов.`);
@@ -1211,7 +1378,7 @@ const ADMIN_COMMANDS = {
     p.job = null;
     p.sealed = false;
     p.sleeping = false;
-    p.location = { place, floor: f };
+    this.relocate(p, { place, floor: f });
     this.notify([p], { title: 'Провал в памяти', text: `Вы моргнули — и оказались здесь: ${this.placeTitle(p)}.`, style: 'whisper' });
     this.log(`${p.name} перемещён: ${this.placeTitle(p)}`, 'admin', p.id);
   },
@@ -1331,15 +1498,20 @@ Game.prototype.playerView = function playerView(p) {
     })),
     gasmaskCharge: Math.round(p.gasmaskCharge),
     location: { ...p.location, title: this.placeTitle(p) },
+    pos: p.pos,
+    posSeq: p.posSeq,
     travel: p.travel
       ? {
           via: p.travel.via,
           toPlace: p.travel.toPlace,
           toFloor: p.travel.toFloor,
+          fromFloor: p.travel.fromFloor,
           stuck: !!p.travel.stuck,
           etaMs: p.travel.stuck ? null : Math.max(0, p.travel.arriveAt - now),
+          totalMs: p.travel.arriveAt - p.travel.startedAt,
         }
       : null,
+    searchInSec: Math.max(0, Math.ceil(((p.searchedAt || 0) + SEARCH_COOLDOWN_MS - now) / 1000)),
     sealed: p.sealed,
     sleeping: p.sleeping,
     conditions: p.conditions.map((c) => ({
@@ -1411,23 +1583,26 @@ Game.prototype.describePlace = function describePlace(p) {
     apt: q.apartment.number,
     symptoms: q.conditions.map((c) => C.CONDITIONS[c.id]?.symptom).filter(Boolean),
   }));
-  const here = { place: l.place, floor: l.floor, title: this.placeTitle(p), text: '', people, shop: null, residents: null, closed: null };
+  const here = { key: this.locationKey(p), place: l.place, floor: l.floor, title: this.placeTitle(p), text: '', people, shop: null, residents: null, closed: null };
 
   switch (l.place) {
     case 'home':
       here.text = `Ваша квартира. Голые бетонные стены, продавленная кровать, радиоточка бормочет о перевыполнении плана. Гермодверь ${p.sealed ? 'задраена' : 'открыта'}.${p.sleeping ? ' Вы спите.' : ''}`;
       break;
     case 'corridor': {
-      here.text = dark
-        ? `Коридор ${l.floor} этажа. Темно, хоть глаз выколи. Где-то капает.`
-        : `Коридор ${l.floor} этажа. Лампы дневного света гудят и мигают. Пахнет сыростью и чужим ужином.`;
+      const kind = this.map.floorKind(l.floor);
+      if (dark) here.text = `Коридор ${l.floor} этажа. Темно, хоть глаз выколи. Где-то капает.`;
+      else if (kind === 'technical') here.text = `Технический этаж ${l.floor}. Голый бетон, трубы под потолком, запертые двери. Здесь никто не живёт — и, кажется, давно.`;
+      else if (kind === 'service') here.text = `Служебный этаж ${l.floor}. Двери подсобок заперты. Табличка у двустворчатой двери: «${C.FACILITIES[this.map.facilityByFloor[l.floor]].name}».`;
+      else here.text = `Коридор ${l.floor} этажа. Лампы дневного света гудят и мигают. Пахнет сыростью и чужим ужином.`;
+      here.floorKind = kind;
       const residents = [];
       for (let i = 1; i <= C.BUILDING.apartmentsPerFloor; i++) {
         const number = `${l.floor}${String(i).padStart(2, '0')}`;
         const r = this.alivePlayers().find((q) => q.apartment.number === number);
         residents.push({ number, name: r ? r.name : null, online: r ? this.isOnline(r.id) : false, you: r?.id === p.id });
       }
-      here.residents = residents;
+      if (kind === 'residential') here.residents = residents;
       break;
     }
     case 'canteen':
@@ -1521,4 +1696,4 @@ Game.prototype.adminContent = function adminContent() {
   };
 };
 
-module.exports = { Game, freshState, sanitizeName, sanitizeText, ADMIN_COMMANDS };
+module.exports = { Game, freshState, sanitizeName, sanitizeText, ADMIN_COMMANDS, WORLD_CONFIG };

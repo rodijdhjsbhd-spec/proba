@@ -21,7 +21,7 @@ const BUILDING = {
 // Общие помещения. floor — где они находятся (важно для лестницы и тумана).
 const FACILITIES = {
   canteen: { name: 'Столовая №3', floor: 100 },
-  medpost: { name: 'Медпункт', floor: 104 },
+  medpost: { name: 'Медпункт', floor: 98 },
   factory: { name: 'Цех №4', floor: 96 },
 };
 

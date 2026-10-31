@@ -1,7 +1,7 @@
 'use strict';
 
-/* Клиент Гигахрущёвки. Сервер — источник правды: клиент только рисует
-   присланный «вид» (view) и отправляет действия (act). */
+/* Клиент Гигахрущёвки. Сервер — источник правды: клиент рисует мир,
+   двигает своего жильца (сервер проверяет стены и скорость) и отправляет действия. */
 (() => {
   // ---------------------------------------------------------------------------
   // Утилиты
@@ -35,14 +35,8 @@
     },
   };
 
-  const plural = (n, one, few, many) => {
-    const a = Math.abs(n) % 100, b = a % 10;
-    if (a > 10 && a < 20) return many;
-    if (b > 1 && b < 5) return few;
-    if (b === 1) return one;
-    return many;
-  };
   const fmtSec = (s) => (s >= 60 ? `${Math.floor(s / 60)} мин ${String(s % 60).padStart(2, '0')} с` : `${s} с`);
+  const isTyping = () => ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName);
 
   // ---------------------------------------------------------------------------
   // Состояние клиента
@@ -52,6 +46,22 @@
     token: store.get('gh_token'),
     view: null,
     catalog: {},
+    map: null, // World.create(...) — карты мира
+    scene: null,
+    sceneKey: null,
+    posSeq: null,
+    me: null, // { x, y, d, m } — своя позиция (двигаем локально)
+    lastSent: { x: 0, y: 0, d: '', t: 0 },
+    path: null,
+    pathEnd: null,
+    onArrive: null,
+    stuckFor: 0,
+    keys: new Set(),
+    actors: new Map(),
+    bubbles: new Map(),
+    hover: null,
+    near: null,
+    sheet: null, // { kind, obj }
     chat: { local: [], global: [] },
     tab: 'local',
     unread: { local: 0, global: 0 },
@@ -62,6 +72,12 @@
     sound: store.get('gh_sound') !== 'off',
     retry: 0,
   };
+
+  const renderer = new Renderer($('#view'));
+  new ResizeObserver(([entry]) => {
+    const r = entry.contentRect;
+    renderer.resize(Math.max(1, Math.round(r.width)), Math.max(1, Math.round(r.height)));
+  }).observe($('#stage'));
 
   // ---------------------------------------------------------------------------
   // Связь
@@ -92,7 +108,7 @@
     if (S.ws && S.ws.readyState === WebSocket.OPEN) S.ws.send(JSON.stringify(msg));
   }
 
-  /** Действие игрока. Ошибку показываем тостом, если не попросили молчать. */
+  /** Действие жильца. Ошибку показываем тостом, если не попросили молчать. */
   function act(action, args = {}, { quiet = false } = {}) {
     return new Promise((resolve) => {
       const id = ++S.reqId;
@@ -118,12 +134,27 @@
       case 'welcome':
         S.token = msg.token;
         S.catalog = msg.catalog || {};
+        S.map = World.create(msg.world);
+        S.sceneKey = null;
         store.set('gh_token', msg.token);
         $('#register').hidden = true;
         break;
       case 'view':
         S.view = msg.view;
+        S.viewAt = performance.now();
+        syncScene();
         render();
+        break;
+      case 'actors':
+        if (msg.key === S.sceneKey) updateActors(msg.actors);
+        break;
+      case 'pos_fix':
+        if (S.me && msg.seq === S.posSeq) {
+          S.me.x = msg.x;
+          S.me.y = msg.y;
+          S.path = null;
+          S.lastSent = { x: msg.x, y: msg.y, d: S.me.d, t: performance.now() };
+        }
         break;
       case 'chat_history':
         S.chat.global = msg.global || [];
@@ -147,6 +178,517 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Сцена и соседи
+  // ---------------------------------------------------------------------------
+  function syncScene() {
+    const v = S.view;
+    if (!S.map || !v || !v.you.alive) return;
+    const key = v.here.key;
+    if (key !== S.sceneKey) {
+      S.scene = S.map.scene(key);
+      renderer.setScene(S.scene);
+      S.actors.clear();
+      S.hover = null;
+      if (S.sheet && S.sheet.kind !== 'work') closeSheet();
+    }
+    if (key !== S.sceneKey || v.you.posSeq !== S.posSeq) {
+      S.sceneKey = key;
+      S.posSeq = v.you.posSeq;
+      S.me = { x: v.you.pos.x, y: v.you.pos.y, d: v.you.pos.d || 'down', m: false };
+      S.lastSent = { x: S.me.x, y: S.me.y, d: S.me.d, t: performance.now() };
+      S.path = null;
+      S.pathEnd = null;
+      S.onArrive = null;
+    }
+  }
+
+  function updateActors(list) {
+    const myId = S.view && S.view.you.id;
+    const seen = new Set();
+    for (const a of list) {
+      if (a.id === myId) continue;
+      seen.add(a.id);
+      const cur = S.actors.get(a.id);
+      if (cur) Object.assign(cur, { tx: a.x, ty: a.y, d: a.d, m: a.m, sick: a.sick, hurt: a.hurt, sleep: a.sleep, mask: a.mask, name: a.name, apt: a.apt });
+      else S.actors.set(a.id, { ...a, tx: a.x, ty: a.y, look: lookFor(a.id), phase: Math.random() * 6 });
+    }
+    for (const id of [...S.actors.keys()]) if (!seen.has(id)) S.actors.delete(id);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Движение
+  // ---------------------------------------------------------------------------
+  const MOVE_KEYS = {
+    KeyW: [0, -1], ArrowUp: [0, -1],
+    KeyS: [0, 1], ArrowDown: [0, 1],
+    KeyA: [-1, 0], ArrowLeft: [-1, 0],
+    KeyD: [1, 0], ArrowRight: [1, 0],
+  };
+
+  function canControl() {
+    return S.view && S.view.you.alive && !isTyping() && $('#modal').hidden && !(S.job && S.job.state === 'playing');
+  }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.code === 'Escape' && S.sheet && S.sheet.kind !== 'work') {
+      closeSheet();
+      return;
+    }
+    if (!canControl()) return;
+    if (MOVE_KEYS[e.code]) {
+      S.keys.add(e.code);
+      e.preventDefault();
+    } else if (e.code === 'KeyE') {
+      e.preventDefault();
+      const info = S.near && objectInfo(S.near);
+      if (info && info.actions[0]) info.actions[0].run();
+    } else if (e.code === 'Enter') {
+      e.preventDefault();
+      $('#chat-input').focus();
+    }
+  });
+  document.addEventListener('keyup', (e) => S.keys.delete(e.code));
+  window.addEventListener('blur', () => S.keys.clear());
+
+  function walkTo(dest, onArrive) {
+    if (!S.scene || !S.me) return false;
+    const path = World.findPath(S.scene, S.me, dest);
+    if (!path) return false;
+    if (!path.length) {
+      // уже стоим на месте
+      S.path = null;
+      S.pathEnd = null;
+      S.onArrive = null;
+      if (onArrive) onArrive();
+      return true;
+    }
+    S.path = path;
+    S.pathEnd = { x: dest.x, y: dest.y };
+    S.onArrive = onArrive || null;
+    S.stuckFor = 0;
+    return true;
+  }
+
+  function stepMovement(dt) {
+    const me = S.me;
+    let vx = 0, vy = 0;
+    if (canControl()) for (const code of S.keys) {
+      vx += MOVE_KEYS[code][0];
+      vy += MOVE_KEYS[code][1];
+    }
+    if (vx || vy) {
+      S.path = null;
+      S.pathEnd = null;
+      S.onArrive = null;
+    } else if (S.path && S.path.length) {
+      const p0 = S.path[0];
+      const dx = p0.x - me.x, dy = p0.y - me.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist < 0.08) {
+        S.path.shift();
+        if (!S.path.length) {
+          S.path = null;
+          S.pathEnd = null;
+          const cb = S.onArrive;
+          S.onArrive = null;
+          if (cb) cb();
+        }
+      } else {
+        vx = dx / dist;
+        vy = dy / dist;
+      }
+    }
+    if (vx || vy) {
+      const len = Math.hypot(vx, vy);
+      vx /= len;
+      vy /= len;
+      const step = World.SPEED * dt;
+      const ox = me.x, oy = me.y;
+      const nx = me.x + vx * step;
+      if (World.canStand(S.scene, nx, me.y)) me.x = nx;
+      const ny = me.y + vy * step;
+      if (World.canStand(S.scene, me.x, ny)) me.y = ny;
+      me.d = Math.abs(vx) > Math.abs(vy) ? (vx > 0 ? 'right' : 'left') : vy > 0 ? 'down' : 'up';
+      me.m = Math.hypot(me.x - ox, me.y - oy) > 0.001;
+      if (S.path && !me.m && (S.stuckFor += dt) > 0.6) {
+        S.path = null;
+        S.pathEnd = null;
+        S.onArrive = null;
+      }
+    } else {
+      me.m = false;
+    }
+    // отправляем позицию не чаще ~11 раз в секунду
+    const now = performance.now();
+    const moved = Math.hypot(me.x - S.lastSent.x, me.y - S.lastSent.y) > 0.02 || me.d !== S.lastSent.d;
+    if (moved && now - S.lastSent.t >= 90) {
+      send({ t: 'pos', x: Math.round(me.x * 100) / 100, y: Math.round(me.y * 100) / 100, d: me.d });
+      S.lastSent = { x: me.x, y: me.y, d: me.d, t: now };
+    }
+    // закрываем панель, если отошли от предмета
+    if (S.sheet && S.sheet.obj && S.sheet.kind !== 'work' && World.distToObject(S.sheet.obj, me.x, me.y) > World.REACH + 1.2) closeSheet();
+  }
+
+  function stepActors(dt) {
+    const k = Math.min(1, dt * 12);
+    for (const a of S.actors.values()) {
+      const dist = Math.hypot(a.tx - a.x, a.ty - a.y);
+      if (dist > 3) {
+        a.x = a.tx;
+        a.y = a.ty;
+      } else {
+        a.x += (a.tx - a.x) * k;
+        a.y += (a.ty - a.y) * k;
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Предметы и двери: что с ними можно сделать
+  // ---------------------------------------------------------------------------
+  const FLAVOR = {
+    window: () => (fogHere() ? 'За стеклом — сплошная белая муть. Она шевелится.' : 'За окном — стена соседнего корпуса. В окнах напротив кто-то тоже смотрит в окно.'),
+    poster: 'Плакат выцвел, но буквы ещё видно. Кто-то пририсовал усы.',
+    menu: 'Меню: суп дня, чай, хлеб, кисель, сухари, тушёнка. Мелом приписано: «Ложки — свои!»',
+    jobboard: 'Наряды на смену. Вашей фамилии нет — значит, берите любой.',
+    clock: 'Часы идут. Иногда — назад.',
+    machine: 'Станок горячий. Лучше не трогать.',
+    conveyor: 'Конвейер уходит в стену и выходит из противоположной. Что он везёт — непонятно.',
+    cabinet: 'Шкаф с лекарствами. На замке.',
+    couch: 'Холодная клеёнчатая кушетка.',
+    wardrobe: 'В шкафу пусто. Пахнет нафталином.',
+    stove: 'Плитка на две конфорки. Одна не работает.',
+    sink: 'Из крана капает ржавая вода.',
+    table: 'На столе — кружка и крошки.',
+    dtable: 'Клеёнка липкая.',
+    hose: 'Пожарный кран. Рукава нет.',
+    radiator: 'Батарея чуть тёплая.',
+    liftpanel: 'Кнопки затёрты до блеска.',
+  };
+
+  function residents() {
+    const map = {};
+    for (const r of S.view?.here?.residents || []) map[r.number] = r;
+    return map;
+  }
+
+  function fogHere() {
+    const f = S.view?.world.fog;
+    return !!(f && f.phase === 'active' && f.affectsYou);
+  }
+
+  function say(text) {
+    toast({ text, style: 'info' });
+  }
+
+  /** Подпись и действия для предмета. null — с предметом ничего не сделать. */
+  function objectInfo(o) {
+    const v = S.view;
+    if (!v) return null;
+    const you = v.you;
+    switch (o.type) {
+      case 'apt': {
+        if (o.number === you.apartment.number) return { label: `Кв. ${o.number}`, sub: 'ваша квартира', actions: [{ label: 'Войти домой', run: () => act('move', { place: 'home' }) }] };
+        const r = residents()[o.number];
+        return {
+          label: `Кв. ${o.number}`,
+          sub: r && r.name ? r.name : 'пустует',
+          actions: [{ label: 'Постучать', run: async () => { const res = await act('knock', { apt: o.number }); if (res.ok) say(res.message); } }],
+        };
+      }
+      case 'locked':
+        return { label: 'Служебная дверь', actions: [{ label: 'Подёргать ручку', run: () => say('Заперто. За дверью что-то ровно гудит.') }] };
+      case 'lift':
+        return { label: 'Лифт', sub: v.world.lift.broken ? 'не работает' : `${v.here.floor} этаж`, actions: [{ label: 'Вызвать лифт', run: () => openTravel('lift', o) }] };
+      case 'stairs':
+        return { label: 'Лестница', actions: [{ label: 'Пойти по лестнице', run: () => openTravel('stairs', o) }] };
+      case 'facility': {
+        const f = v.facilities[o.facility];
+        return { label: f.name, sub: f.open ? 'открыто' : 'закрыто', actions: [{ label: 'Войти', run: () => act('move', { place: o.facility }) }] };
+      }
+      case 'board':
+        return { label: 'Доска объявлений', actions: [{ label: 'Читать', run: () => openBoard(o) }] };
+      case 'chute':
+        return {
+          label: 'Мусоропровод',
+          sub: you.searchInSec ? `рылись недавно · ${fmtSec(you.searchInSec)}` : null,
+          actions: [{ label: 'Порыться', run: async () => { const res = await act('search'); if (res.ok) say(res.message); } }],
+        };
+      case 'exit':
+        return { label: 'Выход', actions: [{ label: 'Выйти в коридор', run: () => act('move', { place: 'corridor' }) }] };
+      case 'hermodoor': {
+        if (you.sealed) return { label: 'Гермодверь', sub: 'задраена', actions: [{ label: 'Открыть гермодверь', run: () => act('seal', { on: false }) }] };
+        const out = { label: 'Выйти в коридор', run: () => act('move', { place: 'corridor' }) };
+        const seal = { label: 'Задраить гермодверь', run: () => act('seal', { on: true }) };
+        const danger = v.world.fog && v.world.fog.affectsYou;
+        return { label: 'Гермодверь', sub: 'открыта', actions: danger ? [seal, out] : [out, seal] };
+      }
+      case 'bed':
+        return you.sleeping
+          ? { label: 'Кровать', actions: [{ label: 'Встать', run: () => act('sleep', { on: false }) }] }
+          : { label: 'Кровать', actions: [{ label: 'Лечь спать', run: () => act('sleep', { on: true }) }] };
+      case 'radio':
+        return {
+          label: 'Радиоточка',
+          actions: [{ label: 'Слушать', run: () => { selectTab('global'); say('Радиоточка хрипит голосом диктора. Новости дома — во вкладке «Весь дом».'); } }],
+        };
+      case 'counter':
+        return { label: 'Раздача', sub: v.facilities.canteen.open ? null : 'закрыто', actions: [{ label: 'Подойти к раздаче', run: () => openShop('canteen', o) }] };
+      case 'window_med':
+        return { label: 'Окошко фельдшера', sub: v.facilities.medpost.open ? null : 'закрыто', actions: [{ label: 'Постучать в окошко', run: () => openShop('medpost', o) }] };
+      case 'station': {
+        const job = (v.here.jobs || []).find((j) => j.id === o.game);
+        return { label: o.label, sub: v.facilities.factory.open ? null : 'цех стоит', actions: [{ label: `Взять наряд: ${job ? job.name : o.game}`, run: () => startWork(o.game) }] };
+      }
+      default: {
+        const f = FLAVOR[o.type];
+        if (!f) return null;
+        return { label: o.label || 'Предмет', actions: [{ label: 'Осмотреть', run: () => say(typeof f === 'function' ? f() : f) }] };
+      }
+    }
+  }
+
+  /** Ближайший предмет, с которым можно что-то сделать (без декора). */
+  function nearestObject() {
+    if (!S.scene || !S.me) return null;
+    let best = null, bestD = Infinity;
+    for (const o of S.scene.objects) {
+      if (o.decor || !o.spot) continue;
+      const d = World.distToObject(o, S.me.x, S.me.y);
+      if (d <= World.REACH && d < bestD) {
+        best = o;
+        bestD = d;
+      }
+    }
+    return best;
+  }
+
+  function renderPrompt() {
+    const o = S.view && S.view.you.travel ? null : nearestObject();
+    S.near = o;
+    const info = o && objectInfo(o);
+    const sig = info ? `${o.id}|${info.label}|${info.sub}|${info.actions.map((a) => a.label).join('/')}` : 'none';
+    if (S.memo.prompt === sig) return;
+    S.memo.prompt = sig;
+    const box = $('#prompt');
+    if (!info) {
+      box.replaceChildren(h('span', { class: 'idle', text: S.view?.you.travel ? '' : 'Подойдите к двери или предмету.' }));
+      return;
+    }
+    box.replaceChildren(
+      h('span', { class: 'label' }, info.label, info.sub ? h('small', { text: ` · ${info.sub}` }) : null),
+      ...info.actions.map((a, i) =>
+        h('button', { class: `btn small ${i === 0 ? 'primary' : ''}`, onclick: () => a.run() }, i === 0 ? h('kbd', { text: 'E' }) : null, a.label),
+      ),
+    );
+  }
+
+  // клики по сцене
+  const canvas = $('#view');
+  function worldPoint(e) {
+    const r = canvas.getBoundingClientRect();
+    return renderer.toWorld(e.clientX - r.left, e.clientY - r.top);
+  }
+
+  function actorAt(pt) {
+    for (const a of S.actors.values()) {
+      if (Math.abs(a.x - pt.x) < 0.35 && pt.y < a.y + 0.15 && pt.y > a.y - 1.25) return a;
+    }
+    return null;
+  }
+
+  canvas.addEventListener('pointerdown', (e) => {
+    if (!S.view || !S.view.you.alive || !S.scene || !S.me) return;
+    unlockAudio();
+    const pt = worldPoint(e);
+    const a = actorAt(pt);
+    if (a) {
+      const person = { id: a.id, name: a.name, apt: a.apt };
+      if (Math.hypot(a.x - S.me.x, a.y - S.me.y) <= 2.5) openTrade(person);
+      else walkTo({ x: a.x, y: a.y }, () => openTrade(person));
+      return;
+    }
+    const o = renderer.objectAt(pt);
+    const info = o && objectInfo(o);
+    if (o && info && info.actions[0]) {
+      if (o.spot && World.distToObject(o, S.me.x, S.me.y) > World.REACH) {
+        walkTo(o.spot, () => info.actions[0] && objectInfo(o).actions[0].run());
+      } else {
+        info.actions[0].run();
+      }
+      return;
+    }
+    if (!walkTo(pt) && o && o.spot) walkTo(o.spot);
+  });
+
+  canvas.addEventListener('pointermove', (e) => {
+    if (!S.scene) return;
+    const pt = worldPoint(e);
+    const o = renderer.objectAt(pt);
+    S.hover = o && objectInfo(o) ? o : null;
+    canvas.classList.toggle('pointer', !!(S.hover || actorAt(pt)));
+  });
+  canvas.addEventListener('pointerleave', () => (S.hover = null));
+
+  // ---------------------------------------------------------------------------
+  // Панели поверх сцены
+  // ---------------------------------------------------------------------------
+  function openSheet(kind, title, obj) {
+    S.sheet = { kind, obj: obj || null };
+    S.memo.sheet = null;
+    const sheet = $('#sheet');
+    sheet.className = `sheet ${kind}`;
+    sheet.hidden = false;
+    $('#sheet-title').textContent = title;
+    $('#sheet-close').hidden = kind === 'work';
+    return $('#sheet-body');
+  }
+
+  function closeSheet() {
+    if (S.sheet && S.sheet.kind === 'work' && S.job) S.job.timers.forEach((f) => f());
+    S.sheet = null;
+    S.job = null;
+    $('#sheet').hidden = true;
+    $('#sheet-body').replaceChildren();
+  }
+  $('#sheet-close').addEventListener('click', closeSheet);
+
+  /** Перерисовать содержимое открытой панели, если её данные поменялись. */
+  function renderSheet() {
+    if (!S.sheet || !S.view) return;
+    if (S.sheet.kind === 'shop') renderShop();
+    else if (S.sheet.kind === 'travel') renderTravel();
+  }
+
+  // ---- раздача и окошко фельдшера ----
+  function openShop(shop, obj) {
+    openSheet('shop', shop === 'canteen' ? 'Раздача · Столовая №3' : 'Окошко фельдшера', obj);
+    S.sheet.shop = shop;
+    renderShop();
+  }
+
+  function renderShop() {
+    const v = S.view;
+    const here = v.here;
+    const you = v.you;
+    memo('sheet', [here.shop, here.closed, you.money], () => {
+      const body = $('#sheet-body');
+      const kids = [];
+      if (here.closed) kids.push(h('p', { class: 'note bad', text: here.closed }));
+      kids.push(
+        h(
+          'div',
+          { class: 'shop' },
+          (here.shop || []).map((e) =>
+            h(
+              'div',
+              { class: 'shop-row' },
+              h('div', null, e.name, e.desc ? h('span', { class: 'desc', text: e.desc }) : null, e.note ? h('span', { class: 'note', text: e.note }) : null),
+              h('span', { class: 'price', text: `${e.price} ₸` }),
+              h('button', {
+                class: 'btn small',
+                text: e.eat ? 'Взять' : 'Купить',
+                disabled: !!here.closed || you.money < e.price,
+                onclick: () => act('buy', { shop: here.place, key: e.key }),
+              }),
+            ),
+          ),
+        ),
+      );
+      kids.push(h('p', { class: 'note', text: `У вас ${you.money} ₸. Талоны дают за смену в цеху.` }));
+      body.replaceChildren(...kids);
+    });
+  }
+
+  // ---- лифт и лестница ----
+  function openTravel(via, obj) {
+    openSheet('travel', via === 'lift' ? 'Лифт' : 'Лестница', obj);
+    S.sheet.via = via;
+    renderTravel();
+  }
+
+  function renderTravel() {
+    const v = S.view;
+    const via = S.sheet.via;
+    const here = v.here.floor;
+    const you = v.you;
+    const broken = via === 'lift' && v.world.lift.broken;
+    const legBroken = you.conditions.some((c) => c.id === 'leg');
+    memo('sheet', [via, here, broken, Math.floor(you.stats.energy), legBroken], () => {
+      const body = $('#sheet-body');
+      if (broken) {
+        body.replaceChildren(
+          h('p', { class: 'note bad', text: `Лифт не работает. ${v.world.lift.reason || ''}` }),
+          h('button', {
+            class: 'btn primary',
+            text: 'Идти к лестнице',
+            onclick: () => {
+              const st = S.scene.objects.find((o) => o.type === 'stairs');
+              closeSheet();
+              if (st) walkTo(st.spot, () => openTravel('stairs', st));
+            },
+          }),
+        );
+        return;
+      }
+      const dests = [{ label: 'Домой', floor: you.apartment.floor }];
+      for (const [key, f] of Object.entries(v.facilities)) dests.push({ label: f.name, floor: f.floor, key });
+      const cost = (floor) => {
+        const diff = Math.abs(floor - here);
+        return via === 'lift' ? `~${Math.round(3 + diff * 0.08)} с` : `−${Math.ceil(diff * 0.4)} сил`;
+      };
+      const canGo = (floor) => floor !== here && (via === 'lift' || (!legBroken && you.stats.energy >= Math.abs(floor - here) * 0.4));
+      const go = async (floor) => {
+        const res = await act('move', { place: 'corridor', floor, via });
+        if (res.ok) closeSheet();
+      };
+      const input = h('input', { type: 'number', min: '1', max: '999', inputmode: 'numeric', placeholder: String(here), 'aria-label': 'Этаж' });
+      body.replaceChildren(
+        h('p', { class: 'note', text: via === 'lift' ? `Вы на ${here} этаже. Куда едем?` : `Вы на ${here} этаже. Лестница бесплатная, но отнимает силы.` }),
+        ...(legBroken && via === 'stairs' ? [h('p', { class: 'note bad', text: 'С переломом ноги по лестнице не пройти.' })] : []),
+        h(
+          'div',
+          { class: 'dest-grid' },
+          dests.map((d) =>
+            h(
+              'button',
+              { class: 'btn', disabled: !canGo(d.floor), onclick: () => go(d.floor) },
+              h('span', { text: d.label }),
+              h('small', { text: d.floor === here ? `${d.floor} эт. · вы здесь` : `${d.floor} эт. · ${cost(d.floor)}` }),
+            ),
+          ),
+        ),
+        h(
+          'form',
+          {
+            class: 'travel-form',
+            onsubmit: (e) => {
+              e.preventDefault();
+              const floor = parseInt(input.value, 10);
+              if (Number.isFinite(floor)) go(floor);
+            },
+          },
+          h('label', { text: 'Другой этаж:' }),
+          input,
+          h('button', { class: 'btn', type: 'submit', text: via === 'lift' ? 'Поехать' : 'Пойти' }),
+        ),
+      );
+    });
+  }
+
+  // ---- доска объявлений ----
+  async function openBoard(obj) {
+    const res = await act('board');
+    if (!res.ok) return;
+    const body = openSheet('board', 'Доска объявлений', obj);
+    body.replaceChildren(
+      res.notes.length
+        ? h('ul', { class: 'board-notes' }, res.notes.map((n) => h('li', null, h('small', { text: `${n.from} · ${new Date(n.ts).toLocaleString('ru-RU')}` }), n.text)))
+        : h('p', { class: 'note', text: 'Доска пуста. Только ржавые кнопки.' }),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
   // Регистрация и смерть
   // ---------------------------------------------------------------------------
   function showRegister() {
@@ -165,7 +707,7 @@
 
   $('#rebirth-form').addEventListener('submit', (e) => {
     e.preventDefault();
-    closeWork();
+    closeSheet();
     send({ t: 'register', name: $('#rebirth-name').value });
   });
 
@@ -176,13 +718,11 @@
     memo('death', v.you.journal.length, () => {
       $('#death-journal').replaceChildren(...v.you.journal.filter((j) => j.kind !== 'death').slice(-6).reverse().map(journalItem));
     });
-    setOverlays(null);
   }
 
   // ---------------------------------------------------------------------------
-  // Рисование
+  // Интерфейс вокруг сцены
   // ---------------------------------------------------------------------------
-  /** Перерисовать секцию только если её данные поменялись (не сбиваем клики и фокус). */
   function memo(key, data, fn) {
     const s = JSON.stringify(data);
     if (S.memo[key] === s) return;
@@ -194,6 +734,7 @@
     const v = S.view;
     if (!v) return;
     if (!v.you.alive) {
+      if (S.sheet) closeSheet();
       showDeath(v);
       return;
     }
@@ -212,12 +753,19 @@
     renderBanners(v);
     memo('stats', [you.stats, you.conditions.map((c) => [c.id, c.remainingSec == null ? null : Math.ceil(c.remainingSec / 10)])], () => renderStats(you));
     memo('inv', [you.inventory, you.gasmaskCharge], () => renderInventory(you));
-    memo('place', [v.here, you.location, you.travel, you.sealed, you.sleeping, you.money, v.trades, v.world.fog && v.world.fog.phase], () => renderPlace(v));
-    memo('nav', [you.location, !!you.travel, v.facilities, v.world.lift, Math.floor(you.stats.energy / 5)], () => renderNav(v));
+    memo('head', [v.here.title, v.here.text, v.here.floor, v.here.place], () => {
+      const showFloor = v.here.floor != null && ['canteen', 'medpost', 'factory'].includes(v.here.place);
+      $('#place-title').replaceChildren(v.here.title, ...(showFloor ? [h('span', { class: 'floor-tag', text: ` ${v.here.floor} этаж` })] : []));
+      $('#place-text').textContent = v.here.text;
+    });
+    memo('nearby', [v.here.people, v.trades], () => renderNearby(v));
     memo('journal', you.journal.length && you.journal[you.journal.length - 1].ts, () => {
       $('#journal').replaceChildren(...you.journal.slice().reverse().map(journalItem));
     });
-    setOverlays(v);
+    renderCaption(v);
+    renderSheet();
+    document.body.classList.toggle('sanity-critical', you.stats.sanity < 10);
+    document.body.classList.toggle('sanity-low', you.stats.sanity >= 10 && you.stats.sanity < 25);
     syncWork(v);
   }
 
@@ -253,23 +801,37 @@
     });
   }
 
+  function renderCaption(v) {
+    const t = v.you.travel;
+    const cap = $('#caption');
+    if (!t) {
+      cap.hidden = true;
+      return;
+    }
+    cap.hidden = false;
+    cap.className = `caption${t.stuck ? ' stuck' : ''}`;
+    cap.textContent = t.stuck
+      ? 'Лифт застрял между этажами. Ждите, пока починят.'
+      : `${t.via === 'lift' ? 'Лифт' : 'Лестница'}: ${t.fromFloor} → ${t.toFloor} этаж · ещё ~${Math.ceil((t.etaMs || 0) / 1000)} с`;
+  }
+
   const STAT_LABELS = { health: 'Здоровье', hunger: 'Сытость', energy: 'Силы', sanity: 'Рассудок' };
 
   function renderStats(you) {
     $('#stats').replaceChildren(
       ...Object.entries(STAT_LABELS).map(([k, label]) => {
-        const v = you.stats[k];
+        const val = you.stats[k];
         return h(
           'div',
-          { class: `stat${v <= 20 ? ' low' : ''}` },
-          h('div', { class: 'stat-head' }, h('span', { text: label }), h('b', { text: v })),
-          h('div', { class: `bar ${k}` }, h('i', { style: `width:${v}%` })),
+          { class: `stat${val <= 20 ? ' low' : ''}` },
+          h('div', { class: 'stat-head' }, h('span', { text: label }), h('b', { text: val })),
+          h('div', { class: `bar ${k}` }, h('i', { style: `width:${val}%` })),
         );
       }),
     );
     $('#conditions').replaceChildren(
       ...you.conditions.map((c) =>
-        h('li', { class: c.kind }, c.name, c.remainingSec != null ? h('span', { class: 't', text: fmtSec(c.remainingSec) }) : h('span', { class: 't', text: 'нужно лечение' })),
+        h('li', { class: c.kind }, c.name, h('span', { class: 't', text: c.remainingSec != null ? fmtSec(c.remainingSec) : 'нужно лечение' })),
       ),
     );
   }
@@ -303,209 +865,122 @@
     return h('li', { class: j.kind }, h('span', { class: 'clock-s', text: j.clock }), j.text);
   }
 
-  // ---- место ----
-  function renderPlace(v) {
-    const you = v.you;
-    const here = v.here;
-    const box = $('#place');
+  function renderNearby(v) {
     const kids = [];
-    kids.push(h('h1', null, here.title, here.floor != null && here.place !== 'home' ? h('span', { class: 'floor-tag', text: `${here.floor} этаж` }) : null));
-    kids.push(h('p', { class: 'place-text', text: here.text }));
-    if (here.closed) kids.push(h('div', { class: 'closed', text: here.closed }));
-
-    if (you.travel) {
-      const t = you.travel;
-      const label = t.stuck
-        ? 'Застряли. Ждите, пока починят лифт.'
-        : `${t.via === 'lift' ? 'Лифт' : 'Лестница'} → ${t.toFloor} этаж · ещё ~${Math.ceil((t.etaMs || 0) / 1000)} с`;
-      kids.push(h('div', { class: `travel${t.stuck ? ' stuck' : ''}` }, h('span', { text: label })));
-    }
-
-    if (here.place === 'home') {
-      const fogSoon = v.world.fog && v.world.fog.affectsYou;
+    for (const p of v.here.place === 'home' ? [] : v.here.people) {
       kids.push(
         h(
-          'div',
-          { class: 'actions' },
-          h('button', {
-            class: `btn ${!you.sealed && fogSoon ? 'primary' : ''}`,
-            text: you.sealed ? 'Открыть гермодверь' : 'Задраить гермодверь',
-            onclick: () => act('seal', { on: !you.sealed }),
-          }),
-          h('button', { class: 'btn', text: you.sleeping ? 'Проснуться' : 'Лечь спать', onclick: () => act('sleep', { on: !you.sleeping }) }),
+          'span',
+          { class: 'chip-person' },
+          h('b', { text: p.name }),
+          p.symptoms.length ? h('span', { class: 'symptom', text: p.symptoms.join(', ') }) : null,
+          h('button', { class: 'btn small', text: 'Обмен', onclick: () => tradeWith(p) }),
         ),
       );
     }
-
-    if (here.shop) {
-      kids.push(h('div', { class: 'sub-h', text: here.place === 'canteen' ? 'Раздача' : 'Окошко фельдшера' }));
+    for (const t of v.trades) {
       kids.push(
         h(
           'div',
-          { class: 'shop' },
-          here.shop.map((e) =>
-            h(
-              'div',
-              { class: 'shop-row' },
-              h('div', null, e.name, e.desc ? h('span', { class: 'desc', text: e.desc }) : null, e.note ? h('span', { class: 'note', text: e.note }) : null),
-              h('span', { class: 'price', text: `${e.price} ₸` }),
-              h('button', {
-                class: 'btn small',
-                text: e.eat ? 'Взять' : 'Купить',
-                disabled: !!here.closed || you.money < e.price || !!you.travel,
-                onclick: () => act('buy', { shop: here.place, key: e.key }),
-              }),
-            ),
-          ),
-        ),
-      );
-    }
-
-    if (here.jobs) {
-      kids.push(h('div', { class: 'sub-h', text: `Наряды на смену · −${here.workCost.energy} сил, −${here.workCost.hunger} сытости · до 6 ₸` }));
-      kids.push(
-        h(
-          'div',
-          { class: 'actions' },
-          here.jobs.map((j) =>
-            h('button', { class: 'btn', text: j.name, disabled: !!here.closed || !!you.job || !!S.job, onclick: () => startWork(j.id) }),
-          ),
-        ),
-      );
-    }
-
-    if (here.residents) {
-      kids.push(h('div', { class: 'sub-h', text: 'Двери этажа' }));
-      kids.push(
-        h(
-          'div',
-          { class: 'residents' },
-          here.residents.map((r) =>
-            h(
-              'div',
-              { class: `door${r.you ? ' you' : ''}` },
-              h('span', { class: 'num', text: `кв. ${r.number}` }),
-              r.name ? [h('span', { class: `dot${r.online ? ' on' : ''}` }), r.you ? `${r.name} (вы)` : r.name] : h('span', { class: 'empty', text: 'пустует' }),
-            ),
-          ),
-        ),
-      );
-    }
-
-    if (v.trades.length) {
-      kids.push(h('div', { class: 'sub-h', text: 'Предложения обмена' }));
-      kids.push(
-        h(
-          'div',
-          { class: 'trades' },
-          v.trades.map((t) =>
-            h(
-              'div',
-              { class: 'trade' },
-              t.incoming
-                ? `${t.other ? t.other.name : '?'} предлагает: ${t.give} — в обмен на: ${t.want}`
-                : `Вы предложили ${t.other ? t.other.name : '?'}: ${t.give} — за: ${t.want}`,
-              h(
-                'div',
-                { class: 'actions' },
-                t.incoming ? h('button', { class: 'btn small primary', text: 'Принять', onclick: () => act('trade_respond', { trade: t.id, accept: true }) }) : null,
-                h('button', { class: 'btn small', text: t.incoming ? 'Отказать' : 'Отозвать', onclick: () => act('trade_respond', { trade: t.id, accept: false }) }),
-              ),
-            ),
-          ),
-        ),
-      );
-    }
-
-    if (here.place !== 'home') {
-      kids.push(h('div', { class: 'sub-h', text: here.people.length ? 'Рядом с вами' : 'Рядом никого' }));
-      if (here.people.length) {
-        kids.push(
+          { class: 'trade' },
+          t.incoming
+            ? `${t.other ? t.other.name : '?'} предлагает: ${t.give} — в обмен на: ${t.want}`
+            : `Вы предложили ${t.other ? t.other.name : '?'}: ${t.give} — за: ${t.want}`,
           h(
-            'ul',
-            { class: 'people' },
-            here.people.map((p) =>
-              h(
-                'li',
-                null,
-                h('span', null, h('b', { text: p.name }), ` · кв. ${p.apt}`, p.symptoms.length ? h('span', { class: 'symptom', text: ` — ${p.symptoms.join(', ')}` }) : null),
-                h('button', { class: 'btn small', text: 'Передать / обмен', onclick: () => openTrade(p) }),
-              ),
-            ),
+            'div',
+            { class: 'actions' },
+            t.incoming ? h('button', { class: 'btn small primary', text: 'Принять', onclick: () => act('trade_respond', { trade: t.id, accept: true }) }) : null,
+            h('button', { class: 'btn small', text: t.incoming ? 'Отказать' : 'Отозвать', onclick: () => act('trade_respond', { trade: t.id, accept: false }) }),
           ),
-        );
-      }
+        ),
+      );
     }
-    box.replaceChildren(...kids);
+    $('#nearby').replaceChildren(...kids);
   }
 
-  // ---- навигация ----
-  function renderNav(v) {
-    const you = v.you;
-    const here = you.location;
-    const busy = !!you.travel;
-    const liftBroken = v.world.lift.broken;
-    const route = (floor) => {
-      const diff = Math.abs(floor - here.floor);
-      if (!diff) return 'рядом';
-      if (!liftBroken) return `лифт · ${diff} эт.`;
-      return `лестница · −${Math.ceil(diff * 0.4)} сил`;
-    };
-    const btn = (label, sub, dest, isHere, extra = '') =>
-      h('button', { class: `btn${isHere ? ' here' : ''}`, disabled: busy || isHere, onclick: () => act('move', dest) }, h('span', { text: label }), h('small', { text: sub + extra }));
-
-    const fac = v.facilities;
-    const facBtn = (key) =>
-      btn(fac[key].name, `${fac[key].floor} эт. · ${route(fac[key].floor)}`, { place: key }, here.place === key, fac[key].open ? '' : ' · закрыто');
-
-    $('#nav-buttons').replaceChildren(
-      btn('Домой', `кв. ${you.apartment.number} · ${route(you.apartment.floor)}`, { place: 'home' }, here.place === 'home'),
-      btn('Выйти в коридор', `${here.floor} этаж`, { place: 'corridor', floor: here.floor }, here.place === 'corridor' || busy),
-      facBtn('canteen'),
-      facBtn('medpost'),
-      facBtn('factory'),
-    );
-    const ls = $('#lift-status');
-    ls.textContent = liftBroken ? 'Лифт сломан — пешком' : 'Лифт работает';
-    ls.className = `lift-status${liftBroken ? ' broken' : ''}`;
-    $('#lift-form button').disabled = busy;
+  /** Обмен с соседом: если далеко — сначала подойти. */
+  function tradeWith(person) {
+    const a = S.actors.get(person.id);
+    if (a && Math.hypot(a.x - S.me.x, a.y - S.me.y) > 2.5) walkTo({ x: a.x, y: a.y }, () => openTrade(person));
+    else openTrade(person);
   }
 
-  $('#lift-form').addEventListener('submit', (e) => {
-    e.preventDefault();
-    const floor = parseInt($('#lift-floor').value, 10);
-    if (!Number.isFinite(floor)) return;
-    act('move', { place: 'corridor', floor });
-  });
+  // ---------------------------------------------------------------------------
+  // Главный цикл: движение + кадр
+  // ---------------------------------------------------------------------------
+  let lastTs = performance.now();
+  function frame(ts) {
+    const dt = Math.min(0.05, (ts - lastTs) / 1000);
+    lastTs = ts;
+    const v = S.view;
+    try {
+      if (v && v.you.alive && S.scene && S.me && !$('#app').hidden) {
+        stepMovement(dt);
+        stepActors(dt);
+        renderPrompt();
+        drawWorld(ts / 1000);
+      }
+    } catch (err) {
+      // одна ошибка не должна останавливать мир
+      console.error(err);
+      S.path = null;
+    }
+    requestAnimationFrame(frame);
+  }
 
-  // ---- атмосфера ----
-  function setOverlays(v) {
-    const fog = $('#fog');
-    const dark = $('#dark');
-    fog.className = 'fog-overlay';
-    dark.className = 'dark-overlay';
-    document.body.classList.remove('sanity-low', 'sanity-critical');
-    if (!v) return;
+  function drawWorld(time) {
+    const v = S.view;
     const you = v.you;
     const f = v.world.fog;
+    let fog = null;
     if (f && f.phase === 'active' && f.affectsYou) {
-      if (you.location.place === 'home' && you.sealed) fog.classList.add('light');
-      else if (you.location.place === 'home') fog.classList.add('medium');
-      else fog.classList.add('heavy');
+      if (you.location.place === 'home') fog = you.sealed ? 'window' : 'leak';
+      else fog = 'outside';
     }
-    if (v.world.dark) {
-      dark.classList.add('on');
-      if (you.inventory.some((i) => i.id === 'flashlight')) dark.classList.add('torch');
+    const has = (id) => you.inventory.some((i) => i.id === id);
+    let liftFloor = null;
+    if (you.travel && you.travel.totalMs) {
+      const elapsed = you.travel.totalMs - (you.travel.etaMs || 0) + (you.travel.stuck ? 0 : performance.now() - S.viewAt);
+      const k = Math.max(0, Math.min(1, elapsed / you.travel.totalMs));
+      liftFloor = Math.round(you.travel.fromFloor + (you.travel.toFloor - you.travel.fromFloor) * k);
     }
-    if (you.stats.sanity < 10) document.body.classList.add('sanity-critical');
-    else if (you.stats.sanity < 25) document.body.classList.add('sanity-low');
+    const [hh, mm] = v.world.clock.time.split(':').map(Number);
+    renderer.draw({
+      you: {
+        id: you.id,
+        name: you.name,
+        x: S.me.x,
+        y: S.me.y,
+        d: S.me.d,
+        m: S.me.m,
+        self: true,
+        look: lookFor(you.id),
+        sick: you.conditions.some((c) => c.kind === 'disease'),
+        hurt: you.conditions.some((c) => c.kind === 'injury'),
+        sleep: you.sleeping && !S.me.m,
+        mask: has('gasmask') && !!fog && fog !== 'window',
+      },
+      actors: [...S.actors.values()],
+      time,
+      now: Date.now(),
+      gameMinutes: hh * 60 + mm,
+      dark: v.world.dark,
+      flashlight: has('flashlight'),
+      fog,
+      fogOutside: !!(f && f.phase === 'active' && f.affectsYou),
+      siren: !!(f && f.phase === 'warning' && f.affectsYou),
+      liftFloor,
+      liftBroken: v.world.lift.broken,
+      sealed: you.sealed,
+      residents: residents(),
+      target: S.near,
+      hover: S.hover,
+      bubbles: S.bubbles,
+      pathEnd: S.pathEnd,
+      sanity: you.stats.sanity,
+    });
   }
-
-  document.addEventListener('pointermove', (e) => {
-    const dark = $('#dark');
-    dark.style.setProperty('--mx', `${e.clientX}px`);
-    dark.style.setProperty('--my', `${e.clientY}px`);
-  });
+  requestAnimationFrame(frame);
 
   // ---------------------------------------------------------------------------
   // Чат
@@ -515,6 +990,7 @@
     S.chat[ch].push(msg);
     if (S.chat[ch].length > 120) S.chat[ch].shift();
     if (ch !== S.tab) S.unread[ch]++;
+    if (ch === 'local' && msg.from && msg.from.id && !msg.hallucination) S.bubbles.set(msg.from.id, { text: msg.text, until: Date.now() + 6000 });
     renderChat();
   }
 
@@ -544,23 +1020,31 @@
     }
   }
 
-  for (const tab of document.querySelectorAll('.tab')) {
-    tab.addEventListener('click', () => {
-      S.tab = tab.dataset.tab;
-      S.unread[S.tab] = 0;
-      renderChat();
-      const log = $('#chat-log');
-      log.scrollTop = log.scrollHeight;
-    });
+  function selectTab(tab) {
+    S.tab = tab;
+    S.unread[tab] = 0;
+    renderChat();
+    const log = $('#chat-log');
+    log.scrollTop = log.scrollHeight;
   }
+
+  for (const tab of document.querySelectorAll('.tab')) tab.addEventListener('click', () => selectTab(tab.dataset.tab));
 
   $('#chat-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const input = $('#chat-input');
     const text = input.value.trim();
-    if (!text) return;
+    if (!text) {
+      input.blur();
+      return;
+    }
     const res = await act('chat', { channel: S.tab, text });
-    if (res.ok) input.value = '';
+    if (res.ok) {
+      input.value = '';
+      input.blur(); // вернуть управление ходьбой
+      // на телефоне вернуться к сцене — реплика появится облачком над головой
+      if (window.innerWidth < 760) $('#stage').scrollIntoView({ block: 'start', behavior: 'smooth' });
+    }
   });
 
   // ---------------------------------------------------------------------------
@@ -585,6 +1069,7 @@
     if (n.style === 'siren') playSiren();
     else if (n.style === 'whisper') playDrone();
     else if (n.style === 'danger' || n.style === 'fog') playTone(110, 0.5, 'square', 0.08);
+    else if (n.style === 'knock') playKnock();
     else playTone(660, 0.12, 'sine', 0.04);
 
     if (MODAL_STYLES.includes(n.style)) {
@@ -608,10 +1093,10 @@
       return;
     }
     modalOpen = true;
+    S.keys.clear();
     modal.className = `modal ${m.style || ''}`;
     $('#modal-title').textContent = m.title || '';
-    const body = $('#modal-body');
-    body.replaceChildren(typeof m.body === 'string' ? h('p', { text: m.body }) : m.body);
+    $('#modal-body').replaceChildren(typeof m.body === 'string' ? h('p', { text: m.body }) : m.body);
     $('#modal-actions').replaceChildren(
       ...m.actions.map((a) =>
         h('button', {
@@ -641,7 +1126,7 @@
     const body = h(
       'div',
       null,
-      h('p', { text: `${person.name} (кв. ${person.apt}). Подарок отдаётся сразу; обмен — если сосед согласится.` }),
+      h('p', { text: `${person.name} (кв. ${person.apt}). Подарок отдаётся сразу; обмен — если сосед согласится. Стойте рядом.` }),
       h(
         'div',
         { class: 'trade-grid' },
@@ -652,13 +1137,7 @@
           h('label', null, `Талоны (есть ${you.money})`, giveMoney),
           giveItems.length ? giveItems.map(([, input, it]) => h('label', null, `${it.name} (×${it.count})`, input)) : h('p', { class: 'empty', text: 'Карманы пусты' }),
         ),
-        h(
-          'div',
-          null,
-          h('h4', { text: 'Прошу взамен' }),
-          h('label', null, 'Талоны', wantMoney),
-          wantItems.map(([, input, it]) => h('label', null, it.name, input)),
-        ),
+        h('div', null, h('h4', { text: 'Прошу взамен' }), h('label', null, 'Талоны', wantMoney), wantItems.map(([, input, it]) => h('label', null, it.name, input))),
       ),
     );
     const collect = (money, items) => ({
@@ -672,10 +1151,7 @@
       keepFocus: true,
       actions: [
         { label: 'Отмена' },
-        {
-          label: 'Подарить',
-          onClick: async () => (await act('trade_offer', { to: person.id, give: collect(giveMoney, giveItems), want: {} })).ok,
-        },
+        { label: 'Подарить', onClick: async () => (await act('trade_offer', { to: person.id, give: collect(giveMoney, giveItems), want: {} })).ok },
         {
           label: 'Предложить обмен',
           primary: true,
@@ -705,10 +1181,10 @@
   }
   document.addEventListener('pointerdown', unlockAudio, { once: true });
 
-  function playTone(freq, dur, type = 'sine', vol = 0.05) {
+  function playTone(freq, dur, type = 'sine', vol = 0.05, delay = 0) {
     const a = unlockAudio();
     if (!a) return;
-    const t = a.currentTime;
+    const t = a.currentTime + delay;
     const o = a.createOscillator();
     const g = a.createGain();
     o.type = type;
@@ -744,7 +1220,11 @@
 
   function playDrone() {
     playTone(55, 2.5, 'sine', 0.12);
-    setTimeout(() => playTone(58, 2.5, 'sine', 0.08), 200);
+    playTone(58, 2.5, 'sine', 0.08, 0.2);
+  }
+
+  function playKnock() {
+    for (let i = 0; i < 3; i++) playTone(140, 0.08, 'square', 0.09, i * 0.18);
   }
 
   const soundBtn = $('#sound-toggle');
@@ -760,26 +1240,26 @@
   syncSoundBtn();
 
   // ---------------------------------------------------------------------------
-  // Работа: мини-игры
+  // Работа: мини-игры (открываются панелью над станком)
   // ---------------------------------------------------------------------------
   const BIN_KEYS = ['1', '2', '3', '4'];
 
   async function startWork(gameId) {
+    if (S.job) return;
     const res = await act('work_start', { game: gameId });
     if (!res.ok) return;
     const job = res.job;
+    S.keys.clear();
+    const station = S.scene.objects.find((o) => o.type === 'station' && o.game === gameId);
+    openSheet('work', job.data.title, station);
     S.job = { ...job, gameId, startedAt: performance.now(), state: 'playing', timers: [] };
-    const panel = $('#work');
-    panel.hidden = false;
-    panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
     ({ sort: playSort, meter: playMeter, gauge: playGauge })[job.game](S.job);
   }
 
   function workShell(job, ...content) {
     const d = job.data;
     const timer = h('div', { class: 'timer' }, h('i', { style: 'width:100%' }));
-    $('#work').replaceChildren(
-      h('h1', { text: d.title }),
+    $('#sheet-body').replaceChildren(
       h('p', { class: 'rules', text: d.rules }),
       timer,
       ...content,
@@ -792,7 +1272,7 @@
       timer.firstChild.style.width = `${left * 100}%`;
       if (left <= 0) {
         clearInterval(iv);
-        job.onTimeout && job.onTimeout();
+        if (job.onTimeout) job.onTimeout();
       }
     }, 250);
     job.timers.push(() => clearInterval(iv));
@@ -805,15 +1285,14 @@
     const res = await act('work_submit', { job: job.id, answers });
     job.state = 'done';
     if (S.job !== job) return;
-    const text = res.ok ? res.result.text : res.error;
-    $('#work').replaceChildren(
-      h('h1', { text: 'Смена окончена' }),
-      h('p', { class: 'result', text }),
+    $('#sheet-title').textContent = 'Смена окончена';
+    $('#sheet-body').replaceChildren(
+      h('p', { class: 'result', text: res.ok ? res.result.text : res.error }),
       h(
         'div',
         { class: 'actions' },
-        h('button', { class: 'btn primary', text: 'Ещё смену', onclick: () => { closeWork(); startWork(job.gameId); } }),
-        h('button', { class: 'btn', text: 'Закрыть', onclick: closeWork }),
+        h('button', { class: 'btn primary', text: 'Ещё смену', onclick: () => { closeSheet(); startWork(job.gameId); } }),
+        h('button', { class: 'btn', text: 'Закрыть', onclick: closeSheet }),
       ),
     );
     if (res.ok && res.result.reward) playTone(880, 0.15, 'triangle', 0.06);
@@ -825,27 +1304,17 @@
     job.state = 'done';
     job.timers.forEach((f) => f());
     await act('work_cancel', {}, { quiet: true });
-    closeWork();
+    closeSheet();
   }
 
-  function closeWork() {
-    if (S.job) S.job.timers.forEach((f) => f());
-    S.job = null;
-    $('#work').hidden = true;
-    $('#work').replaceChildren();
-    S.memo.place = null; // кнопки нарядов снова активны
-    render();
-  }
-
-  /** Сервер прервал смену (ушли, авария, смерть) — закрываем панель. */
+  /** Сервер прервал смену (авария, смерть, админ) — закрываем панель. */
   function syncWork(v) {
     const job = S.job;
     if (!job || job.state !== 'playing') return;
     if (!v.you.job || v.you.job.id !== job.id) {
       job.state = 'done';
-      job.timers.forEach((f) => f());
       toast({ title: 'Смена прервана', text: 'Наряд закрыт без оплаты.', style: 'warn' });
-      closeWork();
+      closeSheet();
     }
   }
 
@@ -861,18 +1330,14 @@
       if (answers.length >= d.items.length) submitWork(job, answers);
       else show();
     };
-    const bins = h(
-      'div',
-      { class: 'bins' },
-      d.bins.map((b, i) => h('button', { class: 'btn', onclick: () => choose(b.id) }, b.name, h('kbd', { text: BIN_KEYS[i] }))),
-    );
+    const bins = h('div', { class: 'bins' }, d.bins.map((bn, i) => h('button', { class: 'btn', onclick: () => choose(bn.id) }, bn.name, h('kbd', { text: BIN_KEYS[i] }))));
     const show = () => {
       part.textContent = d.items[answers.length];
       progress.textContent = `Деталь ${answers.length + 1} из ${d.items.length}`;
     };
     const onKey = (e) => {
       const i = BIN_KEYS.indexOf(e.key);
-      if (i >= 0 && document.activeElement?.tagName !== 'INPUT') choose(d.bins[i].id);
+      if (i >= 0 && !isTyping()) choose(d.bins[i].id);
     };
     document.addEventListener('keydown', onKey);
     job.timers.push(() => document.removeEventListener('keydown', onKey));
@@ -888,33 +1353,28 @@
     const progress = h('div', { class: 'progress' });
     workShell(job, screen, progress);
     let i = 0;
-    const showNext = () => {
-      if (S.job !== job || job.state !== 'playing') return;
-      if (i >= d.readings.length) return askInputs();
-      screen.textContent = d.readings[i];
-      progress.textContent = `Счётчик №${i + 1} из ${d.readings.length}`;
-      i++;
-      const t = setTimeout(showNext, d.showMs);
-      job.timers.push(() => clearTimeout(t));
-    };
     const inputs = d.readings.map((_, n) => h('input', { maxlength: '5', inputmode: 'numeric', placeholder: `№${n + 1}`, 'aria-label': `Показание ${n + 1}` }));
     const collect = () => inputs.map((inp) => inp.value);
     const askInputs = () => {
       screen.replaceWith(
         h(
           'form',
-          {
-            onsubmit: (e) => {
-              e.preventDefault();
-              submitWork(job, collect());
-            },
-          },
+          { onsubmit: (e) => { e.preventDefault(); submitWork(job, collect()); } },
           h('div', { class: 'meter-inputs' }, inputs),
           h('button', { class: 'btn primary', type: 'submit', text: 'Сдать журнал' }),
         ),
       );
       progress.textContent = 'Запишите показания по порядку.';
       inputs[0].focus();
+    };
+    const showNext = () => {
+      if (S.job !== job || job.state !== 'playing') return;
+      if (i >= d.readings.length) return askInputs();
+      screen.textContent = d.readings[i];
+      progress.textContent = `Счётчик №${i + 1} из ${d.readings.length}`;
+      i++;
+      const tm = setTimeout(showNext, d.showMs);
+      job.timers.push(() => clearTimeout(tm));
     };
     job.onTimeout = () => submitWork(job, collect());
     showNext();
@@ -928,10 +1388,10 @@
 
   function playGauge(job) {
     const d = job.data;
-    const W = 340, H = 200;
+    const CW = 340, CH = 200;
     const dpr = window.devicePixelRatio || 1;
-    const canvas = h('canvas', { width: W * dpr, height: H * dpr, 'aria-label': 'Манометр' });
-    const ctx = canvas.getContext('2d');
+    const cnv = h('canvas', { width: CW * dpr, height: CH * dpr, 'aria-label': 'Манометр' });
+    const ctx = cnv.getContext('2d');
     ctx.scale(dpr, dpr);
     const presses = [];
     let hits = 0;
@@ -954,7 +1414,7 @@
     };
     button.addEventListener('click', press);
     const onKey = (e) => {
-      if (e.code === 'Space' && document.activeElement?.tagName !== 'INPUT') {
+      if (e.code === 'Space' && !isTyping()) {
         e.preventDefault();
         press();
       }
@@ -962,12 +1422,12 @@
     document.addEventListener('keydown', onKey);
     job.timers.push(() => document.removeEventListener('keydown', onKey));
 
-    const cx = W / 2, cy = H - 20, r = 140;
+    const cx = CW / 2, cy = CH - 20, r = 140;
     const ang = (x) => Math.PI + x * Math.PI;
     const draw = () => {
       if (S.job !== job || job.state !== 'playing') return;
       const pos = gaugePos(d, performance.now() - job.startedAt);
-      ctx.clearRect(0, 0, W, H);
+      ctx.clearRect(0, 0, CW, CH);
       ctx.lineWidth = 18;
       ctx.strokeStyle = '#3b413f';
       ctx.beginPath(); ctx.arc(cx, cy, r, Math.PI, 2 * Math.PI); ctx.stroke();
@@ -993,9 +1453,12 @@
       requestAnimationFrame(draw);
     };
     job.onTimeout = () => submitWork(job, presses);
-    workShell(job, h('div', { class: 'gauge-wrap' }, canvas, button, counter));
+    workShell(job, h('div', { class: 'gauge-wrap' }, cnv, button, counter));
     requestAnimationFrame(draw);
   }
+
+  // Для автотестов и отладки из консоли (сервер всё равно проверяет каждое действие).
+  window.ghDebug = { S, renderer, walkTo, objectInfo };
 
   // ---------------------------------------------------------------------------
   connect();

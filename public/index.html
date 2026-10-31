@@ -85,18 +85,24 @@
       </aside>
 
       <section class="col col-center">
-        <section class="panel place" id="place"></section>
-        <section class="panel work" id="work" hidden></section>
-        <nav class="panel nav" id="nav" aria-label="Перемещение">
-          <h2>Куда идти</h2>
-          <div class="nav-grid" id="nav-buttons"></div>
-          <form class="lift-form" id="lift-form">
-            <label for="lift-floor">На этаж</label>
-            <input id="lift-floor" type="number" min="1" max="999" inputmode="numeric" placeholder="101">
-            <button class="btn" type="submit">В коридор</button>
-            <span class="lift-status" id="lift-status"></span>
-          </form>
-        </nav>
+        <div class="stage-head">
+          <h1 id="place-title"></h1>
+          <p id="place-text" class="place-text"></p>
+        </div>
+        <div class="stage" id="stage">
+          <canvas id="view" aria-label="Вид сверху на помещение"></canvas>
+          <div class="caption" id="caption" hidden></div>
+          <section class="sheet" id="sheet" hidden>
+            <div class="sheet-head">
+              <h2 id="sheet-title"></h2>
+              <button class="icon-btn" id="sheet-close" title="Закрыть (Esc)" aria-label="Закрыть">✕</button>
+            </div>
+            <div id="sheet-body"></div>
+          </section>
+        </div>
+        <div class="prompt" id="prompt" aria-live="polite"></div>
+        <div class="nearby" id="nearby"></div>
+        <p class="controls-hint">Ходить — WASD, стрелки или клик/тап по полу. <kbd>E</kbd> — действие с тем, что рядом. Клик по двери или предмету — подойти и сделать.</p>
       </section>
 
       <aside class="col col-right">
@@ -107,7 +113,7 @@
           </div>
           <ul id="chat-log" class="chat-log" aria-live="polite"></ul>
           <form id="chat-form" class="chat-form" autocomplete="off">
-            <input id="chat-input" maxlength="300" placeholder="Сказать...">
+            <input id="chat-input" maxlength="300" placeholder="Сказать... (Enter)">
             <button class="btn" type="submit">⏎</button>
           </form>
         </section>
@@ -118,10 +124,6 @@
       </aside>
     </main>
   </div>
-
-  <!-- Оверлеи атмосферы -->
-  <div id="fog" class="fog-overlay" aria-hidden="true"><div class="fog-layer a"></div><div class="fog-layer b"></div></div>
-  <div id="dark" class="dark-overlay" aria-hidden="true"></div>
 
   <!-- Уведомления -->
   <div id="toasts" class="toasts" aria-live="polite"></div>
@@ -135,6 +137,8 @@
 
   <div id="conn" class="conn" hidden>Связь с домом потеряна. Переподключение…</div>
 
+  <script src="shared/world.js"></script>
+  <script src="render.js"></script>
   <script src="game.js"></script>
 </body>
 </html>
