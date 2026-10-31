@@ -208,7 +208,7 @@
       if (a.id === myId) continue;
       seen.add(a.id);
       const cur = S.actors.get(a.id);
-      if (cur) Object.assign(cur, { tx: a.x, ty: a.y, d: a.d, m: a.m, sick: a.sick, hurt: a.hurt, sleep: a.sleep, mask: a.mask, name: a.name, apt: a.apt });
+      if (cur) Object.assign(cur, { tx: a.x, ty: a.y, d: a.d, m: a.m, sick: a.sick, hurt: a.hurt, sleep: a.sleep, mask: a.mask, away: a.away, name: a.name, apt: a.apt });
       else S.actors.set(a.id, { ...a, tx: a.x, ty: a.y, look: lookFor(a.id), phase: Math.random() * 6 });
     }
     for (const id of [...S.actors.keys()]) if (!seen.has(id)) S.actors.delete(id);
@@ -1058,7 +1058,7 @@
     while ($('#toasts').children.length > 4) $('#toasts').firstChild.remove();
   }
 
-  const MODAL_STYLES = ['siren', 'fog', 'danger', 'whisper', 'announce'];
+  const MODAL_STYLES = ['siren', 'fog', 'danger', 'whisper', 'announce', 'receipt'];
   const modalQueue = [];
   let modalOpen = false;
 

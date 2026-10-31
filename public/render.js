@@ -565,6 +565,16 @@
   // Жильцы
   // ---------------------------------------------------------------------------
   function drawCharacter(b, a, t) {
+    // жилец не в сети (бредёт домой или спит) — полупрозрачный
+    if (a.away) b.g.globalAlpha = 0.55;
+    try {
+      drawCharacterBody(b, a, t);
+    } finally {
+      b.g.globalAlpha = 1;
+    }
+  }
+
+  function drawCharacterBody(b, a, t) {
     const { x, y } = a;
     const L = a.look;
     const walk = a.m ? Math.sin(t * 11 + (a.phase || 0)) : 0;
@@ -968,13 +978,14 @@
       g.textBaseline = 'bottom';
       for (const a of people) {
         if (a.sleep) continue;
+        const label = a.away ? `${a.name} · не в сети` : a.name;
         const nx = a.x * TD, ny = (a.y - 1.15) * TD;
-        const wName = g.measureText(a.name).width + 8 * this.dpr;
+        const wName = g.measureText(label).width + 8 * this.dpr;
         g.fillStyle = 'rgba(10,11,11,0.6)';
         roundRect(g, nx - wName / 2, ny - fontPx - 2 * this.dpr, wName, fontPx + 4 * this.dpr, 4 * this.dpr);
         g.fill();
-        g.fillStyle = a.self ? '#e3a13b' : '#e9e3d0';
-        g.fillText(a.name, nx, ny + this.dpr);
+        g.fillStyle = a.self ? '#e3a13b' : a.away ? '#a8a597' : '#e9e3d0';
+        g.fillText(label, nx, ny + this.dpr);
       }
       // облачка реплик
       const now = s.now;

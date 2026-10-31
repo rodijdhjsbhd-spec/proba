@@ -547,6 +547,7 @@
     if (p.travel) s = `${p.travel.via === 'lift' ? 'лифт' : 'лестница'} → ${p.travel.toFloor}${p.travel.stuck ? ' · ЗАСТРЯЛ' : ''}`;
     if (p.sealed) s += ' 🔒';
     if (p.sleeping) s += ' 💤';
+    if (p.homeward && !p.online) s += ' · бредёт домой';
     if (p.working) s += ' 🔧';
     return s;
   }

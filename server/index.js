@@ -156,10 +156,10 @@ function bind(ws, player) {
   socketsByPlayer.get(player.id).add(ws);
   clearTimeout(offlineTimers.get(player.id));
   offlineTimers.delete(player.id);
-  game.setOnline(player.id, true);
   send(ws, { t: 'welcome', id: player.id, token: player.token, catalog: ITEM_CATALOG, world: WORLD_CONFIG });
   lastActors.delete(player.id);
   send(ws, { t: 'chat_history', ...game.chatHistory(player) });
+  game.setOnline(player.id, true); // после приветствия: квитанция «Пока вас не было» придёт уже в игру
   pushView(player.id);
 }
 

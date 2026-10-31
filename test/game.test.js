@@ -333,15 +333,18 @@ test('доска объявлений показывает сообщения р
 });
 
 test('сон — у кровати; ушедший из игры засыпает у себя в кровати', () => {
-  const { game } = makeWorld();
+  const { game, advance } = makeWorld();
   const p = join(game, 'Иван');
   assert.equal(game.sleep(p, true).ok, false);
   walkTo(game, p, type('bed'));
   assert.equal(game.sleep(p, true).ok, true);
   game.admin('teleport', { id: p.id, place: 'factory' });
   game.setOnline(p.id, false);
+  assert.equal(p.location.place, 'factory', 'мгновенно домой не переносит');
+  advance(60000);
   assert.equal(p.location.place, 'home');
   assert.ok(game.nearTo(p, type('bed')), 'лежит у кровати');
+  assert.equal(p.sleeping, true);
 });
 
 test('админ: несчастный случай, смерть и воскрешение', () => {
@@ -490,4 +493,95 @@ test('давно погибшие уходят в архив домовой кн
   assert.equal(game.playerByToken(p.token), null);
   assert.equal(game.state.archive[0].name, 'Иван');
   assert.equal(game.adminSnapshot().archived, 1);
+});
+
+test('выход из игры не спасает: тело идёт домой ногами', () => {
+  const { game, advance } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 120 });
+  game.setOnline(p.id, false);
+  assert.ok(p.homeward);
+  advance(1000);
+  assert.equal(p.location.place, 'corridor', 'ещё в пути');
+  advance(30000);
+  assert.equal(game.locationKey(p), `home:${p.apartment.number}`);
+  assert.equal(p.homeward, null);
+});
+
+test('застрявший в лифте и после выхода остаётся в кабине', () => {
+  const { game, advance } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  walkTo(game, p, type('lift'));
+  game.move(p, { place: 'corridor', floor: 50, via: 'lift' });
+  game.admin('breakdown', { key: 'lift', broken: true });
+  advance(2000);
+  game.setOnline(p.id, false);
+  advance(5 * 60000);
+  assert.equal(p.location.place, 'lift');
+  assert.equal(p.travel.stuck, true);
+  game.admin('breakdown', { key: 'lift', broken: false });
+  advance(10000);
+  assert.equal(game.locationKey(p), 'corridor:50', 'доехал');
+  game.admin('breakdown', { key: 'lift', broken: false });
+  advance(60000);
+  assert.equal(p.location.place, 'home', 'и дошёл домой');
+});
+
+test('в тумане тело ушедшего не идёт домой и получает полный урон', () => {
+  const { game, advance } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  game.admin('fog', { from: 101, to: 101, warnSec: 0, durationMin: 2 });
+  game.setOnline(p.id, false);
+  advance(60000);
+  assert.equal(p.location.place, 'corridor', 'ждёт отбоя');
+  assert.ok(p.stats.health <= 85, `туман бьёт отсутствующего: ${p.stats.health}`);
+  advance(2 * 60000);
+  advance(60000);
+  assert.equal(p.location.place, 'home', 'после отбоя дошёл');
+});
+
+test('голод сам по себе не убивает того, кто не в сети', () => {
+  const { game, advance } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('setStats', { id: p.id, stats: { hunger: 12 } });
+  game.setOnline(p.id, false);
+  advance(3 * 3600 * 1000 / 20); // ускоренно: несколько часов тиков не нужны — порог проверяется каждый тик
+  assert.ok(p.stats.hunger >= C.BALANCE.offlineHungerFloor - 0.001);
+  game.admin('setStats', { id: p.id, stats: { hunger: 0, health: 30 } });
+  advance(10 * 60000);
+  assert.equal(p.alive, true, 'от голода отсутствующий не умирает');
+});
+
+test('квитанция ЖЭК: кто стучал и что случилось, пока вас не было', () => {
+  const { game, clock, advance } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  game.setOnline(a.id, false);
+  game.admin('teleport', { id: b.id, place: 'corridor', floor: 101 });
+  walkTo(game, b, (o) => o.type === 'apt' && o.number === a.apartment.number);
+  game.knock(b, a.apartment.number);
+  game.admin('breakdown', { key: 'canteen', broken: true });
+  clock.t += 10 * 60000;
+  advance(1000);
+  const notes = [];
+  game.on('notify', (n) => notes.push(n));
+  game.setOnline(a.id, true);
+  const receipt = notes.find((n) => n.style === 'receipt');
+  assert.ok(receipt, 'квитанция пришла');
+  assert.match(receipt.text, /Вас не было/);
+  assert.match(receipt.text, /Стучали в дверь: Мария/);
+  assert.match(receipt.text, /Столовая/);
+});
+
+test('отсутствующие видны соседям в сцене, но помечены', () => {
+  const { game } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  for (const p of [a, b]) game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  game.setOnline(a.id, false);
+  const actors = game.sceneActors('corridor:101');
+  assert.equal(actors.find((x) => x.id === a.id).away, true);
+  assert.equal(actors.find((x) => x.id === b.id).away, false);
 });

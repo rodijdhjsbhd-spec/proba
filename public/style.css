@@ -373,3 +373,12 @@ body.sanity-critical .place h1 { animation: flicker 2s infinite; }
   .stage { height: 56vh; }
   .controls-hint { display: none; }
 }
+
+/* Квитанция ЖЭК «Пока вас не было» */
+#modal-body p { white-space: pre-line; }
+.modal.receipt .modal-card {
+  background: #ece6d3; color: #222; border: 0; border-top: 6px dashed #b9b29b; border-bottom: 6px dashed #b9b29b;
+  font-family: var(--mono); font-size: 14px; line-height: 1.55;
+}
+.modal.receipt h3 { color: #6b2a24; font-family: var(--mono); letter-spacing: .12em; text-transform: uppercase; }
+.modal.receipt .btn { color: #222; }

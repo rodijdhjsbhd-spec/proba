@@ -60,6 +60,16 @@ function plural(n, one, few, many) {
 }
 const talons = (n) => `${n} ${plural(n, 'талон', 'талона', 'талонов')}`;
 
+/** «3 ч 12 мин», «17 мин», «меньше минуты» */
+function fmtDuration(ms) {
+  const min = Math.floor(ms / 60000);
+  if (min < 1) return 'меньше минуты';
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  if (!h) return `${m} мин`;
+  return m ? `${h} ч ${m} мин` : `${h} ч`;
+}
+
 function freshState() {
   return {
     version: 1,
@@ -101,6 +111,12 @@ class Game extends EventEmitter {
       const scene = this.sceneOf(p);
       if (!p.pos || !World.canStand(scene, p.pos.x, p.pos.y)) p.pos = { ...this.map.spawn(scene.key), d: 'down' };
       p.posSeq = p.posSeq || 1;
+      // после перезапуска сервера все не в сети: кто был не дома — идёт домой
+      if (p.alive) {
+        p.leftAt = p.leftAt || p.lastSeen || this.now();
+        p.absence = p.absence || { knocks: [] };
+        if (!this.isHome(p) && !p.homeward) p.homeward = { since: this.now(), arriveAt: null };
+      }
     }
   }
 
@@ -148,27 +164,130 @@ class Game extends EventEmitter {
     return this.onlineSet.has(id);
   }
 
+  /** Жилец у себя в квартире. */
+  isHome(p) {
+    return p.location.place === 'home';
+  }
+
   setOnline(id, online) {
     const p = this.getPlayer(id);
     if (!p) return;
+    const now = this.now();
     if (online) {
+      const wasAway = !this.onlineSet.has(id);
       this.onlineSet.add(id);
-      p.lastSeen = this.now();
+      p.lastSeen = now;
+      if (!p.alive || !wasAway) return;
+      if (p.homeward) {
+        // вернулся по дороге — тело там, где успело дойти
+        p.homeward = null;
+      }
+      if (p.leftAt && now - p.leftAt >= B.receiptMinAbsenceMin * 60000) this.sendReceipt(p, now);
+      p.leftAt = null;
+      p.absence = null;
+      this.dirty([p.id, ...this.othersAt(p).map((q) => q.id)]);
       return;
     }
     this.onlineSet.delete(id);
-    p.lastSeen = this.now();
-    // Ушедший из игры жилец «засыпает» у себя дома.
-    if (p.alive) {
-      if (p.job) p.job = null;
-      if (p.location.place !== 'home') {
-        p.travel = null;
-        p.sealed = false;
-        this.relocate(p, { place: 'home', floor: p.apartment.floor }, 'bed');
-      }
+    p.lastSeen = now;
+    if (!p.alive) return;
+    p.leftAt = now;
+    p.absence = { knocks: [], stats: Object.fromEntries(STAT_KEYS.map((k) => [k, Math.round(p.stats[k])])), money: p.money };
+    if (p.job) p.job = null;
+    if (this.isHome(p)) {
       p.sleeping = !this.hasCondition(p, 'insomnia');
+    } else {
+      // Выход из игры не спасает: тело идёт домой с обычной скоростью, застрявший остаётся в лифте,
+      // а в тумане ждёт отбоя. Пока идёт — соседи его видят.
+      p.homeward = { since: now, arriveAt: null };
     }
     this.dirty(this.othersAt(p).map((q) => q.id));
+  }
+
+  /** Сколько миллисекунд идти домой отсюда (null — путь закрыт). */
+  routeHomeMs(p) {
+    const here = p.location;
+    const walk = (a, b) => (a && b ? Math.hypot(a.x - b.x, a.y - b.y) / World.SPEED : 0);
+    let sec = 0;
+    let from = p.pos;
+    if (here.place !== 'corridor') {
+      const exit = this.sceneOf(p).objects.find((o) => o.type === 'exit' || o.type === 'hermodoor');
+      sec += walk(from, exit && exit.spot) + 1;
+      const corridor = this.map.scene(`corridor:${here.floor}`);
+      const door = corridor.objects.find((o) => (here.place === 'home' ? o.type === 'apt' : o.type === 'facility'));
+      from = door ? door.spot : this.map.spawn(corridor.key);
+    }
+    const home = this.map.scene(`corridor:${p.apartment.floor}`);
+    const myDoor = home.objects.find((o) => o.type === 'apt' && o.number === p.apartment.number);
+    if (here.floor !== p.apartment.floor) {
+      const diff = Math.abs(here.floor - p.apartment.floor);
+      const corridor = this.map.scene(`corridor:${here.floor}`);
+      const liftWorks = !this.world.breakdowns.lift;
+      if (!liftWorks && this.hasBlock(p, 'stairs')) return null;
+      const exitObj = corridor.objects.find((o) => o.type === (liftWorks ? 'lift' : 'stairs'));
+      sec += walk(from, exitObj && exitObj.spot);
+      sec += liftWorks ? B.liftBaseSec + diff * B.liftSecPerFloor : diff * B.stairsSecPerFloor;
+      const arrive = home.objects.find((o) => o.type === (liftWorks ? 'lift' : 'stairs'));
+      sec += walk(arrive && arrive.spot, myDoor && myDoor.spot);
+    } else {
+      sec += walk(from, myDoor && myDoor.spot);
+    }
+    return Math.round((sec + 1) * 1000);
+  }
+
+  /** Тело ушедшего жильца бредёт домой. */
+  updateHomeward(p, now) {
+    const h = p.homeward;
+    if (p.travel) return; // едет в лифте или идёт по лестнице — ждём прибытия (застрявший так и стоит)
+    if (this.inFog(p.location.floor)) {
+      h.arriveAt = null; // в тумане не идёт — ждёт отбоя
+      return;
+    }
+    if (h.arriveAt == null) {
+      const ms = this.routeHomeMs(p);
+      if (ms == null) return;
+      h.arriveAt = now + ms;
+    }
+    if (now < h.arriveAt) return;
+    const witnesses = this.othersAt(p);
+    p.homeward = null;
+    this.relocate(p, { place: 'home', floor: p.apartment.floor }, 'bed');
+    p.sleeping = !this.hasCondition(p, 'insomnia');
+    this.dirty(witnesses.map((q) => q.id));
+  }
+
+  /** Квитанция ЖЭК «Пока вас не было»: что случилось, пока жилец был не в сети. */
+  sendReceipt(p, now) {
+    const a = p.absence || { knocks: [] };
+    const lines = [`Вас не было: ${fmtDuration(now - p.leftAt)}.`];
+    if (p.location.place === 'home') lines.push('Вы проснулись у себя дома.');
+    else if (p.travel && p.travel.stuck) lines.push('Вы очнулись в застрявшем лифте.');
+    else if (p.travel) lines.push('Вы очнулись по дороге — в лифте.');
+    else lines.push(`До дома вы так и не дошли: ${this.placeTitle(p)}.`);
+    if (a.stats) {
+      const parts = STAT_KEYS.map((k) => [STAT_NAMES[k], a.stats[k], Math.round(p.stats[k])]).filter(([, was, now2]) => was !== now2);
+      if (parts.length) lines.push(parts.map(([n, was, now2]) => `${n}: ${was} → ${now2}`).join(' · '));
+    }
+    if (a.knocks && a.knocks.length) {
+      const by = new Map();
+      for (const k of a.knocks) by.set(`${k.name} (кв. ${k.apt})`, (by.get(`${k.name} (кв. ${k.apt})`) || 0) + 1);
+      lines.push(`Стучали в дверь: ${[...by].map(([who, n]) => (n > 1 ? `${who} ×${n}` : who)).join(', ')}.`);
+    }
+    for (const extra of this.receiptExtras(p, a)) lines.push(extra);
+    const since = p.leftAt;
+    const events = this.state.log.filter((e) => e.ts >= since && e.kind === 'event').slice(-6);
+    if (events.length) lines.push('В доме:', ...events.map((e) => `— ${e.text}`));
+    const neighbours = this.state.log.filter(
+      (e) => e.ts >= since && (e.kind === 'death' || e.kind === 'join') && e.playerId !== p.id && e.floor === p.apartment.floor,
+    );
+    if (neighbours.length) lines.push('На вашем этаже:', ...neighbours.slice(-5).map((e) => `— ${e.text.replace(/^☠ /, 'умер: ')}`));
+    this.notify([p], { title: 'Квитанция ЖЭК', text: lines.join('\n'), style: 'receipt', journal: false });
+    this.journal(p, `Вы вернулись. Вас не было ${fmtDuration(now - p.leftAt)}.`);
+  }
+
+  /** Дополнительные строки квитанции (их добавляют другие механики — например, передачки под дверью). */
+  receiptExtras() {
+    return [];
   }
 
   gameClock() {
@@ -184,7 +303,8 @@ class Game extends EventEmitter {
   }
 
   log(text, kind = 'info', playerId = null) {
-    const entry = { ts: this.now(), clock: this.gameClock().label, text, kind, playerId };
+    const who = playerId ? this.getPlayer(playerId) : null;
+    const entry = { ts: this.now(), clock: this.gameClock().label, text, kind, playerId, floor: who ? who.apartment.floor : null };
     this.state.log.push(entry);
     if (this.state.log.length > 500) this.state.log.splice(0, this.state.log.length - 500);
     this.emit('log', entry);
@@ -298,6 +418,10 @@ class Game extends EventEmitter {
     p.posSeq = (p.posSeq || 0) + 1;
     p.posAt = this.now();
     p.moveBudget = 1;
+    if (p.homeward) {
+      if (this.isHome(p)) p.homeward = null;
+      else p.homeward.arriveAt = null;
+    }
   }
 
   /** Объект сцены рядом с жильцом, подходящий под условие (или null). */
@@ -338,8 +462,9 @@ class Game extends EventEmitter {
   sceneActors(key) {
     const now = this.now();
     return this.alivePlayers()
-      .filter((p) => this.isOnline(p.id) && this.locationKey(p) === key)
+      .filter((p) => this.locationKey(p) === key)
       .map((p) => ({
+        away: !this.isOnline(p.id),
         id: p.id,
         name: p.name,
         apt: p.apartment.number,
@@ -510,8 +635,12 @@ class Game extends EventEmitter {
 
   tickPlayer(p, now, dt, groups) {
     const online = this.isOnline(p.id);
-    const d = dt * (online ? 1 : B.offlineFactor);
     if (p.travel) this.updateTravel(p, now);
+    if (!online && p.homeward) this.updateHomeward(p, now);
+    const atHomeNow = p.location.place === 'home';
+    // d — нужды и болезни (у отсутствующих медленно), dh — беды бога (туман, темнота)
+    const d = dt * (online ? 1 : B.offlineFactor);
+    const dh = dt * (online ? 1 : atHomeNow ? B.offlineHazardHome : 1);
 
     const delta = { health: 0, hunger: 0, energy: 0, sanity: 0 };
     const harm = {};
@@ -541,28 +670,31 @@ class Game extends EventEmitter {
       let factor = this.world.fog.intensity || 1;
       if (this.hasItem(p, 'gasmask')) {
         factor *= B.gasMaskFactor;
-        this.wearGasmask(p, d);
+        this.wearGasmask(p, dh);
       }
-      const hp = (atHome ? B.fogHpHomeUnsealedPerMin : B.fogHpOutsidePerMin) * factor * d;
+      const hp = (atHome ? B.fogHpHomeUnsealedPerMin : B.fogHpOutsidePerMin) * factor * dh;
       delta.health += hp;
       hurt('Погиб в тумане', hp);
-      delta.sanity += (atHome ? B.fogSanityHomeUnsealedPerMin : B.fogSanityOutsidePerMin) * factor * d;
-      if (!this.hasCondition(p, 'fogsick') && this.random() < B.fogSicknessChancePerMin * factor * d) {
+      delta.sanity += (atHome ? B.fogSanityHomeUnsealedPerMin : B.fogSanityOutsidePerMin) * factor * dh;
+      if (!this.hasCondition(p, 'fogsick') && this.random() < B.fogSicknessChancePerMin * factor * dh) {
         this.addCondition(p, 'fogsick');
         this.log(`${p.name} подхватил туманную хворь`, 'disease', p.id);
       }
     }
 
-    if (this.isDark(floor) && !this.hasItem(p, 'flashlight')) delta.sanity += B.darkSanityPerMin * d;
+    if (this.isDark(floor) && !this.hasItem(p, 'flashlight')) delta.sanity += B.darkSanityPerMin * dh;
 
-    if (p.stats.hunger <= 0) {
+    // Голод сам по себе отсутствующего не убивает: сытость не опускается ниже порога
+    if (!online && p.stats.hunger + delta.hunger < B.offlineHungerFloor) delta.hunger = Math.min(0, B.offlineHungerFloor - p.stats.hunger);
+
+    if (p.stats.hunger <= 0 && online) {
       const hp = B.starvationHpPerMin * d;
       delta.health += hp;
       hurt('Умер от голода', hp);
     } else if (p.stats.hunger > 50 && p.conditions.length === 0 && !fogged) {
       delta.health += B.healthRegenPerMin * d;
     }
-    if (p.stats.sanity <= 0) {
+    if (p.stats.sanity <= 0 && online) {
       const hp = B.sanityZeroHpPerMin * d;
       delta.health += hp;
       hurt('Сошёл с ума', hp);
@@ -804,6 +936,10 @@ class Game extends EventEmitter {
     if (owner && this.isOnline(owner.id) && owner.location.place === 'home') {
       this.notify([owner], { title: 'Стук в дверь', text: `В глазок видно: ${p.name} из кв. ${p.apartment.number}.`, style: 'knock', journal: false });
       return { ok: true, message: 'Вы постучали. За дверью кто-то шевелится.' };
+    }
+    if (owner && !this.isOnline(owner.id) && owner.absence) {
+      owner.absence.knocks.push({ name: p.name, apt: p.apartment.number, ts: now });
+      if (owner.absence.knocks.length > 20) owner.absence.knocks.shift();
     }
     return { ok: true, message: owner ? 'Тишина. Похоже, хозяина нет дома.' : 'Тишина. Квартира пустует.' };
   }
@@ -1724,6 +1860,7 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       travel: p.travel ? { via: p.travel.via, toFloor: p.travel.toFloor, stuck: !!p.travel.stuck } : null,
       sealed: p.sealed,
       sleeping: p.sleeping,
+      homeward: !!p.homeward,
       working: !!p.job,
       shifts: p.shifts || 0,
       conditions: p.conditions.map((c) => ({ id: c.id, name: C.CONDITIONS[c.id]?.name || c.id, remainingSec: c.until ? Math.round((c.until - now) / 1000) : null })),
