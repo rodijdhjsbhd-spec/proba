@@ -93,3 +93,16 @@ textarea { width: 100%; resize: vertical; min-height: 60px; }
 }
 .chat-log .note-feed { color: #e3d58a; }
 .chat-log .note-feed .btn { margin-left: 6px; }
+
+/* Планировщик */
+.sched { margin-top: 10px; border-top: 1px dashed var(--line); padding-top: 8px; }
+.sched summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+.sched[open] summary { color: var(--amber); margin-bottom: 8px; }
+.schedule-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; }
+.schedule-list li { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 6px 8px; background: var(--panel-2); border-radius: var(--radius); }
+.schedule-list li .t { font-family: var(--mono); color: var(--amber); }
+.schedule-list li .muted { color: var(--muted); font-size: 12px; }
+.schedule-list li .btn { margin-left: auto; }
+.admin-log .schedule { border-color: var(--blue); }
+.admin-log .social { border-color: var(--violet); }
+.hint { color: var(--muted); font-size: 13px; }

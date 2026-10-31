@@ -91,6 +91,7 @@ function freshState() {
     doorDrops: {}, // кв. → записки и передачки, ждущие хозяина у гермодвери
     boardNotes: {}, // этаж → листки жильцов на доске объявлений
     noteFeed: [], // лента записок и листков для Пульта
+    schedule: [], // планировщик ЖЭК: отложенные и повторяющиеся команды
   };
 }
 
@@ -632,6 +633,7 @@ class Game extends EventEmitter {
 
   updateWorldTimers(now) {
     const w = this.world;
+    this.runSchedule(now);
     for (const key of Object.keys(w.breakdowns)) {
       const b = w.breakdowns[key];
       if (b && b.until && now >= b.until) this.setBreakdown(key, false, {});
@@ -657,6 +659,44 @@ class Game extends EventEmitter {
     if (this.world.tick % 60 === 0) {
       this.archiveDead(now);
       this.expireBoardNotes(now);
+    }
+  }
+
+  /** Планировщик ЖЭК: выполнить команды, время которых пришло. */
+  runSchedule(now) {
+    const due = this.state.schedule.filter((e) => now >= e.at).slice(0, 10);
+    for (const e of due) {
+      const res = this.admin(e.cmd, JSON.parse(JSON.stringify(e.args || {})));
+      e.runs = (e.runs || 0) + 1;
+      this.log(`По расписанию: ${e.label}${res.ok ? (res.message ? ` — ${res.message}` : '') : ` — не вышло: ${res.error}`}`, 'schedule');
+      if (e.repeatMs) {
+        e.at += e.repeatMs;
+        if (e.at <= now) e.at = now + e.repeatMs;
+      } else {
+        this.state.schedule = this.state.schedule.filter((x) => x !== e);
+      }
+    }
+  }
+
+  /** Сдвинуть все таймеры мира на ms (после паузы: всё должно продолжиться с того же места). */
+  shiftTimers(ms) {
+    const w = this.world;
+    if (w.fog) {
+      w.fog.warnUntil += ms;
+      w.fog.until += ms;
+    }
+    if (w.power && w.power.until) w.power.until += ms;
+    for (const b of Object.values(w.breakdowns)) if (b && b.until) b.until += ms;
+    for (const e of this.state.schedule) e.at += ms;
+    for (const p of this.players()) {
+      for (const c of p.conditions) if (c.until) c.until += ms;
+      if (p.travel && !p.travel.stuck) {
+        p.travel.arriveAt += ms;
+        p.travel.startedAt += ms;
+      }
+      if (p.down) p.down.until += ms;
+      if (p.homeward && p.homeward.arriveAt) p.homeward.arriveAt += ms;
+      if (p.job) p.job.startedAt += ms;
     }
   }
 
@@ -1808,8 +1848,72 @@ class Game extends EventEmitter {
 // ---------------------------------------------------------------------------
 const ADMIN_COMMANDS = {
   pause({ paused }) {
-    this.world.paused = !!paused;
+    const w = this.world;
+    if (!!paused === !!w.paused) return { ok: true };
+    if (paused) {
+      w.pausedAt = this.now();
+    } else if (w.pausedAt) {
+      // всё, что тикало по часам (туман, поломки, болезни, расписание…), продолжается с того же места
+      this.shiftTimers(this.now() - w.pausedAt);
+      w.pausedAt = null;
+    }
+    w.paused = !!paused;
     this.log(paused ? 'Мир поставлен на паузу' : 'Мир снят с паузы', 'admin');
+  },
+
+  /**
+   * Запланировать любую команду Пульта.
+   *   mode: 'in'     — через value реальных минут
+   *         'at'     — в игровое время value ('ЧЧ:ММ')
+   *         'window' — в случайный момент в ближайшие value минут
+   *   repeat: 'none' | 'every' (каждые repeatMin минут) | 'daily' (каждые игровые сутки)
+   */
+  schedule({ cmd, args = {}, label, mode = 'in', value, repeat = 'none', repeatMin }) {
+    if (!ADMIN_COMMANDS[cmd] || ['schedule', 'unschedule', 'pause', 'erase'].includes(cmd)) throw new Error('Эту команду нельзя поставить в расписание');
+    const now = this.now();
+    const gameMinMs = 1000; // каждый тик добавляет tickMs/1000 игровых минут: 1 игровая минута = 1 реальная секунда
+    let at;
+    if (mode === 'at') {
+      const m = /^(\d{1,2}):(\d{2})$/.exec(String(value || '').trim());
+      if (!m || Number(m[1]) > 23 || Number(m[2]) > 59) throw new Error('Время — в виде ЧЧ:ММ, например 02:00');
+      const target = Number(m[1]) * 60 + Number(m[2]);
+      const cur = Math.floor(this.world.gameMinutes) % 1440;
+      const until = (target - cur + 1440) % 1440 || 1440;
+      at = now + until * gameMinMs;
+    } else {
+      const min = Number(value);
+      if (!Number.isFinite(min) || min < 0 || min > 7 * 24 * 60) throw new Error('Минуты — от 0 до недели');
+      at = now + (mode === 'window' ? this.random() * min : min) * 60000;
+    }
+    let repeatMs = null;
+    if (repeat === 'every') {
+      const r = Number(repeatMin);
+      if (!Number.isFinite(r) || r < 1) throw new Error('Повтор — не чаще раза в минуту');
+      repeatMs = r * 60000;
+    } else if (repeat === 'daily') {
+      repeatMs = 1440 * gameMinMs;
+    }
+    const entry = {
+      id: newId('s'),
+      cmd,
+      args: JSON.parse(JSON.stringify(args || {})),
+      label: sanitizeText(label, 80) || cmd,
+      at: Math.round(at),
+      repeatMs,
+      createdAt: now,
+      runs: 0,
+    };
+    this.state.schedule.push(entry);
+    this.log(`Запланировано: ${entry.label}${repeatMs ? ' (с повтором)' : ''}`, 'admin');
+    return { ok: true, message: `Запланировано: ${entry.label} — через ${fmtDuration(entry.at - now)}`, id: entry.id };
+  },
+
+  unschedule({ id }) {
+    const e = this.state.schedule.find((x) => x.id === id);
+    if (!e) throw new Error('Такого в расписании нет');
+    this.state.schedule = this.state.schedule.filter((x) => x !== e);
+    this.log(`Снято с расписания: ${e.label}`, 'admin');
+    return { ok: true, message: 'Снято с расписания' };
   },
 
   // ---- воздействие на конкретного жильца ----
@@ -2230,6 +2334,10 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
     },
     online: this.onlineSet.size,
     archived: this.state.archive.length,
+    schedule: this.state.schedule
+      .slice()
+      .sort((a, b) => a.at - b.at)
+      .map((e) => ({ id: e.id, label: e.label, cmd: e.cmd, inSec: Math.max(0, Math.round(((w.paused && w.pausedAt ? e.at + (now - w.pausedAt) : e.at) - now) / 1000)), repeatSec: e.repeatMs ? Math.round(e.repeatMs / 1000) : null, runs: e.runs || 0 })),
     players: this.players().map((p) => (!p.alive ? {
       id: p.id,
       name: p.name,

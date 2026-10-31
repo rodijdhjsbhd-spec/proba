@@ -228,6 +228,44 @@
     return h('section', { class: `panel event-card ${cls || ''}` }, h('h2', { text: title }), hint ? h('p', { class: 'hint', text: hint }) : null, ...body);
   }
 
+  /**
+   * Добавить к карточке события блок «⏱ Запланировать»: та же команда, но позже или по расписанию.
+   * opts: { label, cmd, args: () => {...} | null, extra: [элементы выбора, если нужны] }
+   */
+  function withSchedule(cardEl, opts) {
+    const mode = select([['in', 'через N минут'], ['at', 'в игровое время'], ['window', 'в случайный момент за N минут']], 'in');
+    const value = h('input', { value: '10', 'aria-label': 'Минуты или время ЧЧ:ММ' });
+    const repeat = select([['none', 'один раз'], ['every', 'каждые N минут'], ['daily', 'каждые игровые сутки']], 'none');
+    const repeatMin = num(60, { min: 1, 'aria-label': 'Повтор, минут' });
+    const sync = () => {
+      if (mode.value === 'at' && !/:/.test(value.value)) value.value = '02:00';
+      if (mode.value !== 'at' && /:/.test(value.value)) value.value = '10';
+      repeatMin.disabled = repeat.value !== 'every';
+    };
+    mode.addEventListener('change', sync);
+    repeat.addEventListener('change', sync);
+    sync();
+    const val = (x) => (typeof x === 'function' ? x() : x);
+    cardEl.append(
+      h(
+        'details',
+        { class: 'sched' },
+        h('summary', { text: '⏱ Запланировать' }),
+        ...(opts.extra || []),
+        h('div', { class: 'grid2' }, field('Когда', mode), field('Минут или ЧЧ:ММ', value)),
+        h('div', { class: 'grid2' }, field('Повтор', repeat), field('Каждые, мин', repeatMin)),
+        actions(
+          button('Поставить в расписание', () => {
+            const args = opts.args();
+            if (!args) return;
+            cmd('schedule', { cmd: val(opts.cmd), args, label: val(opts.label), mode: mode.value, value: value.value, repeat: repeat.value, repeatMin: repeatMin.value });
+          }),
+        ),
+      ),
+    );
+    return cardEl;
+  }
+
   function actions(...buttons) {
     return h('div', { class: 'actions' }, buttons);
   }
@@ -286,6 +324,12 @@
       ),
     );
 
+    withSchedule(grid.lastElementChild, {
+      label: () => `Туман на этажах ${fogFrom.value}–${fogTo.value}`,
+      cmd: 'fog',
+      args: () => ({ from: fogFrom.value, to: fogTo.value, warnSec: fogWarn.value, durationMin: fogDur.value, intensity: fogPower.value }),
+    });
+
     // --- Поломки ---
     A.breakdownRows = {};
     const bdRows = Object.entries(C.breakdowns).map(([key, def]) => {
@@ -301,6 +345,15 @@
     });
     grid.append(card('Поломки оборудования', 'Минуты — через сколько починится само (0 — пока вы не почините).', 'warn-card', bdRows));
 
+    const bdKey = select(opts(C.breakdowns));
+    const bdDur = num(10, { min: 0, max: 600 });
+    withSchedule(grid.lastElementChild, {
+      label: () => `Поломка: ${C.breakdowns[bdKey.value].name}`,
+      cmd: 'breakdown',
+      args: () => ({ key: bdKey.value, broken: true, durationMin: bdDur.value }),
+      extra: [h('div', { class: 'grid2' }, field('Что сломать', bdKey), field('Минут до починки (0 — ∞)', bdDur))],
+    });
+
     // --- Свет ---
     const pwFrom = num(firstFloor, { min: 1, max: 999 });
     const pwTo = num(firstFloor + 9, { min: 1, max: 999 });
@@ -315,6 +368,12 @@
       ),
     );
 
+    withSchedule(grid.lastElementChild, {
+      label: () => `Отключение света ${pwFrom.value}–${pwTo.value}`,
+      cmd: 'power',
+      args: () => ({ on: false, from: pwFrom.value, to: pwTo.value, durationMin: pwDur.value }),
+    });
+
     // --- Ложки ---
     const steal = num(30, { min: 0, max: 100 });
     grid.append(
@@ -326,6 +385,8 @@
         actions(button('Украсть', () => cmd('cutlery', { steal: true, percent: steal.value }), 'primary'), button('Вернуть ложки в столовую', () => cmd('cutlery', { steal: false }))),
       ),
     );
+
+    withSchedule(grid.lastElementChild, { label: 'Кража столовых приборов', cmd: 'cutlery', args: () => ({ steal: true, percent: steal.value }) });
 
     // --- Эпидемия ---
     const epiTarget = targetPicker('random');
@@ -343,6 +404,12 @@
       ),
     );
 
+    withSchedule(grid.lastElementChild, {
+      label: () => `Болезнь: ${C.conditions[epiCond.value].name}`,
+      cmd: 'infect',
+      args: () => ({ target: epiTarget.get(), condition: epiCond.value, silent: epiSilent.checked }),
+    });
+
     // --- Несчастный случай ---
     const accTarget = targetPicker('random');
     const accSel = select(opts(C.accidents));
@@ -353,6 +420,12 @@
     grid.append(
       card('Несчастный случай', null, 'danger-card', accTarget.el, field('Что случится', accSel), accText, actions(button('Устроить', () => cmd('accident', { target: accTarget.get(), accident: accSel.value }), 'primary'))),
     );
+
+    withSchedule(grid.lastElementChild, {
+      label: () => `Несчастный случай: ${C.accidents[accSel.value].name}`,
+      cmd: 'accident',
+      args: () => ({ target: accTarget.get(), accident: accSel.value }),
+    });
 
     // --- Гуманитарка ---
     const aidTarget = targetPicker('all');
@@ -376,10 +449,22 @@
       ),
     );
 
+    withSchedule(grid.lastElementChild, {
+      label: () => aidTitle.value || 'Гуманитарная помощь',
+      cmd: 'aid',
+      args: () => ({ target: aidTarget.get(), money: aidMoney.value, items: aidItem.value ? { [aidItem.value]: aidCount.value } : {}, title: aidTitle.value, text: aidText.value }),
+    });
+
     // --- Объявление ---
     const annTitle = h('input', { value: 'Объявление ЖЭК', maxlength: '80' });
     const annText = h('textarea', { maxlength: '500', placeholder: 'Уважаемые жильцы! В связи с…' });
     grid.append(card('Объявление по радиоточке', 'Всплывает у всех живых жильцов и попадает в общий чат.', '', field('Заголовок', annTitle), field('Текст', annText), actions(button('Объявить', () => cmd('announce', { title: annTitle.value, text: annText.value }), 'primary'))));
+
+    withSchedule(grid.lastElementChild, {
+      label: () => `Объявление: ${annText.value.slice(0, 40)}`,
+      cmd: 'announce',
+      args: () => (annText.value.trim() ? { title: annTitle.value, text: annText.value } : (toast('Сначала напишите текст объявления', 'error'), null)),
+    });
 
     // --- Шёпот ---
     const whTarget = targetPicker('player');
@@ -389,8 +474,15 @@
       card('Шёпот', 'Жуткое личное сообщение. Видит только адресат.', 'whisper-card', whTarget.el, field('От кого', whFrom), field('Текст', whText), actions(button('Шепнуть', () => cmd('whisper', { target: whTarget.get(), from: whFrom.value, text: whText.value }), 'primary'))),
     );
 
+    withSchedule(grid.lastElementChild, {
+      label: () => `Шёпот: ${whText.value.slice(0, 40)}`,
+      cmd: 'whisper',
+      args: () => (whText.value.trim() ? { target: whTarget.get(), from: whFrom.value, text: whText.value } : (toast('Сначала напишите, что шепнуть', 'error'), null)),
+    });
+
     // --- Произвольное событие ---
     grid.append(buildCustomEvent());
+    withSchedule(grid.lastElementChild, { label: () => A.customEvent.label(), cmd: 'custom', args: () => A.customEvent.args() });
   }
 
   // Заготовки для произвольного события
@@ -434,14 +526,19 @@
       typeSel.dispatchEvent(new Event('change'));
     });
 
-    const run = () => {
+    const collect = () => {
       const effect = Object.fromEntries(Object.entries(deltas).map(([k, input]) => [k, Number(input.value) || 0]));
       if (item.value) effect.items = { [item.value]: Number(itemCount.value) || 0 };
       if (condition.value) effect.condition = condition.value;
       if (cure.checked) effect.cure = true;
       if (kill.checked) effect.kill = true;
-      if (kill.checked && !confirm('Событие убьёт всех, кого коснётся. Точно?')) return;
-      cmd('custom', { target: target.get(), title: title.value, text: text.value, style: style.value, effect });
+      if (kill.checked && !confirm('Событие убьёт всех, кого коснётся. Точно?')) return null;
+      return { target: target.get(), title: title.value, text: text.value, style: style.value, effect };
+    };
+    A.customEvent = { args: collect, label: () => title.value || 'Своё событие' };
+    const run = () => {
+      const args = collect();
+      if (args) cmd('custom', args);
     };
 
     return card(
@@ -479,6 +576,7 @@
     $('#counts').textContent = `в сети ${s.online} · живых ${alive} · погибших ${s.players.length - alive}`;
     $('#pause-btn').textContent = s.world.paused ? '▶ Запустить время' : '⏸ Пауза мира';
     renderStatus();
+    renderSchedule();
     renderPlayers();
     renderCard();
     for (const picker of A.pickers) picker.refresh();
@@ -538,6 +636,40 @@
       );
     });
     for (const [el, fn] of A.statusTimers || []) el.textContent = fn();
+  }
+
+  function renderSchedule() {
+    const list = A.snap.schedule || [];
+    const fmt = (sec) => (sec >= 3600 ? `${Math.floor(sec / 3600)} ч ${Math.floor((sec % 3600) / 60)} мин` : fmtSec(sec));
+    memo('schedule', list.map((e) => [e.id, e.label, e.repeatSec, e.runs]), () => {
+      A.schedTimers = [];
+      $('#schedule-list').replaceChildren(
+        ...(list.length
+          ? list.map((e) => {
+              const t = h('span', { class: 't' });
+              A.schedTimers.push([t, e.id]);
+              return h(
+                'li',
+                null,
+                h('b', { text: e.label }),
+                ' · ',
+                t,
+                e.repeatSec
+                  ? h('span', { class: 'muted', text: ` · ${e.repeatSec === 1440 ? 'каждые игровые сутки (24 мин)' : `каждые ${Math.round(e.repeatSec / 60)} мин`} · срабатывало: ${e.runs}` })
+                  : null,
+                button('Отменить', () => cmd('unschedule', { id: e.id }), 'small'),
+              );
+            })
+          : [h('li', { class: 'empty', text: 'Ничего не запланировано. Откройте «⏱ Запланировать» в любой карточке на вкладке «События дома».' })]),
+      );
+    });
+    const byId = new Map(list.map((e) => [e.id, e]));
+    for (const [el, id] of A.schedTimers || []) {
+      const e = byId.get(id);
+      if (e) el.textContent = `через ${fmt(e.inSec)}${A.snap.world.paused ? ' (пауза)' : ''}`;
+    }
+    const tab = document.querySelector('.admin-tabs .tab[data-tab="schedule"]');
+    if (tab) tab.textContent = list.length ? `Расписание (${list.length})` : 'Расписание';
   }
 
   function whereText(p) {

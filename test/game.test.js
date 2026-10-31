@@ -823,3 +823,54 @@ test('дома без сознания не лежат — умирают; см�
   game.admin('accident', { id: b.id, accident: 'liftShaft' });
   assert.equal(b.alive, false);
 });
+
+test('планировщик: событие через N минут, повтор, отмена', () => {
+  const { game, advance } = makeWorld();
+  join(game, 'Иван');
+  const res = game.admin('schedule', { cmd: 'fog', args: { from: 101, to: 101, warnSec: 0, durationMin: 0.5 }, label: 'Туман на 101', mode: 'in', value: 1 });
+  assert.equal(res.ok, true, res.error);
+  assert.equal(game.adminSnapshot().schedule.length, 1);
+  advance(59000);
+  assert.equal(game.world.fog, null);
+  advance(2000);
+  assert.ok(game.world.fog, 'туман по расписанию');
+  assert.equal(game.adminSnapshot().schedule.length, 0, 'однократное снято после срабатывания');
+
+  const every = game.admin('schedule', { cmd: 'announce', args: { text: 'Проверка' }, label: 'Сводка', mode: 'in', value: 1, repeat: 'every', repeatMin: 1 });
+  advance(61000);
+  advance(61000);
+  assert.equal(game.state.schedule[0].runs, 2);
+  assert.equal(game.admin('unschedule', { id: every.id }).ok, true);
+  assert.equal(game.state.schedule.length, 0);
+  assert.equal(game.admin('schedule', { cmd: 'schedule', args: {}, mode: 'in', value: 1 }).ok, false, 'расписание в расписании нельзя');
+  assert.equal(game.admin('schedule', { cmd: 'fog', mode: 'at', value: '25:99' }).ok, false);
+});
+
+test('планировщик: игровое время и случайное окно', () => {
+  const { game, clock } = makeWorld({ random: () => 0.5 });
+  game.world.gameMinutes = 8 * 60; // 08:00
+  const now = clock.t;
+  game.admin('schedule', { cmd: 'announce', args: { text: 'Ночь' }, label: 'Ночное', mode: 'at', value: '02:00' });
+  assert.equal(game.state.schedule[0].at, now + 18 * 60 * 1000, '18 игровых часов = 18 реальных минут');
+  game.admin('schedule', { cmd: 'announce', args: { text: 'Когда-нибудь' }, mode: 'window', value: 10 });
+  assert.equal(game.state.schedule[1].at, now + 5 * 60000);
+});
+
+test('пауза замораживает таймеры: туман, болезни и расписание продолжаются с того же места', () => {
+  const { game, clock, advance } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('fog', { from: 101, to: 101, warnSec: 0, durationMin: 1 });
+  game.addCondition(p, 'flu');
+  game.admin('schedule', { cmd: 'announce', args: { text: 'x' }, mode: 'in', value: 2 });
+  const fogUntil = game.world.fog.until;
+  const fluUntil = p.conditions[0].until;
+  const at = game.state.schedule[0].at;
+  game.admin('pause', { paused: true });
+  clock.t += 10 * 60000; // десять минут паузы
+  game.admin('pause', { paused: false });
+  assert.equal(game.world.fog.until, fogUntil + 10 * 60000);
+  assert.equal(p.conditions[0].until, fluUntil + 10 * 60000);
+  assert.equal(game.state.schedule[0].at, at + 10 * 60000);
+  advance(1000);
+  assert.ok(game.world.fog, 'туман не кончился за время паузы');
+});

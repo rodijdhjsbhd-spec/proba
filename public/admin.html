@@ -45,6 +45,7 @@
     <nav class="admin-tabs" role="tablist">
       <button class="tab active" data-tab="players">Жильцы</button>
       <button class="tab" data-tab="events">События дома</button>
+      <button class="tab" data-tab="schedule">Расписание</button>
       <button class="tab" data-tab="log">Журнал</button>
       <button class="tab" data-tab="radio">Чаты</button>
     </nav>
@@ -81,6 +82,14 @@
         <div class="event-grid" id="event-grid"></div>
       </section>
 
+      <section class="tab-page" id="tab-schedule" hidden>
+        <div class="panel">
+          <h2>Расписание ЖЭК</h2>
+          <p class="hint">Отложенные и повторяющиеся события. Пауза мира замораживает и расписание.</p>
+          <ul class="schedule-list" id="schedule-list"></ul>
+        </div>
+      </section>
+
       <section class="tab-page" id="tab-log" hidden>
         <div class="panel">
           <div class="players-tools">
@@ -93,6 +102,8 @@
               <option value="trade">Обмены</option>
               <option value="join">Заселения</option>
               <option value="admin">Действия админа</option>
+              <option value="schedule">По расписанию</option>
+              <option value="social">Поступки жильцов</option>
             </select>
           </div>
           <ul class="admin-log" id="log"></ul>
