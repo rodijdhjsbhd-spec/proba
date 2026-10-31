@@ -42,6 +42,8 @@ ADMIN_PASSWORD=мой_пароль npm start
 | `REGISTER_LIMIT` | сколько жильцов в час можно заселить с одного адреса (по умолчанию 5, `0` — без ограничения) |
 | `TRUST_PROXY=1` | сервер стоит за вашим nginx/Caddy: адрес игрока берётся из `X-Forwarded-For` |
 | `DATA_FILE`, `BACKUP_DIR` | где хранить мир и копии |
+| `GH_BALANCE` | правки баланса без правки кода, JSON: `GH_BALANCE='{"hungerPerMin":-2,"workEnergyCost":8}'` (имена — из `BALANCE` в `server/content.js`) |
+| `OFFLINE_GRACE_MS` | сколько ждать переподключения, прежде чем считать жильца ушедшим (по умолчанию 20000) |
 
 Тесты игровой логики:
 

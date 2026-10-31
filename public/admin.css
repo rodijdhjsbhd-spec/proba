@@ -91,3 +91,5 @@ textarea { width: 100%; resize: vertical; min-height: 60px; }
   .stat-inputs, .event-card .grid5 { grid-template-columns: repeat(3, 1fr); }
   .event-grid { grid-template-columns: 1fr; }
 }
+.chat-log .note-feed { color: #e3d58a; }
+.chat-log .note-feed .btn { margin-left: 6px; }

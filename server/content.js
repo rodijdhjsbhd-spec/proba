@@ -78,6 +78,19 @@ const BALANCE = {
   start: { health: 100, hunger: 70, energy: 80, sanity: 90, money: 0 },
 };
 
+// Баланс можно подправить без правки кода: GH_BALANCE='{"hungerPerMin":-2}' npm start
+if (process.env.GH_BALANCE) {
+  try {
+    const overrides = JSON.parse(process.env.GH_BALANCE);
+    for (const [k, v] of Object.entries(overrides)) {
+      if (k in BALANCE && typeof v === typeof BALANCE[k]) BALANCE[k] = v;
+      else console.warn(`[content] GH_BALANCE: неизвестный или неверный параметр «${k}» пропущен`);
+    }
+  } catch (err) {
+    console.warn(`[content] GH_BALANCE не разобран: ${err.message}`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Предметы
 // ---------------------------------------------------------------------------
@@ -220,7 +233,17 @@ const RESERVED_NAMES = ['ЖЭК', 'Радиоточка', 'Голос за ст�
 // Через сколько реальных часов погибших уносят из Пульта в архив домовой книги
 const ARCHIVE_DEAD_AFTER_H = 24;
 
+// Записки, передачки и листки на доске
+const NOTES = {
+  maxLength: 300, // символов в записке
+  boardMaxLength: 200, // символов в листке на доске
+  perDoor: 10, // сколько бумажек и свёртков влезает под одну дверь
+  perBoard: 12, // сколько листков на одной доске
+  boardTtlH: 12, // через сколько реальных часов листок снимают
+  cooldownMs: 8000, // как часто один жилец может что-то подсовывать
+};
+
 module.exports = {
   BUILDING, FACILITIES, BALANCE, ITEMS, SHOPS, CONDITIONS, ACCIDENTS, PLACES, BREAKDOWNS, HALLUCINATIONS,
-  HALLUCINATION_VOICES, RESERVED_NAMES, ARCHIVE_DEAD_AFTER_H,
+  HALLUCINATION_VOICES, RESERVED_NAMES, ARCHIVE_DEAD_AFTER_H, NOTES,
 };

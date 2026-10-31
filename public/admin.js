@@ -821,6 +821,25 @@
 
   // ---- чаты ----
   function chatItem(m) {
+    if (m.channel === 'note') {
+      return h(
+        'li',
+        { class: 'note-feed' },
+        h('span', { class: 'where', text: `[под дверь кв. ${m.to}]` }),
+        h('span', { class: 'from', text: `${m.from.name} (${m.from.apt})${m.anon ? ' — анонимно' : ''}: ` }),
+        m.parcel ? `передачка: ${m.parcel}${m.text ? `. «${m.text}»` : ''}` : `«${m.text}»`,
+      );
+    }
+    if (m.channel === 'board') {
+      return h(
+        'li',
+        { class: 'note-feed' },
+        h('span', { class: 'where', text: `[доска ${m.floor} эт.]` }),
+        h('span', { class: 'from', text: `${m.from.name} (${m.from.apt}): ` }),
+        `«${m.text}» `,
+        h('button', { class: 'btn small', type: 'button', text: 'Снять', onclick: () => cmd('unpin', { id: m.noteId }) }),
+      );
+    }
     const where = m.channel === 'global' ? 'ДОМ' : m.where || m.key || 'рядом';
     return h(
       'li',

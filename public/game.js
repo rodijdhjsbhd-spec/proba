@@ -389,10 +389,16 @@
       case 'apt': {
         if (o.number === you.apartment.number) return { label: `Кв. ${o.number}`, sub: 'ваша квартира', actions: [{ label: 'Войти домой', run: () => act('move', { place: 'home' }) }] };
         const r = residents()[o.number];
+        const knock = { label: 'Постучать', run: async () => { const res = await act('knock', { apt: o.number }); if (res.ok) say(res.message); } };
+        if (!r || !r.name) return { label: `Кв. ${o.number}`, sub: 'пустует', actions: [knock] };
         return {
           label: `Кв. ${o.number}`,
-          sub: r && r.name ? r.name : 'пустует',
-          actions: [{ label: 'Постучать', run: async () => { const res = await act('knock', { apt: o.number }); if (res.ok) say(res.message); } }],
+          sub: r.name,
+          actions: [
+            knock,
+            { label: 'Подсунуть записку', run: () => openNote(o.number, r.name) },
+            { label: 'Оставить передачку', run: () => openParcel(o.number, r.name) },
+          ],
         };
       }
       case 'locked':
@@ -680,11 +686,108 @@
     const res = await act('board');
     if (!res.ok) return;
     const body = openSheet('board', 'Доска объявлений', obj);
+    const input = h('textarea', { maxlength: '200', rows: '2', placeholder: 'Меняю лампочку на сухари. Кв. …', 'aria-label': 'Текст листка' });
+    const mine = res.pinned.find((n) => n.mine);
     body.replaceChildren(
+      h('h4', { class: 'board-h', text: 'Листки жильцов' }),
+      res.pinned.length
+        ? h('ul', { class: 'board-notes pinned' }, res.pinned.map((n) => h('li', { class: n.mine ? 'mine' : '' }, h('small', { text: `${n.name}, кв. ${n.apt} · ${new Date(n.ts).toLocaleString('ru-RU')}` }), n.text)))
+        : h('p', { class: 'note', text: 'Пока никто ничего не повесил.' }),
+      h(
+        'form',
+        {
+          class: 'pin-form',
+          onsubmit: async (e) => {
+            e.preventDefault();
+            const r = await act('pin', { text: input.value });
+            if (r.ok) {
+              say(r.message);
+              openBoard(obj);
+            }
+          },
+        },
+        input,
+        h(
+          'div',
+          { class: 'actions' },
+          h('button', { class: 'btn small primary', type: 'submit', text: mine ? 'Заменить мой листок' : 'Повесить листок' }),
+          ...(mine ? [h('button', { class: 'btn small', type: 'button', text: 'Снять мой', onclick: async () => { const r = await act('unpin'); if (r.ok) openBoard(obj); } })] : []),
+        ),
+        h('p', { class: 'note', text: 'У жильца один листок на весь дом. Через 12 часов его снимают.' }),
+      ),
+      h('h4', { class: 'board-h', text: 'Объявления ЖЭК' }),
       res.notes.length
         ? h('ul', { class: 'board-notes' }, res.notes.map((n) => h('li', null, h('small', { text: `${n.from} · ${new Date(n.ts).toLocaleString('ru-RU')}` }), n.text)))
         : h('p', { class: 'note', text: 'Доска пуста. Только ржавые кнопки.' }),
     );
+  }
+
+  // ---- записки и передачки под чужую дверь ----
+  function openNote(apt, owner) {
+    const text = h('textarea', { maxlength: '300', rows: '4', placeholder: 'Что написать…', 'aria-label': 'Текст записки' });
+    const anon = h('input', { type: 'checkbox' });
+    openModal({
+      title: `Записка для кв. ${apt}`,
+      style: 'trade',
+      keepFocus: true,
+      body: h(
+        'div',
+        { class: 'note-form' },
+        h('p', { text: `${owner} найдёт её у двери, когда будет дома — даже если сейчас его нет.` }),
+        text,
+        h('label', { class: 'check' }, anon, 'без подписи (ЖЭК всё равно знает, кто писал)'),
+      ),
+      actions: [
+        { label: 'Отмена' },
+        {
+          label: 'Подсунуть',
+          primary: true,
+          onClick: async () => {
+            const res = await act('note', { apt, text: text.value, anon: anon.checked });
+            if (res.ok) say(res.message);
+            return res.ok;
+          },
+        },
+      ],
+    });
+    setTimeout(() => text.focus(), 30);
+  }
+
+  function openParcel(apt, owner) {
+    const you = S.view.you;
+    const num = (max) => h('input', { type: 'number', min: '0', max: String(max), value: '0', inputmode: 'numeric' });
+    const money = num(you.money);
+    const items = you.inventory.map((it) => [it.id, num(it.count), it]);
+    const text = h('input', { maxlength: '300', placeholder: 'Приписка (необязательно)', 'aria-label': 'Приписка' });
+    openModal({
+      title: `Передачка для кв. ${apt}`,
+      style: 'trade',
+      keepFocus: true,
+      body: h(
+        'div',
+        { class: 'trade-grid single' },
+        h('p', { text: `Оставить свёрток у двери: ${owner} заберёт его, когда будет дома.` }),
+        h('label', null, `Талоны (есть ${you.money})`, money),
+        items.length ? items.map(([, input, it]) => h('label', null, `${it.name} (×${it.count})`, input)) : h('p', { class: 'empty', text: 'Карманы пусты' }),
+        text,
+      ),
+      actions: [
+        { label: 'Отмена' },
+        {
+          label: 'Оставить',
+          primary: true,
+          onClick: async () => {
+            const give = {
+              money: parseInt(money.value, 10) || 0,
+              items: Object.fromEntries(items.map(([id, input]) => [id, parseInt(input.value, 10) || 0]).filter(([, n]) => n > 0)),
+            };
+            const res = await act('parcel', { apt, give, text: text.value });
+            if (res.ok) say(res.message);
+            return res.ok;
+          },
+        },
+      ],
+    });
   }
 
   // ---------------------------------------------------------------------------

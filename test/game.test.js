@@ -585,3 +585,73 @@ test('отсутствующие видны соседям в сцене, но �
   assert.equal(actors.find((x) => x.id === a.id).away, true);
   assert.equal(actors.find((x) => x.id === b.id).away, false);
 });
+
+test('записка и передачка под дверь: хозяин находит дома, даже если его не было', () => {
+  const { game, clock } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  const feed = [];
+  game.on('chat', (m) => m.adminOnly && feed.push(m));
+  game.setOnline(a.id, false);
+  game.admin('teleport', { id: b.id, place: 'corridor', floor: 101 });
+  b.money = 10;
+  game.addItem(b, 'bread', 2);
+  assert.equal(game.slipNote(b, a.apartment.number, 'привет').ok, false, 'надо подойти');
+  walkTo(game, b, (o) => o.type === 'apt' && o.number === a.apartment.number);
+  assert.equal(game.slipNote(b, a.apartment.number, 'Держись, сосед', true).ok, true);
+  assert.equal(game.leaveParcel(b, a.apartment.number, { money: 3, items: { bread: 1 } }, 'на ужин').ok, false, 'не так часто');
+  clock.t += 10000;
+  assert.equal(game.leaveParcel(b, a.apartment.number, { money: 30 }).ok, false, 'нет таких денег');
+  assert.equal(game.leaveParcel(b, a.apartment.number, { money: 3, items: { bread: 1 } }, 'на ужин').ok, true);
+  assert.equal(b.money, 7);
+  assert.equal(b.inventory.bread, 1);
+  assert.equal(feed.length, 2, 'Пульт видит обе передачи');
+  assert.equal(feed[0].anon, true);
+  assert.equal(feed[0].from.name, 'Мария', 'ЖЭК знает автора анонимки');
+
+  // хозяин возвращается домой
+  clock.t += 10 * 60000;
+  const notes = [];
+  game.on('notify', (n) => notes.push(n));
+  game.setOnline(a.id, true);
+  const receipt = notes.find((n) => n.style === 'receipt');
+  assert.match(receipt.text, /Записка без подписи: «Держись, сосед»/);
+  assert.match(receipt.text, /Передачка от Мария/);
+  assert.equal(a.money, 3);
+  assert.equal(a.inventory.bread, 1);
+  assert.equal(game.state.doorDrops[a.apartment.number], undefined);
+});
+
+test('под чужую дверь — да, под свою и пустую — нет', () => {
+  const { game } = makeWorld();
+  const a = join(game, 'Иван');
+  game.admin('teleport', { id: a.id, place: 'corridor', floor: 101 });
+  walkTo(game, a, (o) => o.type === 'apt' && o.number === a.apartment.number);
+  assert.equal(game.slipNote(a, a.apartment.number, 'себе').ok, false);
+  walkTo(game, a, (o) => o.type === 'apt' && o.number === '10106');
+  assert.equal(game.slipNote(a, '10106', 'кому-нибудь').ok, false, 'квартира пустует');
+});
+
+test('листок на доске: один на жильца, видят соседи, Пульт может снять, со временем снимается сам', () => {
+  const { game, clock } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  for (const p of [a, b]) {
+    game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+    walkTo(game, p, type('board'));
+  }
+  assert.equal(game.pinNote(a, 'Меняю лампочку на сухари').ok, true);
+  clock.t += 10000;
+  assert.equal(game.pinNote(a, 'Меняю вилку на хлеб').ok, true);
+  const seen = game.readBoard(b).pinned;
+  assert.equal(seen.length, 1, 'старый листок заменён');
+  assert.equal(seen[0].text, 'Меняю вилку на хлеб');
+  assert.equal(game.readBoard(a).pinned[0].mine, true);
+  assert.equal(game.admin('unpin', { id: seen[0].id }).ok, true);
+  assert.equal(game.readBoard(b).pinned.length, 0);
+  clock.t += 10000;
+  game.pinNote(b, 'Ищу таблетки');
+  clock.t += (C.NOTES.boardTtlH + 1) * 3600 * 1000;
+  game.expireBoardNotes();
+  assert.equal(game.readBoard(a).pinned.length, 0, 'листок снят по сроку');
+});

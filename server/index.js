@@ -12,6 +12,8 @@
  *   BACKUP_DIR      — куда класть почасовые копии мира (по умолчанию data/backups)
  *   REGISTER_LIMIT  — сколько жильцов в час можно заселить с одного адреса (по умолчанию 5, 0 — без ограничения)
  *   TRUST_PROXY     — 1, если сервер стоит за своим nginx/Caddy: тогда адрес игрока берётся из X-Forwarded-For
+ *   OFFLINE_GRACE_MS — сколько ждать переподключения, прежде чем считать жильца ушедшим (по умолчанию 20000)
+ *   GH_BALANCE      — JSON с правками баланса из server/content.js (BALANCE), например '{"hungerPerMin":-2}'
  */
 
 const http = require('http');
@@ -33,7 +35,8 @@ const REGISTER_LIMIT = process.env.REGISTER_LIMIT === undefined ? 5 : Number(pro
 const TRUST_PROXY = process.env.TRUST_PROXY === '1';
 const PORT = Number(process.env.PORT) || 3000;
 const ADMIN_PASSWORD = resolveAdminPassword();
-const OFFLINE_GRACE_MS = 20000; // сколько ждать переподключения, прежде чем считать игрока ушедшим
+// сколько ждать переподключения, прежде чем считать игрока ушедшим
+const OFFLINE_GRACE_MS = Number(process.env.OFFLINE_GRACE_MS) || 20000;
 
 function resolveAdminPassword() {
   if (process.env.ADMIN_PASSWORD) return process.env.ADMIN_PASSWORD;
@@ -217,6 +220,7 @@ game.on('notify', ({ to, title, text, style }) => {
 
 game.on('chat', (msg) => {
   for (const ws of admins) send(ws, { t: 'chat', msg });
+  if (msg.adminOnly) return; // записки и листки — только в ленту Пульта
   if (msg.to) {
     sendToPlayer(msg.to, { t: 'chat', msg });
     return;
@@ -241,6 +245,10 @@ const PLAYER_ACTIONS = {
   knock: (p, a) => game.knock(p, a.apt),
   search: (p) => game.searchChute(p),
   board: (p) => game.readBoard(p),
+  note: (p, a) => game.slipNote(p, a.apt, a.text, !!a.anon),
+  parcel: (p, a) => game.leaveParcel(p, a.apt, a.give, a.text),
+  pin: (p, a) => game.pinNote(p, a.text),
+  unpin: (p) => game.unpinNote(p),
   seal: (p, a) => game.seal(p, a.on),
   sleep: (p, a) => game.sleep(p, a.on),
   use: (p, a) => game.useItem(p, a.item),
@@ -390,7 +398,7 @@ function handleAdminMessage(ws, ip, raw) {
       t: 'admin_init',
       content: game.adminContent(),
       log: game.state.log.slice(-200),
-      chat: game.state.chatGlobal.slice(-100),
+      chat: [...game.state.chatGlobal.slice(-100), ...game.state.noteFeed.slice(-100)].sort((a, b) => a.ts - b.ts),
       snapshot: game.adminSnapshot(),
     });
     return;

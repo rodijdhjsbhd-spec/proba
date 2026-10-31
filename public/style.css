@@ -382,3 +382,12 @@ body.sanity-critical .place h1 { animation: flicker 2s infinite; }
 }
 .modal.receipt h3 { color: #6b2a24; font-family: var(--mono); letter-spacing: .12em; text-transform: uppercase; }
 .modal.receipt .btn { color: #222; }
+
+/* Доска объявлений: листки жильцов, записки и передачки */
+.board-h { margin: 6px 0; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+.board-notes.pinned li { background: #f1ecd8; }
+.board-notes li.mine { outline: 2px solid var(--amber); }
+.pin-form { display: grid; gap: 6px; margin: 8px 0 12px; }
+.pin-form textarea, .note-form textarea { width: 100%; resize: vertical; }
+.note-form { display: grid; gap: 8px; }
+.trade-grid.single { grid-template-columns: 1fr; }

@@ -87,6 +87,9 @@ function freshState() {
     log: [],
     chatGlobal: [],
     archive: [], // погибшие давно: краткие записи домовой книги
+    doorDrops: {}, // кв. → записки и передачки, ждущие хозяина у гермодвери
+    boardNotes: {}, // этаж → листки жильцов на доске объявлений
+    noteFeed: [], // лента записок и листков для Пульта
   };
 }
 
@@ -285,9 +288,17 @@ class Game extends EventEmitter {
     this.journal(p, `Вы вернулись. Вас не было ${fmtDuration(now - p.leftAt)}.`);
   }
 
-  /** Дополнительные строки квитанции (их добавляют другие механики — например, передачки под дверью). */
-  receiptExtras() {
-    return [];
+  /** Дополнительные строки квитанции: что подсунули под дверь. */
+  receiptExtras(p) {
+    const drops = this.state.doorDrops[p.apartment.number] || [];
+    if (!drops.length) return [];
+    if (this.isOwnHome(p)) return ['Под дверью:', ...this.collectDrops(p, { silent: true })];
+    const notes = drops.filter((d) => d.kind === 'note').length;
+    const parcels = drops.length - notes;
+    const parts = [];
+    if (notes) parts.push(`${notes} ${plural(notes, 'записка', 'записки', 'записок')}`);
+    if (parcels) parts.push(`${parcels} ${plural(parcels, 'передачка', 'передачки', 'передачек')}`);
+    return [`Под вашей дверью ждут: ${parts.join(' и ')}. Заберёте, когда вернётесь домой.`];
   }
 
   gameClock() {
@@ -618,7 +629,10 @@ class Game extends EventEmitter {
     for (const t of Object.values(this.state.trades)) {
       if (now - t.createdAt > 3 * 60000) delete this.state.trades[t.id];
     }
-    if (this.world.tick % 60 === 0) this.archiveDead(now);
+    if (this.world.tick % 60 === 0) {
+      this.archiveDead(now);
+      this.expireBoardNotes(now);
+    }
   }
 
   /** Давно погибших уносим из Пульта в архив домовой книги, чтобы снимок для админки не рос бесконечно. */
@@ -732,6 +746,7 @@ class Game extends EventEmitter {
     }
 
     if (online && p.stats.sanity < 20 && this.random() < 0.02) this.hallucinate(p);
+    if (online && this.state.doorDrops[p.apartment.number] && this.isOwnHome(p)) this.collectDrops(p);
 
     if (p.stats.health <= 0) this.kill(p, p.lastHarm || 'Умер при невыясненных обстоятельствах');
   }
@@ -968,7 +983,143 @@ class Game extends EventEmitter {
   readBoard(p) {
     if (!this.nearTo(p, (o) => o.type === 'board')) return { ok: false, error: 'Подойдите к доске объявлений.' };
     const notes = this.state.chatGlobal.filter((m) => m.from?.system).slice(-8).reverse().map((m) => ({ ts: m.ts, from: m.from.name, text: m.text }));
-    return { ok: true, notes };
+    const pinned = (this.state.boardNotes[p.location.floor] || [])
+      .slice()
+      .reverse()
+      .map((n) => ({ id: n.id, ts: n.ts, name: n.name, apt: n.apt, text: n.text, mine: n.playerId === p.id }));
+    return { ok: true, notes, pinned };
+  }
+
+  /** Жилец у себя в квартире (а не в гостях). */
+  isOwnHome(p) {
+    return p.location.place === 'home' && this.locationKey(p) === `home:${p.apartment.number}`;
+  }
+
+  /** Лента для Пульта: записки и листки видны ЖЭК, в том числе авторы анонимок. */
+  feed(entry) {
+    const e = { id: newId('f'), ts: this.now(), adminOnly: true, ...entry };
+    this.state.noteFeed.push(e);
+    if (this.state.noteFeed.length > 200) this.state.noteFeed.splice(0, this.state.noteFeed.length - 200);
+    this.emit('chat', e);
+  }
+
+  /** Общие проверки для того, что подсовывают под чужую дверь. */
+  doorDropCheck(p, apt) {
+    if (!p.alive) return { error: 'Вы мертвы.' };
+    const door = this.nearTo(p, (o) => o.type === 'apt' && o.number === String(apt));
+    if (!door) return { error: 'Подойдите к двери.' };
+    if (door.number === p.apartment.number) return { error: 'Это ваша дверь.' };
+    if (!this.alivePlayers().some((q) => q.apartment.number === door.number)) return { error: 'Квартира пустует — передавать некому.' };
+    const now = this.now();
+    if (now - (p.lastDropAt || 0) < C.NOTES.cooldownMs) return { error: 'Не так часто.' };
+    const drops = this.state.doorDrops[door.number] || [];
+    if (drops.length >= C.NOTES.perDoor) return { error: 'Под дверью уже не протолкнуть — там куча бумажек и свёртков.' };
+    return { door, now };
+  }
+
+  addDrop(p, door, drop, now) {
+    p.lastDropAt = now;
+    if (!this.state.doorDrops[door.number]) this.state.doorDrops[door.number] = [];
+    this.state.doorDrops[door.number].push({ id: newId('d'), ts: now, fromId: p.id, fromName: p.name, fromApt: p.apartment.number, ...drop });
+    const owner = this.alivePlayers().find((q) => q.apartment.number === door.number);
+    if (owner && this.isOnline(owner.id) && this.isOwnHome(owner)) this.collectDrops(owner);
+  }
+
+  /** Подсунуть записку под чужую дверь. anon — без подписи (ЖЭК всё равно видит автора). */
+  slipNote(p, apt, rawText, anon) {
+    const check = this.doorDropCheck(p, apt);
+    if (check.error) return { ok: false, error: check.error };
+    const text = sanitizeText(rawText, C.NOTES.maxLength);
+    if (!text) return { ok: false, error: 'Пустая записка.' };
+    this.addDrop(p, check.door, { kind: 'note', text, anon: !!anon }, check.now);
+    this.journal(p, `Вы подсунули записку под дверь кв. ${check.door.number}.`);
+    this.feed({ channel: 'note', to: check.door.number, from: { id: p.id, name: p.name, apt: p.apartment.number }, anon: !!anon, text });
+    return { ok: true, message: 'Записка под дверью.' };
+  }
+
+  /** Оставить передачку у чужой двери: вещи и талоны забирает хозяин, даже если сейчас его нет. */
+  leaveParcel(p, apt, rawBundle, rawText) {
+    const check = this.doorDropCheck(p, apt);
+    if (check.error) return { ok: false, error: check.error };
+    const bundle = this.normalizeBundle(rawBundle);
+    if (this.bundleEmpty(bundle)) return { ok: false, error: 'Пустой свёрток.' };
+    if (!this.hasBundle(p, bundle)) return { ok: false, error: 'У вас нет того, что вы хотите оставить.' };
+    p.money -= bundle.money;
+    for (const [id, n] of Object.entries(bundle.items)) this.removeItem(p, id, n);
+    const text = sanitizeText(rawText, C.NOTES.maxLength);
+    this.addDrop(p, check.door, { kind: 'parcel', bundle, text }, check.now);
+    const what = this.bundleText(bundle);
+    this.journal(p, `Вы оставили передачку у кв. ${check.door.number}: ${what}.`);
+    this.log(`${p.name} оставил передачку у кв. ${check.door.number}: ${what}`, 'trade', p.id);
+    this.feed({ channel: 'note', to: check.door.number, from: { id: p.id, name: p.name, apt: p.apartment.number }, parcel: what, text });
+    return { ok: true, message: 'Свёрток лежит у двери.' };
+  }
+
+  /** Хозяин забирает всё, что лежит у его двери. Возвращает строки описания. */
+  collectDrops(p, { silent = false } = {}) {
+    const drops = this.state.doorDrops[p.apartment.number] || [];
+    if (!drops.length) return [];
+    delete this.state.doorDrops[p.apartment.number];
+    const lines = [];
+    for (const d of drops) {
+      const who = d.anon ? 'без подписи' : `от ${d.fromName} (кв. ${d.fromApt})`;
+      if (d.kind === 'note') {
+        lines.push(`Записка ${who}: «${d.text}»`);
+      } else {
+        for (const [id, n] of Object.entries(d.bundle.items)) this.addItem(p, id, n);
+        p.money += d.bundle.money;
+        lines.push(`Передачка ${who}: ${this.bundleText(d.bundle)}${d.text ? `. Приписка: «${d.text}»` : ''}`);
+      }
+    }
+    for (const l of lines) this.journal(p, l, 'good');
+    if (!silent) this.notify([p], { title: 'Под дверью', text: lines.join('\n'), style: 'receipt', journal: false });
+    this.dirty([p.id]);
+    return lines;
+  }
+
+  /** Повесить свой листок на доску объявлений (у жильца — один листок на весь дом). */
+  pinNote(p, rawText) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (!this.nearTo(p, (o) => o.type === 'board')) return { ok: false, error: 'Подойдите к доске объявлений.' };
+    const text = sanitizeText(rawText, C.NOTES.boardMaxLength);
+    if (!text) return { ok: false, error: 'Пустой листок.' };
+    const now = this.now();
+    if (now - (p.lastDropAt || 0) < C.NOTES.cooldownMs) return { ok: false, error: 'Не так часто.' };
+    p.lastDropAt = now;
+    this.removePlayerNotes(p.id);
+    const floor = p.location.floor;
+    const board = (this.state.boardNotes[floor] = this.state.boardNotes[floor] || []);
+    const note = { id: newId('b'), ts: now, playerId: p.id, name: p.name, apt: p.apartment.number, text };
+    board.push(note);
+    if (board.length > C.NOTES.perBoard) board.shift();
+    this.journal(p, `Вы повесили листок на доску ${floor} этажа.`);
+    this.feed({ channel: 'board', floor, noteId: note.id, from: { id: p.id, name: p.name, apt: p.apartment.number }, text });
+    return { ok: true, message: 'Листок висит на доске.' };
+  }
+
+  unpinNote(p) {
+    if (!this.removePlayerNotes(p.id)) return { ok: false, error: 'Вашего листка на досках нет.' };
+    return { ok: true, message: 'Листок снят.' };
+  }
+
+  removePlayerNotes(playerId) {
+    let removed = 0;
+    for (const [floor, list] of Object.entries(this.state.boardNotes)) {
+      const left = list.filter((n) => n.playerId !== playerId);
+      removed += list.length - left.length;
+      if (left.length) this.state.boardNotes[floor] = left;
+      else delete this.state.boardNotes[floor];
+    }
+    return removed;
+  }
+
+  expireBoardNotes(now = this.now()) {
+    const ttl = C.NOTES.boardTtlH * 3600 * 1000;
+    for (const [floor, list] of Object.entries(this.state.boardNotes)) {
+      const left = list.filter((n) => now - n.ts < ttl);
+      if (left.length) this.state.boardNotes[floor] = left;
+      else delete this.state.boardNotes[floor];
+    }
   }
 
   // =========================================================================
@@ -1560,6 +1711,19 @@ const ADMIN_COMMANDS = {
     delete this.state.players[p.id];
     this.byToken.delete(p.token);
     this.log(`Жилец ${p.name} стёрт из домовой книги`, 'admin');
+  },
+
+  unpin({ id }) {
+    for (const [floor, list] of Object.entries(this.state.boardNotes)) {
+      const note = list.find((n) => n.id === id);
+      if (!note) continue;
+      const left = list.filter((n) => n.id !== id);
+      if (left.length) this.state.boardNotes[floor] = left;
+      else delete this.state.boardNotes[floor];
+      this.log(`Снят листок ${note.name} с доски ${floor} этажа: «${note.text}»`, 'admin');
+      return { ok: true, message: 'Листок снят.' };
+    }
+    throw new Error('Листок уже сняли.');
   },
 
   // ---- события дома ----
