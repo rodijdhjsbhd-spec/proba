@@ -246,6 +246,8 @@ const PLAYER_ACTIONS = {
   search: (p) => game.searchChute(p),
   board: (p) => game.readBoard(p),
   open_door: (p, a) => game.openDoor(p, a.guest),
+  aid: (p, a) => game.aid(p, a.target, a.item),
+  rob: (p, a) => game.rob(p, a.target),
   evict: (p, a) => game.evict(p, a.guest),
   note: (p, a) => game.slipNote(p, a.apt, a.text, !!a.anon),
   parcel: (p, a) => game.leaveParcel(p, a.apt, a.give, a.text),
@@ -341,7 +343,9 @@ function handlePlayerMessage(ws, raw) {
     const args = msg.args && typeof msg.args === 'object' ? msg.args : {};
     let res;
     try {
-      res = handler ? handler(p, args) : { ok: false, error: 'Неизвестное действие' };
+      if (!handler) res = { ok: false, error: 'Неизвестное действие' };
+      else if (p.down) res = { ok: false, error: 'Вы без сознания.' };
+      else res = handler(p, args);
     } catch (err) {
       console.error('[action]', msg.action, err);
       res = { ok: false, error: 'Что-то пошло не так.' };

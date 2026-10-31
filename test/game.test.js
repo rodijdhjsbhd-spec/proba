@@ -223,7 +223,8 @@ test('туман: снаружи калечит, за задраенной ге�
   assert.equal(Math.round(inside.stats.health), 100);
   advance(6 * 60000);
   assert.equal(game.world.fog, null, 'туман рассеялся сам');
-  assert.equal(outside.alive, false, 'кто не спрятался — тот погиб');
+  advance(C.BALANCE.downSec * 1000);
+  assert.equal(outside.alive, false, 'кто не спрятался — тот погиб (никто не помог, пока лежал без сознания)');
   assert.equal(outside.deathCause, 'Погиб в тумане');
 });
 
@@ -714,7 +715,7 @@ test('выставили в туман — дом узнает, если гос�
   game.on('chat', (m) => chat.push(m.text));
   assert.equal(game.evict(host, guest.id).ok, true);
   assert.equal(game.locationKey(guest), 'corridor:101');
-  advance(3 * 60000);
+  advance(3 * 60000 + C.BALANCE.downSec * 1000);
   assert.equal(guest.alive, false);
   assert.ok(chat.some((t) => /выставили за дверь/.test(t)), chat.join(' | '));
 });
@@ -725,7 +726,7 @@ test('не открыли в туман — тоже станет известн
   const chat = [];
   game.on('chat', (m) => chat.push(m.text));
   game.knock(guest, host.apartment.number);
-  advance(3 * 60000);
+  advance(3 * 60000 + C.BALANCE.downSec * 1000);
   assert.equal(guest.alive, false);
   assert.ok(chat.some((t) => /ему не открыли/.test(t)));
 });
@@ -759,4 +760,66 @@ test('старое сохранение: гермодверь жильца пе�
   assert.equal(g2.doorSealed(p.apartment.number), true);
   assert.equal(g2.getPlayer(p.id).sealed, undefined);
   assert.equal(g2.locationKey(g2.getPlayer(p.id)), `home:${p.apartment.number}`);
+});
+
+test('без сознания: вне дома не умирают сразу; помощь предметом поднимает', () => {
+  const { game, clock, advance } = makeWorld();
+  const victim = join(game, 'Иван');
+  const helper = join(game, 'Мария');
+  for (const p of [victim, helper]) game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  game.admin('accident', { id: victim.id, accident: 'shock' });
+  game.admin('setStats', { id: victim.id, stats: { health: 5 } });
+  game.admin('accident', { id: victim.id, accident: 'shock' });
+  assert.equal(victim.alive, true);
+  assert.ok(victim.down, 'лежит без сознания');
+  assert.equal(game.move(victim, { place: 'home' }).ok, false, 'без сознания не ходят');
+  assert.equal(game.setPos(victim, victim.pos.x + 0.1, victim.pos.y, 'right'), false);
+  assert.equal(game.sceneActors('corridor:101').find((a) => a.id === victim.id).down, true);
+  assert.equal(game.aid(helper, victim.id, 'bandage').ok, false, 'бинта нет');
+  game.addItem(helper, 'bandage');
+  assert.equal(game.aid(helper, victim.id, 'bandage').ok, true);
+  assert.equal(victim.down, null);
+  assert.ok(victim.stats.health >= 10);
+  assert.equal(helper.inventory.bandage, undefined, 'бинт потрачен');
+  advance(C.BALANCE.downSec * 1000 + 5000);
+  assert.equal(victim.alive, true, 'очнулся и живёт');
+  clock.t += 1;
+});
+
+test('без сознания: не помогли — смерть; обшарить карманы можно, жертва узнает, если очнётся', () => {
+  const { game, advance } = makeWorld();
+  const victim = join(game, 'Иван');
+  const thief = join(game, 'Пётр');
+  const saver = join(game, 'Мария');
+  for (const p of [victim, thief, saver]) game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  victim.money = 9;
+  game.addItem(victim, 'stew', 3);
+  assert.equal(game.rob(thief, victim.id).ok, false, 'в сознании не обшарить');
+  game.admin('custom', { target: { type: 'player', id: victim.id }, title: 'Обвал', effect: { health: -200 } });
+  assert.ok(victim.down);
+  assert.equal(game.rob(thief, victim.id).ok, true);
+  assert.equal(thief.money, 9);
+  assert.equal(thief.inventory.stew, 2, 'забрал две банки из трёх');
+  assert.equal(game.rob(thief, victim.id).ok, false, 'второй раз нельзя');
+  const notes = [];
+  game.on('notify', (n) => notes.push(n));
+  game.addItem(saver, 'bread');
+  assert.equal(game.aid(saver, victim.id, 'bread').ok, true, 'даже хлеб приводит в чувство');
+  assert.match(notes.find((n) => n.title === 'Вы очнулись').text, /рылся: Пётр/);
+
+  game.admin('custom', { target: { type: 'player', id: victim.id }, title: 'Обвал', effect: { health: -200 } });
+  advance(C.BALANCE.downSec * 1000 + 2000);
+  assert.equal(victim.alive, false, 'никто не помог — умер');
+  assert.equal(victim.deathCause, 'Обвал');
+});
+
+test('дома без сознания не лежат — умирают; смертельный случай и «Убить» из Пульта — сразу', () => {
+  const { game } = makeWorld();
+  const a = join(game, 'Иван');
+  game.admin('custom', { target: { type: 'player', id: a.id }, title: 'Сердце', effect: { health: -200 } });
+  assert.equal(a.alive, false, 'у себя дома — сразу');
+  const b = join(game, 'Мария');
+  game.admin('teleport', { id: b.id, place: 'corridor', floor: 101 });
+  game.admin('accident', { id: b.id, accident: 'liftShaft' });
+  assert.equal(b.alive, false);
 });

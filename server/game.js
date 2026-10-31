@@ -475,7 +475,7 @@ class Game extends EventEmitter {
    * Возвращает false, если шаг невозможен — тогда клиенту отправят поправку.
    */
   setPos(p, x, y, dir) {
-    if (!p.alive) return false;
+    if (!p.alive || p.down) return false;
     x = Number(x);
     y = Number(y);
     if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
@@ -511,6 +511,7 @@ class Game extends EventEmitter {
         sick: p.conditions.some((c) => C.CONDITIONS[c.id]?.kind === 'disease'),
         hurt: p.conditions.some((c) => C.CONDITIONS[c.id]?.kind === 'injury'),
         sleep: !!p.sleeping,
+        down: !!p.down,
         mask: this.hasItem(p, 'gasmask') && this.inFog(p.location.floor),
       }));
   }
@@ -772,7 +773,11 @@ class Game extends EventEmitter {
     if (online && p.stats.sanity < 20 && this.random() < 0.02) this.hallucinate(p);
     if (online && this.state.doorDrops[p.apartment.number] && this.isOwnHome(p)) this.collectDrops(p);
 
-    if (p.stats.health <= 0) this.kill(p, p.lastHarm || 'Умер при невыясненных обстоятельствах');
+    if (p.down) {
+      if (now >= p.down.until) this.kill(p, p.down.cause);
+    } else if (p.stats.health <= 0) {
+      this.fall(p, p.lastHarm || 'Умер при невыясненных обстоятельствах');
+    }
   }
 
   wearGasmask(p, d) {
@@ -812,6 +817,7 @@ class Game extends EventEmitter {
    */
   move(p, dest = {}) {
     if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (p.down) return { ok: false, error: 'Вы без сознания.' };
     if (p.travel) return { ok: false, error: p.travel.stuck ? 'Вы застряли в лифте.' : 'Вы уже в пути.' };
     const place = dest.place;
     if (!MOVE_PLACES.includes(place)) return { ok: false, error: 'Туда не пройти.' };
@@ -933,33 +939,130 @@ class Game extends EventEmitter {
     return { ok: true };
   }
 
+  /** Можно ли применить предмет к жильцу (чтобы не тратить таблетки на здорового). */
+  itemUseful(target, itemId) {
+    const u = C.ITEMS[itemId].use;
+    const curable = (u.cure || []).some((id) => this.hasCondition(target, id));
+    const shortenable = (u.shorten || []).some((id) => this.hasCondition(target, id));
+    const onlyCures = !u.hunger && !u.health && !u.sanity;
+    return !onlyCures || curable || shortenable;
+  }
+
+  /** Применить предмет к жильцу (себе или соседу). Возвращает список того, что произошло. */
+  applyItemUse(target, itemId) {
+    const u = C.ITEMS[itemId].use;
+    this.applyStats(target, u);
+    const parts = [];
+    for (const id of (u.cure || []).filter((c) => this.hasCondition(target, c))) {
+      this.cureCondition(target, id);
+      parts.push(`прошло: ${C.CONDITIONS[id].name}`);
+    }
+    for (const id of (u.shorten || []).filter((c) => this.hasCondition(target, c))) {
+      const c = target.conditions.find((x) => x.id === id);
+      if (c && c.until) c.until = this.now() + (c.until - this.now()) / 2;
+      parts.push(`${C.CONDITIONS[id].name} заживает быстрее`);
+    }
+    return parts;
+  }
+
   useItem(p, itemId) {
     if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (p.down) return { ok: false, error: 'Вы без сознания.' };
     const def = C.ITEMS[itemId];
     if (!def || !this.hasItem(p, itemId)) return { ok: false, error: 'У вас этого нет.' };
     if (def.equip) return { ok: false, error: 'Работает сам, пока лежит у вас в кармане.' };
     if (!def.use) return { ok: false, error: 'Это не используется. Зато можно обменять.' };
-    const u = def.use;
-    const curable = (u.cure || []).filter((id) => this.hasCondition(p, id));
-    const shortenable = (u.shorten || []).filter((id) => this.hasCondition(p, id));
-    const onlyCures = !u.hunger && !u.health && !u.sanity;
-    if (onlyCures && !curable.length && !shortenable.length) return { ok: false, error: 'Вам это сейчас не нужно.' };
-
+    if (!this.itemUseful(p, itemId)) return { ok: false, error: 'Вам это сейчас не нужно.' };
     p.sleeping = false;
     this.removeItem(p, itemId, 1);
-    this.applyStats(p, u);
-    const parts = [];
-    for (const id of curable) {
-      this.cureCondition(p, id);
-      parts.push(`прошло: ${C.CONDITIONS[id].name}`);
-    }
-    for (const id of shortenable) {
-      const c = p.conditions.find((x) => x.id === id);
-      if (c && c.until) c.until = this.now() + (c.until - this.now()) / 2;
-      parts.push(`${C.CONDITIONS[id].name} заживает быстрее`);
-    }
+    const parts = this.applyItemUse(p, itemId);
     this.journal(p, `Использовано: ${def.name}${parts.length ? ` (${parts.join(', ')})` : ''}.`);
     return { ok: true };
+  }
+
+  // =========================================================================
+  // Без сознания: помочь или обобрать
+  // =========================================================================
+  /**
+   * Здоровье кончилось. Дома жилец умирает, а вне своей квартиры — теряет сознание
+   * и лежит B.downSec секунд: соседи могут помочь или обобрать. Не помогли — смерть.
+   */
+  fall(p, cause) {
+    if (!p.alive || p.down) return;
+    if (this.isOwnHome(p)) {
+      this.kill(p, cause);
+      return;
+    }
+    const now = this.now();
+    p.down = { since: now, until: now + B.downSec * 1000, cause, robbedBy: [] };
+    p.stats.health = 0;
+    p.sleeping = false;
+    p.job = null;
+    p.homeward = null;
+    this.notify([p], { title: 'Вы теряете сознание', text: 'В глазах темнеет. Может быть, кто-нибудь поможет…', style: 'danger' });
+    this.log(`${p.name} без сознания: ${cause}`, 'accident', p.id);
+    this.dirty([p.id, ...this.othersAt(p).map((q) => q.id)]);
+  }
+
+  /** Соседи рядом, до которых можно дотянуться. */
+  canTouch(p, target) {
+    return target && target.alive && target.id !== p.id && this.locationKey(target) === this.locationKey(p) && this.distance(p, target) <= B.touchReach;
+  }
+
+  /** Использовать свой предмет на соседе: перевязать, дать таблетку, накормить. Лежачий очнётся. */
+  aid(p, targetId, itemId) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (p.down) return { ok: false, error: 'Вы без сознания.' };
+    const t = this.getPlayer(targetId);
+    if (!this.canTouch(p, t)) return { ok: false, error: 'Подойдите ближе.' };
+    const def = C.ITEMS[itemId];
+    if (!def || !def.use || !this.hasItem(p, itemId)) return { ok: false, error: 'Этим не помочь.' };
+    if (!t.down && !this.itemUseful(t, itemId)) return { ok: false, error: `${t.name} это сейчас не нужно.` };
+    this.removeItem(p, itemId, 1);
+    const parts = this.applyItemUse(t, itemId);
+    const what = `${def.name}${parts.length ? ` (${parts.join(', ')})` : ''}`;
+    if (t.down) {
+      const robbers = t.down.robbedBy;
+      t.down = null;
+      t.stats.health = Math.max(10, t.stats.health);
+      t.lastHarm = null;
+      this.notify([t], {
+        title: 'Вы очнулись',
+        text: `Вас привёл в чувство ${p.name}: ${what}.${robbers.length ? `\nПока вы лежали, в ваших карманах рылся: ${robbers.join(', ')}.` : ''}`,
+        style: 'good',
+      });
+      this.log(`${p.name} привёл в чувство ${t.name}: ${what}`, 'social', p.id);
+    } else {
+      this.notify([t], { title: 'Помощь', text: `${p.name} дал вам: ${what}.`, style: 'good' });
+      this.log(`${p.name} помог ${t.name}: ${what}`, 'social', p.id);
+    }
+    this.journal(p, `Вы помогли ${t.name}: ${what}.`, 'good');
+    this.dirty([p.id, t.id, ...this.othersAt(t).map((q) => q.id)]);
+    return { ok: true, message: t.down ? '' : `${t.name} приходит в себя.` };
+  }
+
+  /** Обшарить карманы лежащего без сознания: все талоны и до двух вещей. */
+  rob(p, targetId) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (p.down) return { ok: false, error: 'Вы без сознания.' };
+    const t = this.getPlayer(targetId);
+    if (!this.canTouch(p, t)) return { ok: false, error: 'Подойдите ближе.' };
+    if (!t.down) return { ok: false, error: `${t.name} в сознании — так просто в карманы не залезть.` };
+    if (t.down.robbedBy.includes(p.name)) return { ok: false, error: 'Вы уже всё забрали.' };
+    const taken = { money: t.money, items: {} };
+    const units = [];
+    for (const [id, n] of Object.entries(t.inventory)) for (let i = 0; i < n; i++) units.push(id);
+    for (let k = 0; k < 2 && units.length; k++) {
+      const id = units.splice(Math.floor(this.random() * units.length), 1)[0];
+      taken.items[id] = (taken.items[id] || 0) + 1;
+    }
+    this.moveBundle(t, p, taken);
+    t.down.robbedBy.push(p.name);
+    const what = this.bundleText(taken);
+    this.journal(p, `Вы обшарили карманы ${t.name}: ${what}.`, 'warn');
+    this.log(`${p.name} обшарил карманы лежащего ${t.name}: ${what}`, 'social', p.id);
+    this.dirty([p.id, t.id]);
+    return { ok: true, message: `В карманах нашлось: ${what}.` };
   }
 
   // =========================================================================
@@ -1464,6 +1567,7 @@ class Game extends EventEmitter {
     p.travel = null;
     p.job = null;
     p.sleeping = false;
+    p.down = null;
     p.stats.health = 0;
     for (const t of Object.values(this.state.trades)) if (t.from === p.id || t.to === p.id) delete this.state.trades[t.id];
     this.journal(p, `Вы погибли. ${cause}.`, 'death');
@@ -1471,7 +1575,7 @@ class Game extends EventEmitter {
     this.log(`☠ ${p.name} (кв. ${p.apartment.number}): ${cause}`, 'death', p.id);
     this.systemChat(`Квартира ${p.apartment.number} опечатана. Жилец ${p.name} больше не выйдет на смену.`);
     const refusal = this.refusals.get(p.id);
-    if (refusal && cause === 'Погиб в тумане' && this.now() - refusal.ts < 5 * 60000) {
+    if (refusal && cause === 'Погиб в тумане' && this.now() - refusal.ts < 5 * 60000 + B.downSec * 1000) {
       this.systemChat(
         refusal.kind === 'evicted'
           ? `${p.name} погиб в тумане. Незадолго до этого его выставили за дверь кв. ${refusal.apt}.`
@@ -1565,7 +1669,7 @@ class Game extends EventEmitter {
       parts.push(C.CONDITIONS[effect.condition].name);
     }
     if (effect.kill) this.kill(p, cause);
-    else if (p.stats.health <= 0) this.kill(p, cause);
+    else if (p.stats.health <= 0) this.fall(p, cause);
     this.dirty([p.id]);
     return parts;
   }
@@ -1713,6 +1817,7 @@ const ADMIN_COMMANDS = {
     const p = this.requirePlayer(id);
     for (const k of STAT_KEYS) if (stats[k] !== undefined && stats[k] !== '') p.stats[k] = clamp(Number(stats[k]) || 0);
     if (stats.money !== undefined && stats.money !== '') p.money = Math.max(0, toInt(stats.money));
+    if (p.down && p.stats.health > 0) p.down = null;
     this.log(`Параметры ${p.name} изменены вручную`, 'admin', p.id);
     if (p.stats.health <= 0) this.kill(p, 'Умер при невыясненных обстоятельствах');
     this.dirty([p.id]);
@@ -1961,6 +2066,7 @@ Game.prototype.playerView = function playerView(p) {
     searchInSec: Math.max(0, Math.ceil(((p.searchedAt || 0) + SEARCH_COOLDOWN_MS - now) / 1000)),
     sealed: this.doorSealed(this.currentApt(p) || p.apartment.number),
     sleeping: p.sleeping,
+    down: p.down ? { remainingSec: Math.max(0, Math.ceil((p.down.until - now) / 1000)), cause: p.down.cause } : null,
     knocker: (() => {
       const g = this.knockerFor(p);
       return g ? { id: g.id, name: g.name, apt: g.apartment.number } : null;
@@ -2156,6 +2262,7 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       guestAt: p.location.place === 'home' && this.currentApt(p) !== p.apartment.number ? this.currentApt(p) : null,
       sleeping: p.sleeping,
       homeward: !!p.homeward,
+      down: p.down ? Math.max(0, Math.ceil((p.down.until - now) / 1000)) : null,
       working: !!p.job,
       shifts: p.shifts || 0,
       conditions: p.conditions.map((c) => ({ id: c.id, name: C.CONDITIONS[c.id]?.name || c.id, remainingSec: c.until ? Math.round((c.until - now) / 1000) : null })),

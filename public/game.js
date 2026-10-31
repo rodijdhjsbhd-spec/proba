@@ -208,7 +208,7 @@
       if (a.id === myId) continue;
       seen.add(a.id);
       const cur = S.actors.get(a.id);
-      if (cur) Object.assign(cur, { tx: a.x, ty: a.y, d: a.d, m: a.m, sick: a.sick, hurt: a.hurt, sleep: a.sleep, mask: a.mask, away: a.away, name: a.name, apt: a.apt });
+      if (cur) Object.assign(cur, { tx: a.x, ty: a.y, d: a.d, m: a.m, sick: a.sick, hurt: a.hurt, sleep: a.sleep, down: a.down, mask: a.mask, away: a.away, name: a.name, apt: a.apt });
       else S.actors.set(a.id, { ...a, tx: a.x, ty: a.y, look: lookFor(a.id), phase: Math.random() * 6 });
     }
     for (const id of [...S.actors.keys()]) if (!seen.has(id)) S.actors.delete(id);
@@ -225,7 +225,7 @@
   };
 
   function canControl() {
-    return S.view && S.view.you.alive && !isTyping() && $('#modal').hidden && !(S.job && S.job.state === 'playing');
+    return S.view && S.view.you.alive && !S.view.you.down && !isTyping() && $('#modal').hidden && !(S.job && S.job.state === 'playing');
   }
 
   document.addEventListener('keydown', (e) => {
@@ -471,7 +471,7 @@
   }
 
   function renderPrompt() {
-    const o = S.view && S.view.you.travel ? null : nearestObject();
+    const o = S.view && (S.view.you.travel || S.view.you.down) ? null : nearestObject();
     S.near = o;
     const info = o && objectInfo(o);
     const sig = info ? `${o.id}|${info.label}|${info.sub}|${info.actions.map((a) => a.label).join('/')}` : 'none';
@@ -499,6 +499,7 @@
 
   function actorAt(pt) {
     for (const a of S.actors.values()) {
+      if (a.down && Math.abs(a.x - pt.x) < 0.55 && Math.abs(a.y - 0.2 - pt.y) < 0.4) return a;
       if (Math.abs(a.x - pt.x) < 0.35 && pt.y < a.y + 0.15 && pt.y > a.y - 1.25) return a;
     }
     return null;
@@ -511,8 +512,9 @@
     const a = actorAt(pt);
     if (a) {
       const person = { id: a.id, name: a.name, apt: a.apt };
-      if (Math.hypot(a.x - S.me.x, a.y - S.me.y) <= 2.5) openTrade(person);
-      else walkTo({ x: a.x, y: a.y }, () => openTrade(person));
+      const open = () => (a.down ? openAid(person, true) : openTrade(person));
+      if (Math.hypot(a.x - S.me.x, a.y - S.me.y) <= (a.down ? 1.6 : 2.5)) open();
+      else walkTo({ x: a.x, y: a.y + 0.6 }, open);
       return;
     }
     const o = renderer.objectAt(pt);
@@ -910,6 +912,12 @@
   function renderCaption(v) {
     const t = v.you.travel;
     const cap = $('#caption');
+    if (v.you.down) {
+      cap.hidden = false;
+      cap.className = 'caption stuck';
+      cap.textContent = `Вы без сознания. ${v.you.down.remainingSec} с… Кто-нибудь может помочь.`;
+      return;
+    }
     if (!t) {
       cap.hidden = true;
       return;
@@ -1067,6 +1075,7 @@
         sick: you.conditions.some((c) => c.kind === 'disease'),
         hurt: you.conditions.some((c) => c.kind === 'injury'),
         sleep: you.sleeping && !S.me.m,
+        down: !!you.down,
         mask: has('gasmask') && !!fog && fog !== 'window',
       },
       actors: [...S.actors.values()],
@@ -1238,6 +1247,32 @@
     if (first && !m.keepFocus) first.focus();
   }
 
+  // ---- помочь соседу предметом / обшарить лежачего ----
+  function openAid(person, down) {
+    const you = S.view.you;
+    const usable = you.inventory.filter((it) => it.usable);
+    const run = (action, args) => async () => {
+      const res = await act(action, { target: person.id, ...args });
+      if (res.ok && res.message) say(res.message);
+      return res.ok;
+    };
+    const body = h(
+      'div',
+      { class: 'aid-form' },
+      h('p', { text: down ? `${person.name} лежит без сознания. Перевяжите, дайте таблетку или хоть что-то съестное — и он очнётся. Или нет.` : `Чем помочь ${person.name}?` }),
+      usable.length
+        ? h('div', { class: 'actions' }, usable.map((it) => h('button', { class: 'btn small', text: `${it.name} (×${it.count})`, onclick: async () => { if (await run('aid', { item: it.id })()) nextModal(); } })))
+        : h('p', { class: 'empty', text: 'В карманах нечем помочь.' }),
+    );
+    openModal({
+      title: down ? `${person.name} без сознания` : `Помочь: ${person.name}`,
+      style: down ? 'danger' : 'trade',
+      keepFocus: true,
+      body,
+      actions: [{ label: 'Отойти' }, ...(down ? [{ label: 'Обшарить карманы', onClick: run('rob', {}) }] : [])],
+    });
+  }
+
   // ---- обмен ----
   function openTrade(person) {
     const you = S.view.you;
@@ -1275,6 +1310,7 @@
       keepFocus: true,
       actions: [
         { label: 'Отмена' },
+        { label: 'Помочь предметом', onClick: () => { setTimeout(() => openAid(person, false), 0); return true; } },
         { label: 'Подарить', onClick: async () => (await act('trade_offer', { to: person.id, give: collect(giveMoney, giveItems), want: {} })).ok },
         {
           label: 'Предложить обмен',

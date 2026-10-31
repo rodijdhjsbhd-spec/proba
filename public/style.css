@@ -392,3 +392,4 @@ body.sanity-critical .place h1 { animation: flicker 2s infinite; }
 .note-form { display: grid; gap: 8px; }
 .trade-grid.single { grid-template-columns: 1fr; }
 .toast .toast-action { display: block; margin-top: 6px; }
+.aid-form .actions { flex-wrap: wrap; }

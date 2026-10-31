@@ -592,6 +592,18 @@
       b.g.ellipse(x * b.T, y * b.T, 0.3 * b.T, 0.12 * b.T, 0, 0, Math.PI * 2);
       b.g.stroke();
     }
+    if (a.down) {
+      // без сознания: лежит на полу, рука откинута
+      b.g.fillStyle = 'rgba(90,20,15,0.35)';
+      b.g.beginPath();
+      b.g.ellipse((x + 0.05) * b.T, (y - 0.12) * b.T, 0.42 * b.T, 0.16 * b.T, 0.2, 0, Math.PI * 2);
+      b.g.fill();
+      b.rrect(x - 0.36, y - 0.3, 0.6, 0.26, 0.1, L.coat);
+      b.rrect(x + 0.18, y - 0.2, 0.3, 0.08, 0.04, shade(L.coat, -12));
+      b.rect(x - 0.3, y - 0.08, 0.32, 0.08, '#2a2622');
+      b.circle(x - 0.38, y - 0.18, 0.13, '#c9b9a4');
+      return;
+    }
     if (a.sleep) {
       // спит: лежит
       b.rrect(x - 0.32, y - 0.32, 0.64, 0.26, 0.1, L.coat);
@@ -977,14 +989,14 @@
       g.textAlign = 'center';
       g.textBaseline = 'bottom';
       for (const a of people) {
-        if (a.sleep) continue;
-        const label = a.away ? `${a.name} · не в сети` : a.name;
-        const nx = a.x * TD, ny = (a.y - 1.15) * TD;
+        if (a.sleep && !a.down) continue;
+        const label = a.down ? `${a.name} · без сознания` : a.away ? `${a.name} · не в сети` : a.name;
+        const nx = a.x * TD, ny = (a.down ? a.y - 0.45 : a.y - 1.15) * TD;
         const wName = g.measureText(label).width + 8 * this.dpr;
         g.fillStyle = 'rgba(10,11,11,0.6)';
         roundRect(g, nx - wName / 2, ny - fontPx - 2 * this.dpr, wName, fontPx + 4 * this.dpr, 4 * this.dpr);
         g.fill();
-        g.fillStyle = a.self ? '#e3a13b' : a.away ? '#a8a597' : '#e9e3d0';
+        g.fillStyle = a.down ? '#ff9b90' : a.self ? '#e3a13b' : a.away ? '#a8a597' : '#e9e3d0';
         g.fillText(label, nx, ny + this.dpr);
       }
       // облачка реплик
