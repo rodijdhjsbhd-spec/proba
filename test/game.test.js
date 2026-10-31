@@ -874,3 +874,78 @@ test('пауза замораживает таймеры: туман, болез
   advance(1000);
   assert.ok(game.world.fog, 'туман не кончился за время паузы');
 });
+
+test('паспорт: создание, вход, неверный пароль, занятый логин', () => {
+  const { game } = makeWorld();
+  assert.equal(game.createAccount('ab', 'secret1').ok, false, 'короткий логин');
+  assert.equal(game.createAccount('ivan', '123').ok, false, 'короткий пароль');
+  const { account } = game.createAccount('Ivan_101', 'secret1');
+  assert.ok(account);
+  assert.notEqual(account.hash, 'secret1', 'пароль хранится хешем');
+  assert.equal(game.createAccount('ivan_101', 'other12').ok, false, 'логин занят (регистр не важен)');
+  assert.equal(game.verifyLogin('IVAN_101', 'secret1').ok, true);
+  assert.equal(game.verifyLogin('ivan_101', 'wrong12').ok, false);
+  assert.equal(game.verifyLogin('nobody', 'secret1').ok, false);
+});
+
+test('паспорт: один живой жилец, новая жизнь на том же паспорте', () => {
+  const { game } = makeWorld();
+  const { account } = game.createAccount('ivan', 'secret1');
+  const first = game.register('Иван', { account }).player;
+  assert.equal(game.accountPlayer(account), first);
+  assert.equal(game.register('Иван Второй', { account }).ok, false, 'пока жив первый — второго не заселить');
+  game.kill(first, 'тест');
+  assert.equal(game.accountPlayer(account), null);
+  const second = game.register('Иван Второй', { account }).player;
+  assert.equal(second.account, 'ivan');
+  assert.deepEqual(account.playerIds, [first.id, second.id]);
+});
+
+test('паспорт можно выдать старому жильцу без него', () => {
+  const { game } = makeWorld();
+  const p = join(game, 'Иван');
+  assert.equal(game.playerView(p).you.account, null);
+  assert.equal(game.claimAccount(p, 'ivan', 'secret1').ok, true);
+  assert.equal(game.playerView(p).you.account, 'ivan');
+  assert.equal(game.claimAccount(p, 'ivan2', 'secret1').ok, false);
+});
+
+test('модерация: заглушка, бан паспорта и адреса, разбан', () => {
+  const { game } = makeWorld();
+  const { account } = game.createAccount('ivan', 'secret1');
+  const p = game.register('Иван', { account }).player;
+  game.setOnline(p.id, true);
+  p.lastIp = '10.0.0.7';
+  assert.equal(game.admin('mute', { id: p.id, minutes: 5 }).ok, true);
+  assert.equal(game.chat(p, 'global', 'привет').ok, false);
+  game.admin('unmute', { id: p.id });
+  assert.equal(game.chat(p, 'global', 'привет').ok, true);
+
+  const kicks = [];
+  game.on('kick', (k) => kicks.push(k));
+  assert.equal(game.admin('ban', { id: p.id, minutes: 0, reason: 'спам', ip: true }).ok, true);
+  assert.deepEqual(kicks[0].ids, [p.id]);
+  assert.equal(game.banInfo(p).reason, 'спам');
+  assert.ok(game.accountBanInfo(account), 'паспорт закрыт');
+  assert.ok(game.banInfo(null, '10.0.0.7'), 'адрес закрыт');
+  game.admin('unban', { id: p.id });
+  assert.equal(game.banInfo(p, '10.0.0.7'), null);
+});
+
+test('модерация: удалить сообщение у всех и жалоба в журнал', () => {
+  const { game, clock } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  game.chat(a, 'global', 'плохое слово');
+  const msg = game.state.chatGlobal.find((m) => m.text === 'плохое слово');
+  assert.equal(game.report(a, msg.id).ok, false, 'на себя нельзя');
+  assert.equal(game.report(b, msg.id).ok, true);
+  assert.ok(game.state.log.some((e) => e.kind === 'report' && /плохое слово/.test(e.text)));
+  clock.t += 1000;
+  assert.equal(game.report(b, msg.id).ok, false, 'не так часто');
+  const deleted = [];
+  game.on('chat_delete', (d) => deleted.push(d.id));
+  assert.equal(game.admin('deleteMessage', { id: msg.id }).ok, true);
+  assert.deepEqual(deleted, [msg.id]);
+  assert.equal(game.state.chatGlobal.some((m) => m.id === msg.id), false);
+});

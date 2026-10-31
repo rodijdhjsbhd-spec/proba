@@ -153,8 +153,14 @@ const socketsByPlayer = new Map();
 const offlineTimers = new Map();
 const admins = new Set();
 
+function sendBanned(ws, ban) {
+  send(ws, { t: 'banned', reason: ban.reason, until: ban.until || null });
+  setTimeout(() => ws.close(), 200);
+}
+
 function bind(ws, player) {
   ws.playerId = player.id;
+  player.lastIp = ws.ip;
   if (!socketsByPlayer.has(player.id)) socketsByPlayer.set(player.id, new Set());
   socketsByPlayer.get(player.id).add(ws);
   clearTimeout(offlineTimers.get(player.id));
@@ -235,6 +241,19 @@ game.on('chat', (msg) => {
   }
 });
 
+// Бан: выкинуть из игры все подключения этих жильцов
+game.on('kick', ({ ids, reason, until }) => {
+  for (const id of ids) {
+    for (const ws of socketsByPlayer.get(id) || []) sendBanned(ws, { reason, until });
+  }
+});
+
+// Удалённое сообщение исчезает у всех
+game.on('chat_delete', ({ id }) => {
+  for (const [pid] of socketsByPlayer) sendToPlayer(pid, { t: 'chat_delete', id });
+  for (const ws of admins) send(ws, { t: 'chat_delete', id });
+});
+
 game.on('log', (entry) => {
   for (const ws of admins) send(ws, { t: 'log', entry });
 });
@@ -260,10 +279,14 @@ const PLAYER_ACTIONS = {
   work_start: (p, a) => game.workStart(p, a.game),
   work_submit: (p, a) => game.workSubmit(p, a.job, a.answers),
   work_cancel: (p) => game.workCancel(p),
+  claim_account: (p, a) => game.claimAccount(p, a.login, a.password),
+  report: (p, a) => game.report(p, String(a.id || '')),
   chat: (p, a) => game.chat(p, a.channel === 'global' ? 'global' : 'local', a.text),
   trade_offer: (p, a) => game.tradeOffer(p, a.to, a.give, a.want),
   trade_respond: (p, a) => game.tradeRespond(p, a.trade, !!a.accept),
 };
+
+const failedLogins = new Map(); // адрес → { count, until } — неудачные входы (Пульт и паспорта)
 
 // Сколько жильцов заселили с каждого адреса за последний час
 const registrations = new Map(); // ip → [время, ...]
@@ -300,8 +323,48 @@ function handlePlayerMessage(ws, raw) {
 
   if (msg.t === 'hello') {
     const p = game.playerByToken(msg.token);
-    if (p) bind(ws, p);
-    else send(ws, { t: 'need_register' });
+    if (!p) {
+      send(ws, { t: 'need_register' });
+      return;
+    }
+    const ban = game.banInfo(p, ws.ip);
+    if (ban) {
+      sendBanned(ws, ban);
+      return;
+    }
+    bind(ws, p);
+    return;
+  }
+
+  // Вход по паспорту (логин и пароль) — с любого устройства
+  if (msg.t === 'login') {
+    const lock = failedLogins.get(`p:${ws.ip}`);
+    if (lock && lock.until > Date.now()) {
+      send(ws, { t: 'register_error', error: 'Слишком много попыток. Подождите минуту.' });
+      return;
+    }
+    const res = game.verifyLogin(msg.login, msg.password);
+    if (!res.ok) {
+      const count = (lock?.count || 0) + 1;
+      failedLogins.set(`p:${ws.ip}`, { count, until: count >= 5 ? Date.now() + 60000 : 0 });
+      send(ws, { t: 'register_error', error: res.error });
+      return;
+    }
+    failedLogins.delete(`p:${ws.ip}`);
+    const ban = game.accountBanInfo(res.account, ws.ip);
+    if (ban) {
+      sendBanned(ws, ban);
+      return;
+    }
+    const p = game.accountPlayer(res.account);
+    if (p) {
+      if (ws.playerId) unbind(ws);
+      bind(ws, p);
+    } else {
+      // все жильцы этого паспорта погибли — можно заселить нового
+      ws.account = game.accountKey(res.account.login);
+      send(ws, { t: 'need_new_life', login: res.account.login });
+    }
     return;
   }
 
@@ -310,13 +373,38 @@ function handlePlayerMessage(ws, raw) {
       send(ws, { t: 'register_error', error: `С одного адреса можно заселять не больше ${REGISTER_LIMIT} жильцов в час. Подождите.` });
       return;
     }
-    const res = game.register(msg.name);
+    const ipBan = game.banInfo(null, ws.ip);
+    if (ipBan) {
+      sendBanned(ws, ipBan);
+      return;
+    }
+    // Чей это жилец: паспорт, по которому вошли, паспорт погибшего, или новый паспорт
+    const current = ws.playerId ? game.getPlayer(ws.playerId) : null;
+    let account = null;
+    if (ws.account) account = game.state.accounts[ws.account] || null;
+    else if (current && !current.alive && current.account) account = game.state.accounts[current.account] || null;
+    const legacyRebirth = !account && current && !current.alive && !current.account;
+    if (!account && !legacyRebirth) {
+      const name = game.checkNewName(msg.name);
+      if (!name.ok) {
+        send(ws, { t: 'register_error', error: name.error });
+        return;
+      }
+      const created = game.createAccount(msg.login, msg.password);
+      if (!created.ok) {
+        send(ws, { t: 'register_error', error: created.error });
+        return;
+      }
+      account = created.account;
+    }
+    const res = game.register(msg.name, { account });
     if (!res.ok) {
       send(ws, { t: 'register_error', error: res.error });
       return;
     }
     // «Новая жизнь» — отвязываемся от старого (мёртвого) персонажа
     if (ws.playerId) unbind(ws);
+    ws.account = null;
     if (!registrations.has(ws.ip)) registrations.set(ws.ip, []);
     registrations.get(ws.ip).push(Date.now());
     bind(ws, res.player);
@@ -357,7 +445,6 @@ function handlePlayerMessage(ws, raw) {
 }
 
 // ---- админы ----
-const failedLogins = new Map(); // ip → { count, until }
 
 adminWss.on('connection', (ws, req) => {
   const ip = clientIp(req);

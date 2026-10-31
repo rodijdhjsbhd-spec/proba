@@ -24,11 +24,30 @@
       </p>
       <p class="lore warn-line">Если завоет сирена — бегите домой и задрайте гермодверь.</p>
       <p id="register-note" class="note bad" hidden></p>
-      <form id="register-form" autocomplete="off">
+      <div class="tabs reg-tabs" role="tablist">
+        <button class="tab active" type="button" data-reg="new" role="tab">Новый жилец</button>
+        <button class="tab" type="button" data-reg="login" role="tab">У меня есть паспорт</button>
+      </div>
+      <form id="register-form" autocomplete="on">
         <label for="register-name">Фамилия или имя жильца</label>
-        <input id="register-name" maxlength="20" minlength="2" required placeholder="например, Сидоров">
-        <button type="submit" class="btn primary">Получить ордер</button>
+        <input id="register-name" maxlength="20" minlength="2" required placeholder="например, Сидоров" autocomplete="off">
+        <div id="passport-fields">
+          <p class="passport-h">Паспорт жильца — чтобы входить с любого устройства</p>
+          <label for="register-login">Логин</label>
+          <input id="register-login" maxlength="20" minlength="3" placeholder="латиница или кириллица" autocomplete="username">
+          <label for="register-password">Пароль</label>
+          <input id="register-password" type="password" minlength="6" placeholder="не короче 6 символов" autocomplete="new-password">
+        </div>
+        <button type="submit" class="btn primary" id="register-submit">Получить ордер</button>
         <p id="register-error" class="error" role="alert"></p>
+      </form>
+      <form id="login-form" autocomplete="on" hidden>
+        <label for="login-login">Логин</label>
+        <input id="login-login" maxlength="20" required autocomplete="username">
+        <label for="login-password">Пароль</label>
+        <input id="login-password" type="password" required autocomplete="current-password">
+        <button type="submit" class="btn primary">Войти</button>
+        <p id="login-error" class="error" role="alert"></p>
       </form>
     </div>
   </section>
@@ -82,6 +101,15 @@
         <section class="panel">
           <h2>Карманы</h2>
           <ul id="inventory" class="inventory"></ul>
+        </section>
+        <section class="panel passport" id="passport-panel" hidden>
+          <h2>Паспорт жильца</h2>
+          <p class="note">У вас нет паспорта: если сменить браузер, жилец потеряется. Задайте логин и пароль.</p>
+          <form id="claim-form" autocomplete="on">
+            <input id="claim-login" maxlength="20" placeholder="логин" autocomplete="username" aria-label="Логин">
+            <input id="claim-password" type="password" placeholder="пароль, от 6 символов" autocomplete="new-password" aria-label="Пароль">
+            <button class="btn small primary" type="submit">Получить паспорт</button>
+          </form>
         </section>
       </aside>
 

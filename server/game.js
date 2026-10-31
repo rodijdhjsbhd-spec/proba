@@ -92,6 +92,8 @@ function freshState() {
     boardNotes: {}, // этаж → листки жильцов на доске объявлений
     noteFeed: [], // лента записок и листков для Пульта
     schedule: [], // планировщик ЖЭК: отложенные и повторяющиеся команды
+    accounts: {}, // логин (строчными) → паспорт жильца { login, salt, hash, playerIds, banned }
+    bannedIps: {}, // адрес → { until, reason }
   };
 }
 
@@ -565,11 +567,20 @@ class Game extends EventEmitter {
   // =========================================================================
   // Регистрация
   // =========================================================================
-  register(rawName) {
+  /** Проверить имя нового жильца, ничего не создавая. */
+  checkNewName(rawName) {
     const name = sanitizeName(rawName);
     if (!name) return { ok: false, error: 'Имя — от 2 до 20 букв или цифр.' };
     const taken = this.nameTaken(name);
     if (taken) return { ok: false, error: taken };
+    return { ok: true, name };
+  }
+
+  register(rawName, { account = null } = {}) {
+    const check = this.checkNewName(rawName);
+    if (!check.ok) return check;
+    const name = check.name;
+    if (account && this.accountPlayer(account)) return { ok: false, error: 'У этого паспорта уже есть живой жилец.' };
     const apartment = this.allocateApartment();
     if (!apartment) return { ok: false, error: 'Дом переполнен: свободных квартир нет.' };
     const id = newId('p');
@@ -602,11 +613,107 @@ class Game extends EventEmitter {
     };
     this.state.players[id] = p;
     this.byToken.set(token, id);
+    if (account) this.linkAccount(p, account);
     this.journal(p, `Ордер на заселение получен. Ваша квартира — №${apartment.number}, ${apartment.floor} этаж. Голые стены, кровать и радиоточка.`);
     this.journal(p, `Еда стоит талонов. Талоны дают за смену в цеху (${C.FACILITIES.factory.floor} этаж). Столовая — на ${C.FACILITIES.canteen.floor} этаже.`);
     this.log(`Заселился новый жилец: ${name}, кв. ${apartment.number}`, 'join', id);
     this.systemChat(`В квартиру ${apartment.number} заселился новый жилец — ${name}.`);
     return { ok: true, player: p, token };
+  }
+
+  // =========================================================================
+  // Паспорта жильцов (аккаунты): логин и пароль, вход с любого устройства
+  // =========================================================================
+  static hashPassword(password, salt) {
+    return crypto.scryptSync(String(password), salt, 32).toString('hex');
+  }
+
+  accountKey(login) {
+    return String(login || '').trim().toLocaleLowerCase('ru');
+  }
+
+  getAccount(login) {
+    return this.state.accounts[this.accountKey(login)] || null;
+  }
+
+  createAccount(rawLogin, password) {
+    const login = String(rawLogin || '').trim();
+    if (!/^[\p{L}\p{N}_.\-]{3,20}$/u.test(login)) return { ok: false, error: 'Логин — от 3 до 20 букв, цифр, точек, дефисов или подчёркиваний.' };
+    if (String(password || '').length < 6) return { ok: false, error: 'Пароль — не короче 6 символов.' };
+    if (String(password).length > 200) return { ok: false, error: 'Слишком длинный пароль.' };
+    const key = this.accountKey(login);
+    if (this.state.accounts[key]) return { ok: false, error: 'Такой паспорт уже выдан. Войдите по нему или выберите другой логин.' };
+    const salt = crypto.randomBytes(16).toString('hex');
+    const account = { login, salt, hash: Game.hashPassword(password, salt), createdAt: this.now(), playerIds: [], banned: null };
+    this.state.accounts[key] = account;
+    return { ok: true, account };
+  }
+
+  verifyLogin(rawLogin, password) {
+    const account = this.getAccount(rawLogin);
+    const fail = { ok: false, error: 'Неверный логин или пароль.' };
+    if (!account || !password) return fail;
+    const given = Buffer.from(Game.hashPassword(password, account.salt), 'hex');
+    const expected = Buffer.from(account.hash, 'hex');
+    if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return fail;
+    return { ok: true, account };
+  }
+
+  linkAccount(p, account) {
+    p.account = this.accountKey(account.login);
+    if (!account.playerIds.includes(p.id)) account.playerIds.push(p.id);
+  }
+
+  /** Живой жилец этого паспорта (или null). */
+  accountPlayer(account) {
+    const key = this.accountKey(account.login);
+    return this.alivePlayers().find((q) => q.account === key) || null;
+  }
+
+  /** Привязать паспорт к жильцу, заселённому без него (старые сохранения). */
+  claimAccount(p, login, password) {
+    if (p.account) return { ok: false, error: 'У вас уже есть паспорт.' };
+    const res = this.createAccount(login, password);
+    if (!res.ok) return res;
+    this.linkAccount(p, res.account);
+    this.journal(p, `Паспорт жильца выдан: ${res.account.login}. Теперь можно входить с любого устройства.`, 'good');
+    return { ok: true, message: 'Паспорт выдан.' };
+  }
+
+  /** Причина блокировки (или null): по паспорту, по самому жильцу или по адресу. */
+  banInfo(p, ip) {
+    const now = this.now();
+    const active = (b) => b && (!b.until || b.until > now);
+    const acc = p && p.account ? this.state.accounts[p.account] : null;
+    if (acc && active(acc.banned)) return acc.banned;
+    if (p && active(p.banned)) return p.banned;
+    if (ip && active(this.state.bannedIps[ip])) return this.state.bannedIps[ip];
+    return null;
+  }
+
+  accountBanInfo(account, ip) {
+    const now = this.now();
+    const active = (b) => b && (!b.until || b.until > now);
+    if (account && active(account.banned)) return account.banned;
+    if (ip && active(this.state.bannedIps[ip])) return this.state.bannedIps[ip];
+    return null;
+  }
+
+  /** Жалоба на сообщение в чате — уходит в журнал Пульта. */
+  report(p, msgId) {
+    const now = this.now();
+    if (now - (p.lastReportAt || 0) < 10000) return { ok: false, error: 'Не так часто.' };
+    let msg = this.state.chatGlobal.find((m) => m.id === msgId);
+    if (!msg) for (const list of this.localChat.values()) msg = msg || list.find((m) => m.id === msgId);
+    if (!msg || !msg.from || !msg.from.id) return { ok: false, error: 'Сообщение не найдено.' };
+    if (msg.from.id === p.id) return { ok: false, error: 'На себя не жалуются.' };
+    p.lastReportAt = now;
+    this.log(`Жалоба от ${p.name} на ${msg.from.name} (${msg.channel === 'global' ? 'весь дом' : msg.where || 'рядом'}): «${msg.text}»`, 'report', msg.from.id);
+    return { ok: true, message: 'Жалоба передана в ЖЭК.' };
+  }
+
+  mutedFor(p) {
+    return p.mutedUntil && p.mutedUntil > this.now() ? Math.ceil((p.mutedUntil - this.now()) / 60000) : 0;
   }
 
   // =========================================================================
@@ -1275,6 +1382,7 @@ class Game extends EventEmitter {
 
   /** Подсунуть записку под чужую дверь. anon — без подписи (ЖЭК всё равно видит автора). */
   slipNote(p, apt, rawText, anon) {
+    if (this.mutedFor(p)) return { ok: false, error: `ЖЭК запретил вам писать ещё ${this.mutedFor(p)} мин.` };
     const check = this.doorDropCheck(p, apt);
     if (check.error) return { ok: false, error: check.error };
     const text = sanitizeText(rawText, C.NOTES.maxLength);
@@ -1328,6 +1436,7 @@ class Game extends EventEmitter {
   /** Повесить свой листок на доску объявлений (у жильца — один листок на весь дом). */
   pinNote(p, rawText) {
     if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (this.mutedFor(p)) return { ok: false, error: `ЖЭК запретил вам писать ещё ${this.mutedFor(p)} мин.` };
     if (!this.nearTo(p, (o) => o.type === 'board')) return { ok: false, error: 'Подойдите к доске объявлений.' };
     const text = sanitizeText(rawText, C.NOTES.boardMaxLength);
     if (!text) return { ok: false, error: 'Пустой листок.' };
@@ -1467,6 +1576,7 @@ class Game extends EventEmitter {
   // =========================================================================
   chat(p, channel, rawText) {
     if (!p.alive) return { ok: false, error: 'Мёртвые не разговаривают.' };
+    if (this.mutedFor(p)) return { ok: false, error: `Вы сорвали голос. Говорить сможете через ${this.mutedFor(p)} мин.` };
     const text = sanitizeText(rawText, 300);
     if (!text) return { ok: false, error: 'Пустое сообщение.' };
     const now = this.now();
@@ -2037,6 +2147,63 @@ const ADMIN_COMMANDS = {
     this.log(`Жилец ${p.name} стёрт из домовой книги`, 'admin');
   },
 
+  // ---- модерация ----
+  mute({ id, minutes = 30 }) {
+    const p = this.requirePlayer(id, { alive: false });
+    const min = Math.max(1, Math.min(7 * 24 * 60, Number(minutes) || 30));
+    p.mutedUntil = this.now() + min * 60000;
+    this.notify([p], { title: 'Вы сорвали голос', text: `ЖЭК запретил вам говорить и писать на ${min} мин.`, style: 'warn' });
+    this.log(`${p.name} заглушён на ${min} мин`, 'admin', p.id);
+    return { ok: true, message: `Заглушён на ${min} мин` };
+  },
+
+  unmute({ id }) {
+    const p = this.requirePlayer(id, { alive: false });
+    p.mutedUntil = null;
+    this.log(`${p.name}: заглушка снята`, 'admin', p.id);
+  },
+
+  /** Бан паспорта (а без паспорта — самого жильца); по желанию и адреса. minutes 0 — навсегда. */
+  ban({ id, minutes = 0, reason, ip }) {
+    const p = this.requirePlayer(id, { alive: false });
+    const min = Number(minutes) || 0;
+    const ban = { until: min > 0 ? this.now() + min * 60000 : null, reason: sanitizeText(reason, 200) || 'Нарушение порядка в доме' };
+    const acc = p.account ? this.state.accounts[p.account] : null;
+    if (acc) acc.banned = ban;
+    else p.banned = ban;
+    if (ip && p.lastIp) this.state.bannedIps[p.lastIp] = ban;
+    const ids = acc ? acc.playerIds : [p.id];
+    this.emit('kick', { ids, reason: ban.reason, until: ban.until });
+    this.log(`Бан: ${p.name}${acc ? ` (паспорт ${acc.login})` : ''}${ip && p.lastIp ? ' и адрес' : ''} — ${ban.reason}${min > 0 ? `, на ${min} мин` : ', навсегда'}`, 'admin', p.id);
+    return { ok: true, message: 'Забанен' };
+  },
+
+  unban({ id }) {
+    const p = this.requirePlayer(id, { alive: false });
+    const acc = p.account ? this.state.accounts[p.account] : null;
+    if (acc) acc.banned = null;
+    p.banned = null;
+    if (p.lastIp) delete this.state.bannedIps[p.lastIp];
+    this.log(`Бан снят: ${p.name}`, 'admin', p.id);
+    return { ok: true, message: 'Бан снят' };
+  },
+
+  /** Удалить сообщение из чатов у всех. */
+  deleteMessage({ id }) {
+    const before = this.state.chatGlobal.length;
+    this.state.chatGlobal = this.state.chatGlobal.filter((m) => m.id !== id);
+    let found = before !== this.state.chatGlobal.length;
+    for (const [key, list] of this.localChat) {
+      const left = list.filter((m) => m.id !== id);
+      if (left.length !== list.length) found = true;
+      this.localChat.set(key, left);
+    }
+    if (!found) throw new Error('Сообщение уже удалено');
+    this.emit('chat_delete', { id });
+    this.log('Сообщение удалено из чата', 'admin');
+    return { ok: true, message: 'Удалено' };
+  },
+
   unpin({ id }) {
     for (const [floor, list] of Object.entries(this.state.boardNotes)) {
       const note = list.find((n) => n.id === id);
@@ -2170,6 +2337,8 @@ Game.prototype.playerView = function playerView(p) {
     searchInSec: Math.max(0, Math.ceil(((p.searchedAt || 0) + SEARCH_COOLDOWN_MS - now) / 1000)),
     sealed: this.doorSealed(this.currentApt(p) || p.apartment.number),
     sleeping: p.sleeping,
+    account: p.account ? (this.state.accounts[p.account] || {}).login || p.account : null,
+    mutedMin: this.mutedFor(p),
     down: p.down ? { remainingSec: Math.max(0, Math.ceil((p.down.until - now) / 1000)), cause: p.down.cause } : null,
     knocker: (() => {
       const g = this.knockerFor(p);
@@ -2370,6 +2539,9 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       guestAt: p.location.place === 'home' && this.currentApt(p) !== p.apartment.number ? this.currentApt(p) : null,
       sleeping: p.sleeping,
       homeward: !!p.homeward,
+      account: p.account ? (this.state.accounts[p.account] || {}).login || p.account : null,
+      mutedMin: this.mutedFor(p),
+      banned: !!this.banInfo(p),
       down: p.down ? Math.max(0, Math.ceil((p.down.until - now) / 1000)) : null,
       working: !!p.job,
       shifts: p.shifts || 0,

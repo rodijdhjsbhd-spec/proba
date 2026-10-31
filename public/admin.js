@@ -126,6 +126,10 @@
         if (A.chat.length > 300) A.chat.shift();
         appendChat(msg.msg);
         break;
+      case 'chat_delete':
+        A.chat = A.chat.filter((m) => m.id !== msg.id);
+        renderChat();
+        break;
       case 'res': {
         const r = A.pending.get(msg.id);
         A.pending.delete(msg.id);
@@ -878,6 +882,32 @@
       ),
     );
 
+    // Модерация
+    const muteMin = num(30, { min: 1, max: 10080, 'aria-label': 'Минут заглушки' });
+    const banMin = num(0, { min: 0, 'aria-label': 'Минут бана (0 — навсегда)' });
+    const banReason = h('input', { placeholder: 'Причина бана', maxlength: '200', 'aria-label': 'Причина бана' });
+    const banIp = h('input', { type: 'checkbox' });
+    const modSection = h(
+      'div',
+      { class: 'card-section' },
+      h('h3', { text: 'Модерация' }),
+      h('div', { class: 'row' }, 'Заглушить на', muteMin, 'мин', button('Заглушить', () => cmd('mute', { id, minutes: muteMin.value }), 'small'), button('Снять', () => cmd('unmute', { id }, 'Заглушка снята'), 'small')),
+      h('div', { class: 'row' }, banReason),
+      h(
+        'div',
+        { class: 'row' },
+        'Бан, мин (0 — навсегда)',
+        banMin,
+        h('label', { class: 'check' }, banIp, 'и адрес'),
+      ),
+      h(
+        'div',
+        { class: 'row' },
+        button('Забанить', () => confirm(`Забанить ${p.name}? Его выкинет из игры.`) && cmd('ban', { id, minutes: banMin.value, reason: banReason.value, ip: banIp.checked }), 'small danger'),
+        button('Разбанить', () => cmd('unban', { id }), 'small'),
+      ),
+    );
+
     // Смерть
     const cause = h('input', { placeholder: 'Причина смерти', maxlength: '120', 'aria-label': 'Причина смерти' });
     const deathSection = h(
@@ -887,13 +917,13 @@
       h('div', { class: 'row' }, cause, button('Убить', () => confirm(`Убить ${p.name}?`) && cmd('kill', { id, cause: cause.value }), 'small danger')),
     );
 
-    box.replaceChildren(header, dyn, statsSection, invSection, condSection, accSection, tpSection, whSection, deathSection);
+    box.replaceChildren(header, dyn, statsSection, invSection, condSection, accSection, tpSection, whSection, modSection, deathSection);
   }
 
   function fillCard(p) {
     if (!A.card) return;
     A.card.title.textContent = p.name;
-    A.card.meta.textContent = `кв. ${p.apartment.number} · ${p.online ? 'в сети' : 'не в сети'} · смен отработано: ${p.shifts}`;
+    A.card.meta.textContent = `кв. ${p.apartment.number} · ${p.online ? 'в сети' : 'не в сети'} · смен отработано: ${p.shifts} · ${p.account ? `паспорт «${p.account}»` : 'без паспорта'}${p.mutedMin ? ` · заглушён ещё ${p.mutedMin} мин` : ''}${p.banned ? ' · ЗАБАНЕН' : ''}`;
     A.card.dyn.replaceChildren(
       h('p', { class: 'card-meta', text: `Где: ${whereText(p)}` }),
       p.alive
@@ -973,6 +1003,7 @@
       );
     }
     const where = m.channel === 'global' ? 'ДОМ' : m.where || m.key || 'рядом';
+    const fromPlayer = m.from && m.from.id && !m.hallucination;
     return h(
       'li',
       { class: m.from?.system ? 'sys' : '' },
@@ -980,6 +1011,14 @@
       h('span', { class: 'from', text: `${m.from?.name || '?'}${m.from?.apt ? ` (${m.from.apt})` : ''}: ` }),
       m.text,
       m.hallucination ? h('span', { class: 'ghost-tag', text: ` — галлюцинация для ${nameOf(m.to)}` }) : null,
+      fromPlayer
+        ? h(
+            'span',
+            { class: 'mod-tools' },
+            button('Удалить', () => cmd('deleteMessage', { id: m.id }), 'small'),
+            button('Заглушить 30 мин', () => cmd('mute', { id: m.from.id, minutes: 30 }), 'small'),
+          )
+        : null,
     );
   }
 

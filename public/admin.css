@@ -106,3 +106,5 @@ textarea { width: 100%; resize: vertical; min-height: 60px; }
 .admin-log .schedule { border-color: var(--blue); }
 .admin-log .social { border-color: var(--violet); }
 .hint { color: var(--muted); font-size: 13px; }
+.chat-log .mod-tools { margin-left: 8px; display: inline-flex; gap: 4px; }
+.admin-log .report { border-color: #ff8a5c; color: #ffc9b0; }

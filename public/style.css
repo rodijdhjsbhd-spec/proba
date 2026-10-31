@@ -393,3 +393,14 @@ body.sanity-critical .place h1 { animation: flicker 2s infinite; }
 .trade-grid.single { grid-template-columns: 1fr; }
 .toast .toast-action { display: block; margin-top: 6px; }
 .aid-form .actions { flex-wrap: wrap; }
+
+/* Паспорт жильца: вход и привязка */
+.reg-tabs { margin: 12px 0 4px; }
+.passport-h { margin: 10px 0 2px; font-size: 13px; color: var(--amber); }
+#passport-fields { display: grid; gap: 6px; }
+.passport form { display: grid; gap: 6px; }
+.chat-log li .msg-tools { visibility: hidden; margin-left: 4px; }
+.chat-log li:hover .msg-tools, .chat-log li:focus-within .msg-tools { visibility: visible; }
+.msg-tools button { background: none; border: 0; color: var(--muted); cursor: pointer; padding: 0 3px; font-size: 12px; }
+.msg-tools button:hover { color: var(--amber); }
+@media (hover: none) { .chat-log li .msg-tools { visibility: visible; } }

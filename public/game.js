@@ -71,6 +71,10 @@
     job: null,
     sound: store.get('gh_sound') !== 'off',
     retry: 0,
+    regMode: 'new', // 'new' — новый жилец с паспортом, 'login' — вход по паспорту, 'newlife' — новая жизнь на том же паспорте
+    ignored: new Set((() => {
+      try { return JSON.parse(store.get('gh_ignored') || '[]'); } catch { return []; }
+    })()),
   };
 
   const renderer = new Renderer($('#view'));
@@ -88,7 +92,7 @@
     ws.onopen = () => {
       S.retry = 0;
       $('#conn').hidden = true;
-      send({ t: 'hello', token: S.token });
+      if (!S.banned) send({ t: 'hello', token: S.token });
     };
     ws.onmessage = (e) => {
       let msg;
@@ -127,8 +131,23 @@
         showRegister(S.token ? 'Жилец по вашему ордеру в домовой книге не найден: возможно, он давно погиб или мир начали заново. Можно заселиться снова.' : '');
         break;
       case 'register_error':
-        $('#register-error').textContent = msg.error;
-        toast({ title: 'Ордер не выдан', text: msg.error, style: 'error' });
+        $(S.regMode === 'login' ? '#login-error' : '#register-error').textContent = msg.error;
+        toast({ title: S.regMode === 'login' ? 'Не вышло войти' : 'Ордер не выдан', text: msg.error, style: 'error' });
+        break;
+      case 'need_new_life':
+        // вошли по паспорту, но все жильцы этого паспорта погибли
+        showRegister(`Паспорт «${msg.login}»: прошлые жильцы погибли. Дом не пустует долго — заселите нового.`, 'newlife');
+        break;
+      case 'banned': {
+        const until = msg.until ? `до ${new Date(msg.until).toLocaleString('ru-RU')}` : 'навсегда';
+        S.banned = true;
+        showRegister(`ЖЭК закрыл вам вход ${until}. Причина: ${msg.reason}`, 'login');
+        break;
+      }
+      case 'chat_delete':
+        for (const ch of ['local', 'global']) S.chat[ch] = S.chat[ch].filter((m) => m.id !== msg.id);
+        for (const [pid, b] of S.bubbles) if (b.msgId === msg.id) S.bubbles.delete(pid);
+        renderChat();
         break;
       case 'welcome':
         S.token = msg.token;
@@ -797,12 +816,35 @@
   // ---------------------------------------------------------------------------
   // Регистрация и смерть
   // ---------------------------------------------------------------------------
-  function showRegister(note = '') {
+  function setRegMode(mode) {
+    S.regMode = mode;
+    $('#register-form').hidden = mode === 'login';
+    $('#login-form').hidden = mode !== 'login';
+    $('#passport-fields').hidden = mode === 'newlife';
+    $('#register-submit').textContent = mode === 'newlife' ? 'Заселить нового жильца' : 'Получить ордер';
+    $('#register-login').required = mode === 'new';
+    $('#register-password').required = mode === 'new';
+    $('.reg-tabs').hidden = mode === 'newlife';
+    for (const t of document.querySelectorAll('.reg-tabs .tab')) t.classList.toggle('active', t.dataset.reg === mode);
+  }
+  for (const t of document.querySelectorAll('.reg-tabs .tab')) t.addEventListener('click', () => setRegMode(t.dataset.reg));
+
+  $('#login-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    $('#login-error').textContent = '';
+    S.banned = false;
+    unlockAudio();
+    if (!S.ws || S.ws.readyState !== WebSocket.OPEN) connect();
+    send({ t: 'login', login: $('#login-login').value, password: $('#login-password').value });
+  });
+
+  function showRegister(note = '', mode = null) {
     $('#app').hidden = true;
     $('#death').hidden = true;
     $('#register').hidden = false;
     $('#register-note').hidden = !note;
     $('#register-note').textContent = note;
+    setRegMode(mode || (S.regMode === 'newlife' ? 'new' : S.regMode));
     setTimeout(() => $('#register-name').focus(), 50);
   }
 
@@ -810,7 +852,22 @@
     e.preventDefault();
     $('#register-error').textContent = '';
     unlockAudio();
-    send({ t: 'register', name: $('#register-name').value });
+    const msg = { t: 'register', name: $('#register-name').value };
+    if (S.regMode === 'new') {
+      msg.login = $('#register-login').value;
+      msg.password = $('#register-password').value;
+    }
+    send(msg);
+  });
+
+  // старому жильцу без паспорта — выдать паспорт
+  $('#claim-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const res = await act('claim_account', { login: $('#claim-login').value, password: $('#claim-password').value });
+    if (res.ok) {
+      say(res.message);
+      $('#claim-password').value = '';
+    }
   });
 
   $('#rebirth-form').addEventListener('submit', (e) => {
@@ -859,6 +916,7 @@
     $('#online').textContent = `в сети: ${v.world.online}`;
 
     renderBanners(v);
+    $('#passport-panel').hidden = !!you.account;
     memo('stats', [you.stats, you.conditions.map((c) => [c.id, c.remainingSec == null ? null : Math.ceil(c.remainingSec / 10)])], () => renderStats(you));
     memo('inv', [you.inventory, you.gasmaskCharge], () => renderInventory(you));
     memo('head', [v.here.title, v.here.text, v.here.floor, v.here.place], () => {
@@ -1108,34 +1166,54 @@
     S.chat[ch].push(msg);
     if (S.chat[ch].length > 120) S.chat[ch].shift();
     if (ch !== S.tab) S.unread[ch]++;
-    if (ch === 'local' && msg.from && msg.from.id && !msg.hallucination) S.bubbles.set(msg.from.id, { text: msg.text, until: Date.now() + 6000 });
+    if (ch === 'local' && msg.from && msg.from.id && !msg.hallucination && !S.ignored.has(msg.from.id)) S.bubbles.set(msg.from.id, { text: msg.text, until: Date.now() + 6000, msgId: msg.id });
     renderChat();
   }
 
   function renderChat() {
     const log = $('#chat-log');
     const nearBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
-    const list = S.chat[S.tab];
+    const myId = S.view && S.view.you.id;
+    const list = S.chat[S.tab].filter((m) => !(m.from && m.from.id && S.ignored.has(m.from.id)));
     log.replaceChildren(
       ...(list.length
         ? list.map((m) => {
             if (m.from && m.from.system) return h('li', { class: 'sys' }, h('span', { class: 'from', text: `📻 ${m.from.name}: ` }), m.text);
+            const tools =
+              m.from && m.from.id && m.from.id !== myId
+                ? h(
+                    'span',
+                    { class: 'msg-tools' },
+                    h('button', { type: 'button', title: 'Пожаловаться в ЖЭК', text: '⚑', onclick: async () => { const r = await act('report', { id: m.id }); if (r.ok) say(r.message); } }),
+                    h('button', { type: 'button', title: `Не слышать ${m.from.name}`, text: '🔇', onclick: () => ignore(m.from) }),
+                  )
+                : null;
             return h(
               'li',
               { class: m.hallucination ? 'ghost' : '' },
               h('span', { class: 'from' }, m.from.name, h('span', { class: 'apt', text: `(${m.from.apt})` })),
               ': ',
               m.text,
+              tools,
             );
           })
         : [h('li', { class: 'empty', text: S.tab === 'local' ? 'Тихо. Только гудят лампы.' : 'Радиоточка молчит.' })]),
     );
     if (nearBottom) log.scrollTop = log.scrollHeight;
-    for (const tab of document.querySelectorAll('.tab')) {
+    for (const tab of document.querySelectorAll('.chat .tabs .tab')) {
       const t = tab.dataset.tab;
       tab.classList.toggle('active', t === S.tab);
       tab.replaceChildren(t === 'local' ? 'Здесь' : 'Весь дом', ...(S.unread[t] ? [h('span', { class: 'badge', text: S.unread[t] })] : []));
     }
+  }
+
+  /** «Не слышать»: скрыть сообщения и облачка жильца (запоминается в этом браузере). */
+  function ignore(from) {
+    if (!confirm(`Не слышать ${from.name}? Его сообщения и реплики пропадут у вас. Вернуть — очистив данные сайта.`)) return;
+    S.ignored.add(from.id);
+    store.set('gh_ignored', JSON.stringify([...S.ignored]));
+    S.bubbles.delete(from.id);
+    renderChat();
   }
 
   function selectTab(tab) {
@@ -1146,7 +1224,7 @@
     log.scrollTop = log.scrollHeight;
   }
 
-  for (const tab of document.querySelectorAll('.tab')) tab.addEventListener('click', () => selectTab(tab.dataset.tab));
+  for (const tab of document.querySelectorAll('.chat .tabs .tab')) tab.addEventListener('click', () => selectTab(tab.dataset.tab));
 
   $('#chat-form').addEventListener('submit', async (e) => {
     e.preventDefault();
