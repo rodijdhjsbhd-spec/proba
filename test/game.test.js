@@ -522,25 +522,53 @@ test('застрявший в лифте и после выхода остаёт
   assert.equal(p.location.place, 'lift');
   assert.equal(p.travel.stuck, true);
   game.admin('breakdown', { key: 'lift', broken: false });
-  advance(10000);
-  assert.equal(game.locationKey(p), 'corridor:50', 'доехал');
-  game.admin('breakdown', { key: 'lift', broken: false });
   advance(60000);
-  assert.equal(p.location.place, 'home', 'и дошёл домой');
+  assert.equal(p.location.place, 'home', 'лифт починили — доехал и дошёл домой');
 });
 
-test('в тумане тело ушедшего не идёт домой и получает полный урон', () => {
+test('тело ушедшего: в тумане на своём этаже не замирает, а идёт домой', () => {
   const { game, advance } = makeWorld();
   const p = join(game, 'Иван');
   game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
-  game.admin('fog', { from: 101, to: 101, warnSec: 0, durationMin: 2 });
+  game.admin('fog', { from: 101, to: 101, warnSec: 0, durationMin: 3 });
+  game.setOnline(p.id, false);
+  advance(15000);
+  assert.equal(p.location.place, 'home', 'добрёл до своей двери');
+  assert.ok(p.stats.health < 100, 'по дороге туман бил');
+});
+
+test('тело ушедшего: с безопасного этажа в туман не идёт — ждёт отбоя', () => {
+  const { game, advance } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'canteen' });
+  game.admin('fog', { from: 101, to: 110, warnSec: 0, durationMin: 2, intensity: 3 });
   game.setOnline(p.id, false);
   advance(60000);
-  assert.equal(p.location.place, 'corridor', 'ждёт отбоя');
-  assert.ok(p.stats.health <= 85, `туман бьёт отсутствующего: ${p.stats.health}`);
+  assert.equal(game.locationKey(p), 'corridor:100', 'вышло из столовой, но к лифту в туман не поехало');
+  assert.equal(Math.round(p.stats.health), 100);
   advance(2 * 60000);
+  assert.equal(p.location.place, 'home', 'после отбоя дошло');
+});
+
+test('тело ушедшего: по лестнице — только если хватает сил; сломался лифт в пути — застряло', () => {
+  const { game, advance } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 400 });
+  game.admin('breakdown', { key: 'lift', broken: true });
+  game.admin('setStats', { id: p.id, stats: { energy: 5 } });
+  game.setOnline(p.id, false);
+  advance(3 * 60000);
+  assert.equal(game.locationKey(p), 'corridor:400', 'сил на 299 этажей нет — стоит');
+
+  const q = join(game, 'Мария');
+  game.admin('breakdown', { key: 'lift', broken: false });
+  game.admin('teleport', { id: q.id, place: 'corridor', floor: 300 });
+  game.setOnline(q.id, false);
+  advance(2000);
+  assert.equal(q.location.place, 'lift', 'поехало на лифте');
+  game.admin('breakdown', { key: 'lift', broken: true });
   advance(60000);
-  assert.equal(p.location.place, 'home', 'после отбоя дошёл');
+  assert.equal(q.travel.stuck, true, 'лифт сломался в пути — застряло, как застрял бы живой');
 });
 
 test('голод сам по себе не убивает того, кто не в сети', () => {
@@ -573,7 +601,7 @@ test('квитанция ЖЭК: кто стучал и что случилос�
   assert.ok(receipt, 'квитанция пришла');
   assert.match(receipt.text, /Вас не было/);
   assert.match(receipt.text, /Стучали в дверь: Мария/);
-  assert.match(receipt.text, /Столовая/);
+  assert.match(receipt.text, /сломано: столовая/);
 });
 
 test('отсутствующие видны соседям в сцене, но помечены', () => {
@@ -948,4 +976,64 @@ test('модерация: удалить сообщение у всех и жа�
   assert.equal(game.admin('deleteMessage', { id: msg.id }).ok, true);
   assert.deepEqual(deleted, [msg.id]);
   assert.equal(game.state.chatGlobal.some((m) => m.id === msg.id), false);
+});
+
+test('после перезапуска сервера квитанция считает отсутствие с момента сохранения, а не входа', () => {
+  const { game, clock } = makeWorld();
+  const p = join(game, 'Иван');
+  clock.t += 3 * 3600 * 1000; // три часа играл
+  const saved = JSON.parse(JSON.stringify({ ...game.state, savedAt: clock.t }));
+  clock.t += 60000; // минута простоя
+  const g2 = new (require('../server/game').Game)(saved, { now: () => clock.t });
+  const notes = [];
+  g2.on('notify', (n) => notes.push(n));
+  g2.setOnline(p.id, true);
+  assert.equal(notes.find((n) => n.style === 'receipt'), undefined, 'за минуту простоя квитанции нет');
+});
+
+test('квитанция не пересказывает служебный журнал Пульта', () => {
+  const { game, clock } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  game.setOnline(a.id, false);
+  game.admin('custom', { target: { type: 'player', id: b.id }, title: 'Тайный обыск', text: 'x', style: 'whisper' });
+  game.admin('breakdown', { key: 'lift', broken: true, durationMin: 37, reason: 'Диспетчер запил' });
+  game.admin('kill', { id: b.id, cause: 'Забрали люди в сером' });
+  clock.t += 10 * 60000;
+  const notes = [];
+  game.on('notify', (n) => notes.push(n));
+  game.setOnline(a.id, true);
+  const text = notes.find((n) => n.style === 'receipt').text;
+  assert.doesNotMatch(text, /Тайный обыск/);
+  assert.doesNotMatch(text, /37 мин/);
+  assert.doesNotMatch(text, /люди в сером/);
+  assert.match(text, /Мария/, 'о смерти соседа по этажу — да, но без причины');
+});
+
+test('болезни вне сети не «отлёживаются»: срок идёт так же медленно, как и вред', () => {
+  const { game, advance } = makeWorld();
+  const p = join(game, 'Иван');
+  game.addCondition(p, 'flu');
+  game.setOnline(p.id, false);
+  advance(20 * 60000);
+  assert.ok(game.hasCondition(p, 'flu'), 'грипп никуда не делся за 20 минут вне сети');
+});
+
+test('имена-двойники: латинские буквы, точки и пробелы не обходят уникальность', () => {
+  const { game } = makeWorld();
+  join(game, 'Вася');
+  assert.equal(game.register('Bacя').ok, false);
+  assert.equal(game.register('Вася.').ok, false);
+  assert.equal(game.register('ЖЭK').ok, false);
+  assert.equal(game.register('Ж Э К').ok, false);
+});
+
+test('воскрешение всегда даёт уникальное имя', () => {
+  const { game } = makeWorld();
+  const a = join(game, 'Абвгдежзийклмнопрсту');
+  game.kill(a, 'тест');
+  join(game, 'Абвгдежзийклмнопрсту');
+  game.admin('revive', { id: a.id });
+  const names = game.alivePlayers().map((p) => p.name);
+  assert.equal(new Set(names).size, names.length, names.join(' | '));
 });

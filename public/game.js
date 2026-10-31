@@ -518,6 +518,7 @@
 
   function actorAt(pt) {
     for (const a of S.actors.values()) {
+      if (a.away && !a.down) continue; // тело ушедшего не перехватывает клики (дверь под ним должна нажиматься)
       if (a.down && Math.abs(a.x - pt.x) < 0.55 && Math.abs(a.y - 0.2 - pt.y) < 0.4) return a;
       if (Math.abs(a.x - pt.x) < 0.35 && pt.y < a.y + 0.15 && pt.y > a.y - 1.25) return a;
     }

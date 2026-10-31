@@ -54,12 +54,30 @@ function resolveAdminPassword() {
 }
 
 /** Адрес игрока. За своим прокси — из X-Forwarded-For, иначе — адрес соединения. */
+/**
+ * Адрес игрока для лимитов и блокировок.
+ * За своим прокси (TRUST_PROXY=1) — X-Real-IP или ПОСЛЕДНИЙ элемент X-Forwarded-For: его дописал ваш
+ * прокси, а начало заголовка присылает сам клиент и может подделать. Заголовкам верим, только если
+ * соединение пришло с локального адреса (прокси на той же машине) или из TRUSTED_PROXIES.
+ * IPv4 внутри IPv6 приводим к IPv4, IPv6 — к сети /64 (иначе у одного абонента миллиарды адресов).
+ */
+const TRUSTED_PROXIES = String(process.env.TRUSTED_PROXIES || '').split(',').map((x) => x.trim()).filter(Boolean);
+function normalizeIp(ip) {
+  let a = String(ip || '').trim();
+  if (a.startsWith('::ffff:')) a = a.slice(7);
+  if (a.includes(':')) return `${a.split(':').slice(0, 4).join(':')}::/64`;
+  return a || 'unknown';
+}
 function clientIp(req) {
-  if (TRUST_PROXY) {
-    const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
-    if (fwd) return fwd;
+  const remote = req.socket.remoteAddress || '';
+  const fromProxy = TRUST_PROXY && (/^(127\.|::1$|::ffff:127\.)/.test(remote) || TRUSTED_PROXIES.includes(normalizeIp(remote)));
+  if (fromProxy) {
+    const real = String(req.headers['x-real-ip'] || '').trim();
+    if (real) return normalizeIp(real);
+    const chain = String(req.headers['x-forwarded-for'] || '').split(',').map((x) => x.trim()).filter(Boolean);
+    if (chain.length) return normalizeIp(chain[chain.length - 1]);
   }
-  return req.socket.remoteAddress || 'unknown';
+  return normalizeIp(remote);
 }
 
 // ---------------------------------------------------------------------------
@@ -80,7 +98,7 @@ const game = new Game(saved);
 
 function makeBackup() {
   try {
-    const file = storage.backup(DATA_FILE, BACKUP_DIR);
+    const file = storage.backup(DATA_FILE, BACKUP_DIR, 48, new Date(), { skipIfNewerThanMs: 50 * 60 * 1000 });
     if (file) console.log(`[storage] Резервная копия мира: ${file}`);
   } catch (err) {
     console.error('[storage] Не удалось сделать резервную копию:', err.message);
@@ -138,7 +156,8 @@ const playerWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 })
 const adminWss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
 
 server.on('upgrade', (req, socket, head) => {
-  const { pathname } = new URL(req.url, 'http://localhost');
+  socket.on('error', () => socket.destroy());
+  const pathname = String(req.url || '').split('?')[0]; // без new URL: кривой адрес не должен ронять сервер
   if (pathname === '/ws') playerWss.handleUpgrade(req, socket, head, (ws) => playerWss.emit('connection', ws, req));
   else if (pathname === '/admin-ws') adminWss.handleUpgrade(req, socket, head, (ws) => adminWss.emit('connection', ws, req));
   else socket.destroy();
@@ -294,13 +313,25 @@ function registrationAllowed(ip) {
   if (!REGISTER_LIMIT) return true;
   const now = Date.now();
   const recent = (registrations.get(ip) || []).filter((t) => now - t < 60 * 60 * 1000);
-  registrations.set(ip, recent);
+  if (recent.length) registrations.set(ip, recent);
+  else registrations.delete(ip);
   return recent.length < REGISTER_LIMIT;
 }
+// чистим старые записи, чтобы карта адресов не росла бесконечно
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, list] of registrations) if (!list.some((t) => now - t < 60 * 60 * 1000)) registrations.delete(ip);
+  for (const [ip, lock] of failedLogins) if (!lock.until || lock.until < now) failedLogins.delete(ip);
+}, 10 * 60 * 1000);
 
 playerWss.on('connection', (ws, req) => {
   ws.isAlive = true;
   ws.ip = clientIp(req);
+  // слишком большое или битое сообщение — закрываем это соединение, а не падаем целиком
+  ws.on('error', (err) => {
+    console.error('[ws]', err.message);
+    ws.terminate();
+  });
   ws.on('pong', () => (ws.isAlive = true));
   ws.on('message', (raw) => {
     try {
@@ -369,7 +400,9 @@ function handlePlayerMessage(ws, raw) {
   }
 
   if (msg.t === 'register') {
-    if (!registrationAllowed(ws.ip)) {
+    const bound = ws.playerId ? game.getPlayer(ws.playerId) : null;
+    const rebirth = !!ws.account || !!(bound && !bound.alive);
+    if (!rebirth && !registrationAllowed(ws.ip)) {
       send(ws, { t: 'register_error', error: `С одного адреса можно заселять не больше ${REGISTER_LIMIT} жильцов в час. Подождите.` });
       return;
     }
@@ -405,8 +438,10 @@ function handlePlayerMessage(ws, raw) {
     // «Новая жизнь» — отвязываемся от старого (мёртвого) персонажа
     if (ws.playerId) unbind(ws);
     ws.account = null;
-    if (!registrations.has(ws.ip)) registrations.set(ws.ip, []);
-    registrations.get(ws.ip).push(Date.now());
+    if (!rebirth) {
+      if (!registrations.has(ws.ip)) registrations.set(ws.ip, []);
+      registrations.get(ws.ip).push(Date.now());
+    }
     bind(ws, res.player);
     return;
   }
@@ -449,6 +484,10 @@ function handlePlayerMessage(ws, raw) {
 adminWss.on('connection', (ws, req) => {
   const ip = clientIp(req);
   ws.isAlive = true;
+  ws.on('error', (err) => {
+    console.error('[admin ws]', err.message);
+    ws.terminate();
+  });
   ws.on('pong', () => (ws.isAlive = true));
   ws.on('message', (raw) => {
     try {
@@ -471,7 +510,8 @@ function handleAdminMessage(ws, ip, raw) {
 
   if (msg.t === 'auth') {
     const lock = failedLogins.get(ip);
-    if (lock && lock.until > Date.now()) {
+    const total = failedLogins.get('admin:*');
+    if ((lock && lock.until > Date.now()) || (total && total.until > Date.now())) {
       send(ws, { t: 'auth_error', error: 'Слишком много попыток. Подождите минуту.' });
       return;
     }
@@ -481,6 +521,12 @@ function handleAdminMessage(ws, ip, raw) {
     if (!ok) {
       const count = (lock?.count || 0) + 1;
       failedLogins.set(ip, { count, until: count >= 5 ? Date.now() + 60000 : 0 });
+      // общий счётчик — против перебора с разных адресов
+      const all = failedLogins.get('admin:*');
+      const fresh = all && Date.now() - all.since < 60000 ? all : { since: Date.now(), count: 0, until: 0 };
+      fresh.count++;
+      if (fresh.count >= 30) fresh.until = Date.now() + 60000;
+      failedLogins.set('admin:*', fresh);
       send(ws, { t: 'auth_error', error: 'Неверный пароль.' });
       return;
     }
@@ -570,12 +616,30 @@ function broadcastActors() {
 
 function persist() {
   try {
+    game.state.savedAt = Date.now();
     storage.save(DATA_FILE, game.state);
   } catch (err) {
     console.error('[storage] Не удалось сохранить мир:', err.message);
   }
 }
 setInterval(persist, 10000);
+
+// Смерть — сохраняем сразу (в течение секунды), чтобы падение сервера не «откатывало» беды бога
+let persistTimer = null;
+game.on('log', (entry) => {
+  if (entry.kind === 'death' && !persistTimer) {
+    persistTimer = setTimeout(() => {
+      persistTimer = null;
+      persist();
+    }, 1000);
+  }
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[fatal]', err);
+  persist();
+  process.exit(1);
+});
 
 setInterval(() => {
   for (const wss of [playerWss, adminWss]) {

@@ -926,8 +926,8 @@
     A.card.meta.textContent = `кв. ${p.apartment.number} · ${p.online ? 'в сети' : 'не в сети'} · смен отработано: ${p.shifts} · ${p.account ? `паспорт «${p.account}»` : 'без паспорта'}${p.mutedMin ? ` · заглушён ещё ${p.mutedMin} мин` : ''}${p.banned ? ' · ЗАБАНЕН' : ''}`;
     A.card.dyn.replaceChildren(
       h('p', { class: 'card-meta', text: `Где: ${whereText(p)}` }),
-      p.alive
-        ? h(
+      ...(p.alive
+        ? [h(
             'div',
             null,
             STATS.map(([k, label]) =>
@@ -939,8 +939,8 @@
               ),
             ),
             h('p', { class: 'card-meta', text: `Талоны: ${p.money}` }),
-          )
-        : null,
+          )]
+        : []),
     );
     if (A.card.inv) {
       const entries = Object.entries(p.inventory);

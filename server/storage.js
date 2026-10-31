@@ -39,9 +39,14 @@ function save(file, state) {
  * Резервная копия текущего файла мира в dir (имя с датой и часом).
  * Хранятся последние keep копий. Возвращает путь копии или null, если копировать нечего.
  */
-function backup(file, dir, keep = 48, now = new Date()) {
+function backup(file, dir, keep = 48, now = new Date(), { skipIfNewerThanMs = 0 } = {}) {
   if (!fs.existsSync(file)) return null;
   fs.mkdirSync(dir, { recursive: true });
+  if (skipIfNewerThanMs) {
+    // при частых перезапусках не вытесняем почасовую историю почти одинаковыми копиями
+    const last = latestBackup(dir);
+    if (last && now.getTime() - fs.statSync(last).mtimeMs < skipIfNewerThanMs) return null;
+  }
   const stamp = now.toISOString().slice(0, 16).replace(/[:T]/g, '-');
   const target = path.join(dir, `world-${stamp}.json`);
   fs.copyFileSync(file, target);
