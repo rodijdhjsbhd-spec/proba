@@ -251,7 +251,7 @@ test('голод убивает', () => {
 test('болезнь лечится таблетками; заразная — передаётся соседу', () => {
   const { game, advance } = makeWorld({ random: () => 0 });
   const a = join(game, 'Больной');
-  const b = join(game, 'Сосед');
+  const b = join(game, 'Соседка');
   for (const p of [a, b]) game.admin('teleport', { id: p.id, place: 'canteen' });
   game.admin('infect', { target: { type: 'player', id: a.id }, condition: 'flu' });
   advance(2000);
@@ -432,4 +432,62 @@ test('вид игрока собирается для всех мест', () => 
     assert.ok(view.here.title);
   }
   assert.ok(game.adminSnapshot().players.length === 1);
+});
+
+test('имена: служебные и занятые живыми жильцами нельзя', () => {
+  const { game } = makeWorld();
+  join(game, 'Иван');
+  assert.equal(game.register('ЖЭК').ok, false);
+  assert.equal(game.register('радиоточка').ok, false);
+  assert.equal(game.register('иван').ok, false, 'регистр не важен');
+  const dead = join(game, 'Пётр');
+  game.kill(dead, 'тест');
+  assert.equal(game.register('Пётр').ok, true, 'имя погибшего свободно');
+});
+
+test('дом переполнен — ошибка, а не падение сервера', () => {
+  const { game } = makeWorld();
+  const old = C.BUILDING.maxFloor;
+  C.BUILDING.maxFloor = C.BUILDING.firstResidentialFloor;
+  try {
+    for (let i = 0; i < C.BUILDING.apartmentsPerFloor; i++) assert.equal(game.register(`Жилец${i}`).ok, true);
+    const res = game.register('Лишний');
+    assert.equal(res.ok, false);
+    assert.match(res.error, /переполнен/);
+  } finally {
+    C.BUILDING.maxFloor = old;
+  }
+});
+
+test('галлюцинации говорят выдуманными голосами, не именами соседей', () => {
+  const { game } = makeWorld({ random: () => 0 });
+  const p = join(game, 'Иван');
+  join(game, 'Мария');
+  const msgs = [];
+  game.on('chat', (m) => msgs.push(m));
+  game.hallucinate(p);
+  assert.equal(msgs[0].to, p.id);
+  assert.ok(C.HALLUCINATION_VOICES.includes(msgs[0].from.name));
+  assert.equal(msgs[0].from.apt, '???');
+});
+
+test('Пульт не может писать в чат от имени живого жильца', () => {
+  const { game } = makeWorld();
+  join(game, 'Иван');
+  assert.equal(game.admin('chat', { text: 'привет', as: 'иван' }).ok, false);
+  assert.equal(game.admin('chat', { text: 'привет', as: 'ЖЭК' }).ok, true);
+});
+
+test('давно погибшие уходят в архив домовой книги', () => {
+  const { game, clock } = makeWorld();
+  const p = join(game, 'Иван');
+  game.kill(p, 'тест');
+  game.archiveDead();
+  assert.ok(game.getPlayer(p.id), 'свежий погибший ещё в Пульте');
+  clock.t += (C.ARCHIVE_DEAD_AFTER_H + 1) * 3600 * 1000;
+  game.archiveDead();
+  assert.equal(game.getPlayer(p.id), null);
+  assert.equal(game.playerByToken(p.token), null);
+  assert.equal(game.state.archive[0].name, 'Иван');
+  assert.equal(game.adminSnapshot().archived, 1);
 });

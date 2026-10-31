@@ -203,6 +203,17 @@ const HALLUCINATIONS = [
   'в мусоропроводе кто-то живёт и он голоден',
 ];
 
+// Кто «говорит» в галлюцинациях. Только выдуманные голоса — не имена настоящих жильцов,
+// чтобы скриншотом галлюцинации нельзя было подставить соседа.
+const HALLUCINATION_VOICES = ['Сосед', 'Сосед сверху', 'Кто-то за стеной', 'Голос из вентиляции', 'Жилец из 0-й', 'Мама', 'Вы сами'];
+
+// Эти имена нельзя взять жильцу: ими говорит дом и ЖЭК.
+const RESERVED_NAMES = ['ЖЭК', 'Радиоточка', 'Голос за стеной', 'Админ', 'Администратор', 'Модератор', 'Система', 'Диспетчер', ...HALLUCINATION_VOICES];
+
+// Через сколько реальных часов погибших уносят из Пульта в архив домовой книги
+const ARCHIVE_DEAD_AFTER_H = 24;
+
 module.exports = {
   BUILDING, FACILITIES, BALANCE, ITEMS, SHOPS, CONDITIONS, ACCIDENTS, PLACES, BREAKDOWNS, HALLUCINATIONS,
+  HALLUCINATION_VOICES, RESERVED_NAMES, ARCHIVE_DEAD_AFTER_H,
 };

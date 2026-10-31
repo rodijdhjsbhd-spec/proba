@@ -9,6 +9,9 @@
  *   PORT            — порт (по умолчанию 3000)
  *   ADMIN_PASSWORD  — пароль админки (если не задан — генерируется и сохраняется в data/admin.secret)
  *   DATA_FILE       — куда сохранять мир (по умолчанию data/world.json)
+ *   BACKUP_DIR      — куда класть почасовые копии мира (по умолчанию data/backups)
+ *   REGISTER_LIMIT  — сколько жильцов в час можно заселить с одного адреса (по умолчанию 5, 0 — без ограничения)
+ *   TRUST_PROXY     — 1, если сервер стоит за своим nginx/Caddy: тогда адрес игрока берётся из X-Forwarded-For
  */
 
 const http = require('http');
@@ -25,6 +28,9 @@ const ITEM_CATALOG = Object.fromEntries(Object.entries(ITEMS).map(([id, it]) => 
 const ROOT = path.join(__dirname, '..');
 const PUBLIC_DIR = path.join(ROOT, 'public');
 const DATA_FILE = process.env.DATA_FILE || path.join(ROOT, 'data', 'world.json');
+const BACKUP_DIR = process.env.BACKUP_DIR || path.join(path.dirname(DATA_FILE), 'backups');
+const REGISTER_LIMIT = process.env.REGISTER_LIMIT === undefined ? 5 : Number(process.env.REGISTER_LIMIT) || 0;
+const TRUST_PROXY = process.env.TRUST_PROXY === '1';
 const PORT = Number(process.env.PORT) || 3000;
 const ADMIN_PASSWORD = resolveAdminPassword();
 const OFFLINE_GRACE_MS = 20000; // сколько ждать переподключения, прежде чем считать игрока ушедшим
@@ -44,10 +50,41 @@ function resolveAdminPassword() {
   return generated;
 }
 
+/** Адрес игрока. За своим прокси — из X-Forwarded-For, иначе — адрес соединения. */
+function clientIp(req) {
+  if (TRUST_PROXY) {
+    const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    if (fwd) return fwd;
+  }
+  return req.socket.remoteAddress || 'unknown';
+}
+
 // ---------------------------------------------------------------------------
 // Мир
 // ---------------------------------------------------------------------------
-const game = new Game(storage.load(DATA_FILE));
+let saved;
+try {
+  saved = storage.load(DATA_FILE);
+} catch (err) {
+  // Битый файл мира: не запускаемся, иначе через 10 секунд пустой мир затрёт дом.
+  const last = storage.latestBackup(BACKUP_DIR);
+  console.error(`\n[storage] ${err.message}`);
+  console.error('Сервер не запущен, чтобы не затереть дом пустым миром.');
+  console.error(last ? `Последняя резервная копия: ${last}\nСкопируйте её на место ${DATA_FILE} и запустите сервер снова.` : `Резервных копий нет. Чтобы начать мир заново, удалите ${DATA_FILE}.`);
+  process.exit(1);
+}
+const game = new Game(saved);
+
+function makeBackup() {
+  try {
+    const file = storage.backup(DATA_FILE, BACKUP_DIR);
+    if (file) console.log(`[storage] Резервная копия мира: ${file}`);
+  } catch (err) {
+    console.error('[storage] Не удалось сделать резервную копию:', err.message);
+  }
+}
+makeBackup();
+setInterval(makeBackup, 60 * 60 * 1000);
 
 // ---------------------------------------------------------------------------
 // Статика
@@ -216,147 +253,201 @@ const PLAYER_ACTIONS = {
   trade_respond: (p, a) => game.tradeRespond(p, a.trade, !!a.accept),
 };
 
-playerWss.on('connection', (ws) => {
+// Сколько жильцов заселили с каждого адреса за последний час
+const registrations = new Map(); // ip → [время, ...]
+function registrationAllowed(ip) {
+  if (!REGISTER_LIMIT) return true;
+  const now = Date.now();
+  const recent = (registrations.get(ip) || []).filter((t) => now - t < 60 * 60 * 1000);
+  registrations.set(ip, recent);
+  return recent.length < REGISTER_LIMIT;
+}
+
+playerWss.on('connection', (ws, req) => {
   ws.isAlive = true;
+  ws.ip = clientIp(req);
   ws.on('pong', () => (ws.isAlive = true));
   ws.on('message', (raw) => {
-    let msg;
     try {
-      msg = JSON.parse(raw);
-    } catch {
-      return;
-    }
-    if (!msg || typeof msg !== 'object') return;
-
-    if (msg.t === 'hello') {
-      const p = game.playerByToken(msg.token);
-      if (p) bind(ws, p);
-      else send(ws, { t: 'need_register' });
-      return;
-    }
-
-    if (msg.t === 'register') {
-      // «Новая жизнь» — отвязываемся от старого (мёртвого) персонажа
-      if (ws.playerId) unbind(ws);
-      const res = game.register(msg.name);
-      if (!res.ok) {
-        send(ws, { t: 'register_error', error: res.error });
-        return;
-      }
-      bind(ws, res.player);
-      return;
-    }
-
-    if (msg.t === 'pos') {
-      const p = ws.playerId ? game.getPlayer(ws.playerId) : null;
-      if (!p) return;
-      const now = Date.now();
-      if (now - (ws.lastPosAt || 0) < 30) return;
-      ws.lastPosAt = now;
-      if (!game.setPos(p, msg.x, msg.y, msg.d)) send(ws, { t: 'pos_fix', x: p.pos.x, y: p.pos.y, seq: p.posSeq });
-      return;
-    }
-
-    if (msg.t === 'act') {
-      const p = ws.playerId ? game.getPlayer(ws.playerId) : null;
-      if (!p) {
-        send(ws, { t: 'need_register' });
-        return;
-      }
-      const handler = PLAYER_ACTIONS[msg.action];
-      const args = msg.args && typeof msg.args === 'object' ? msg.args : {};
-      let res;
-      try {
-        res = handler ? handler(p, args) : { ok: false, error: 'Неизвестное действие' };
-      } catch (err) {
-        console.error('[action]', msg.action, err);
-        res = { ok: false, error: 'Что-то пошло не так.' };
-      }
-      send(ws, { t: 'res', id: msg.id, ...res });
-      pushView(p.id);
-      syncLocation(p.id);
+      handlePlayerMessage(ws, raw);
+    } catch (err) {
+      console.error('[player message]', err);
     }
   });
   ws.on('close', () => unbind(ws));
 });
 
+function handlePlayerMessage(ws, raw) {
+  let msg;
+  try {
+    msg = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  if (!msg || typeof msg !== 'object') return;
+
+  if (msg.t === 'hello') {
+    const p = game.playerByToken(msg.token);
+    if (p) bind(ws, p);
+    else send(ws, { t: 'need_register' });
+    return;
+  }
+
+  if (msg.t === 'register') {
+    if (!registrationAllowed(ws.ip)) {
+      send(ws, { t: 'register_error', error: `С одного адреса можно заселять не больше ${REGISTER_LIMIT} жильцов в час. Подождите.` });
+      return;
+    }
+    const res = game.register(msg.name);
+    if (!res.ok) {
+      send(ws, { t: 'register_error', error: res.error });
+      return;
+    }
+    // «Новая жизнь» — отвязываемся от старого (мёртвого) персонажа
+    if (ws.playerId) unbind(ws);
+    if (!registrations.has(ws.ip)) registrations.set(ws.ip, []);
+    registrations.get(ws.ip).push(Date.now());
+    bind(ws, res.player);
+    return;
+  }
+
+  if (msg.t === 'pos') {
+    const p = ws.playerId ? game.getPlayer(ws.playerId) : null;
+    if (!p) return;
+    const now = Date.now();
+    if (now - (ws.lastPosAt || 0) < 30) return;
+    ws.lastPosAt = now;
+    if (!game.setPos(p, msg.x, msg.y, msg.d)) send(ws, { t: 'pos_fix', x: p.pos.x, y: p.pos.y, seq: p.posSeq });
+    return;
+  }
+
+  if (msg.t === 'act') {
+    const p = ws.playerId ? game.getPlayer(ws.playerId) : null;
+    if (!p) {
+      send(ws, { t: 'need_register' });
+      return;
+    }
+    const handler = PLAYER_ACTIONS[msg.action];
+    const args = msg.args && typeof msg.args === 'object' ? msg.args : {};
+    let res;
+    try {
+      res = handler ? handler(p, args) : { ok: false, error: 'Неизвестное действие' };
+    } catch (err) {
+      console.error('[action]', msg.action, err);
+      res = { ok: false, error: 'Что-то пошло не так.' };
+    }
+    send(ws, { t: 'res', id: msg.id, ...res });
+    pushView(p.id);
+    syncLocation(p.id);
+  }
+}
+
 // ---- админы ----
 const failedLogins = new Map(); // ip → { count, until }
 
 adminWss.on('connection', (ws, req) => {
-  const ip = req.socket.remoteAddress;
+  const ip = clientIp(req);
   ws.isAlive = true;
   ws.on('pong', () => (ws.isAlive = true));
   ws.on('message', (raw) => {
-    let msg;
     try {
-      msg = JSON.parse(raw);
-    } catch {
-      return;
-    }
-    if (!msg || typeof msg !== 'object') return;
-
-    if (msg.t === 'auth') {
-      const lock = failedLogins.get(ip);
-      if (lock && lock.until > Date.now()) {
-        send(ws, { t: 'auth_error', error: 'Слишком много попыток. Подождите минуту.' });
-        return;
-      }
-      const given = Buffer.from(String(msg.password || ''));
-      const expected = Buffer.from(ADMIN_PASSWORD);
-      const ok = given.length === expected.length && crypto.timingSafeEqual(given, expected);
-      if (!ok) {
-        const count = (lock?.count || 0) + 1;
-        failedLogins.set(ip, { count, until: count >= 5 ? Date.now() + 60000 : 0 });
-        send(ws, { t: 'auth_error', error: 'Неверный пароль.' });
-        return;
-      }
-      failedLogins.delete(ip);
-      ws.isAdmin = true;
-      admins.add(ws);
-      send(ws, {
-        t: 'admin_init',
-        content: game.adminContent(),
-        log: game.state.log.slice(-200),
-        chat: game.state.chatGlobal.slice(-100),
-        snapshot: game.adminSnapshot(),
-      });
-      return;
-    }
-
-    if (!ws.isAdmin) {
-      send(ws, { t: 'auth_error', error: 'Нужен пароль.' });
-      return;
-    }
-
-    if (msg.t === 'cmd') {
-      const res = game.admin(String(msg.cmd), msg.args && typeof msg.args === 'object' ? msg.args : {});
-      send(ws, { t: 'res', id: msg.id, ...res });
-      send(ws, { t: 'snapshot', snapshot: game.adminSnapshot() });
-      for (const [id] of socketsByPlayer) syncLocation(id);
+      handleAdminMessage(ws, ip, raw);
+    } catch (err) {
+      console.error('[admin message]', err);
     }
   });
   ws.on('close', () => admins.delete(ws));
 });
 
+function handleAdminMessage(ws, ip, raw) {
+  let msg;
+  try {
+    msg = JSON.parse(raw);
+  } catch {
+    return;
+  }
+  if (!msg || typeof msg !== 'object') return;
+
+  if (msg.t === 'auth') {
+    const lock = failedLogins.get(ip);
+    if (lock && lock.until > Date.now()) {
+      send(ws, { t: 'auth_error', error: 'Слишком много попыток. Подождите минуту.' });
+      return;
+    }
+    const given = Buffer.from(String(msg.password || ''));
+    const expected = Buffer.from(ADMIN_PASSWORD);
+    const ok = given.length === expected.length && crypto.timingSafeEqual(given, expected);
+    if (!ok) {
+      const count = (lock?.count || 0) + 1;
+      failedLogins.set(ip, { count, until: count >= 5 ? Date.now() + 60000 : 0 });
+      send(ws, { t: 'auth_error', error: 'Неверный пароль.' });
+      return;
+    }
+    failedLogins.delete(ip);
+    ws.isAdmin = true;
+    admins.add(ws);
+    send(ws, {
+      t: 'admin_init',
+      content: game.adminContent(),
+      log: game.state.log.slice(-200),
+      chat: game.state.chatGlobal.slice(-100),
+      snapshot: game.adminSnapshot(),
+    });
+    return;
+  }
+
+  if (!ws.isAdmin) {
+    send(ws, { t: 'auth_error', error: 'Нужен пароль.' });
+    return;
+  }
+
+  if (msg.t === 'cmd') {
+    const res = game.admin(String(msg.cmd), msg.args && typeof msg.args === 'object' ? msg.args : {});
+    send(ws, { t: 'res', id: msg.id, ...res });
+    send(ws, { t: 'snapshot', snapshot: game.adminSnapshot() });
+    for (const [id] of socketsByPlayer) syncLocation(id);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Игровой цикл, сохранение, пинги
 // ---------------------------------------------------------------------------
 setInterval(() => {
-  game.tick();
+  try {
+    game.tick();
+  } catch (err) {
+    // Ошибка в одном тике не должна ронять весь дом
+    console.error('[tick]', err);
+  }
   for (const [id] of socketsByPlayer) {
-    pushView(id);
-    syncLocation(id);
+    try {
+      pushView(id);
+      syncLocation(id);
+    } catch (err) {
+      console.error('[view]', id, err);
+    }
   }
   if (admins.size) {
-    const snapshot = game.adminSnapshot();
-    for (const ws of admins) send(ws, { t: 'snapshot', snapshot });
+    try {
+      const snapshot = game.adminSnapshot();
+      for (const ws of admins) send(ws, { t: 'snapshot', snapshot });
+    } catch (err) {
+      console.error('[snapshot]', err);
+    }
   }
 }, BALANCE.tickMs);
 
 // Кто где стоит — рассылаем каждому жильцу состав его сцены (только если что-то изменилось).
 const lastActors = new Map(); // playerId → подпись последней отправки
 setInterval(() => {
+  try {
+    broadcastActors();
+  } catch (err) {
+    console.error('[actors]', err);
+  }
+}, 100);
+
+function broadcastActors() {
   const byScene = new Map();
   for (const [id] of socketsByPlayer) {
     const p = game.getPlayer(id);
@@ -374,7 +465,7 @@ setInterval(() => {
       sendToPlayer(id, { t: 'actors', key, actors });
     }
   }
-}, 100);
+}
 
 function persist() {
   try {

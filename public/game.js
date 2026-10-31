@@ -123,9 +123,8 @@
   function onMessage(msg) {
     switch (msg.t) {
       case 'need_register':
-        S.token = null;
-        store.set('gh_token', null);
-        showRegister();
+        // Токен не стираем: если мир восстановят из копии, жилец найдётся при следующем входе.
+        showRegister(S.token ? 'Жилец по вашему ордеру в домовой книге не найден: возможно, он давно погиб или мир начали заново. Можно заселиться снова.' : '');
         break;
       case 'register_error':
         $('#register-error').textContent = msg.error;
@@ -691,10 +690,12 @@
   // ---------------------------------------------------------------------------
   // Регистрация и смерть
   // ---------------------------------------------------------------------------
-  function showRegister() {
+  function showRegister(note = '') {
     $('#app').hidden = true;
     $('#death').hidden = true;
     $('#register').hidden = false;
+    $('#register-note').hidden = !note;
+    $('#register-note').textContent = note;
     setTimeout(() => $('#register-name').focus(), 50);
   }
 

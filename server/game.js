@@ -76,6 +76,7 @@ function freshState() {
     trades: {},
     log: [],
     chatGlobal: [],
+    archive: [], // погибшие давно: краткие записи домовой книги
   };
 }
 
@@ -387,7 +388,15 @@ class Game extends EventEmitter {
         if (!taken.has(number)) return { floor, number };
       }
     }
-    throw new Error('Дом переполнен');
+    return null; // дом переполнен
+  }
+
+  /** Имя занято живым жильцом или зарезервировано за домом/ЖЭК? */
+  nameTaken(name, exceptId = null) {
+    const low = name.toLocaleLowerCase('ru');
+    if (C.RESERVED_NAMES.some((r) => r.toLocaleLowerCase('ru') === low)) return 'Это имя занято домом. Выберите другое.';
+    if (this.alivePlayers().some((q) => q.id !== exceptId && q.name.toLocaleLowerCase('ru') === low)) return 'Жилец с таким именем уже есть.';
+    return null;
   }
 
   // =========================================================================
@@ -396,9 +405,12 @@ class Game extends EventEmitter {
   register(rawName) {
     const name = sanitizeName(rawName);
     if (!name) return { ok: false, error: 'Имя — от 2 до 20 букв или цифр.' };
+    const taken = this.nameTaken(name);
+    if (taken) return { ok: false, error: taken };
+    const apartment = this.allocateApartment();
+    if (!apartment) return { ok: false, error: 'Дом переполнен: свободных квартир нет.' };
     const id = newId('p');
     const token = crypto.randomBytes(24).toString('hex');
-    const apartment = this.allocateApartment();
     const now = this.now();
     const p = {
       id,
@@ -480,6 +492,19 @@ class Game extends EventEmitter {
     }
     for (const t of Object.values(this.state.trades)) {
       if (now - t.createdAt > 3 * 60000) delete this.state.trades[t.id];
+    }
+    if (this.world.tick % 60 === 0) this.archiveDead(now);
+  }
+
+  /** Давно погибших уносим из Пульта в архив домовой книги, чтобы снимок для админки не рос бесконечно. */
+  archiveDead(now = this.now()) {
+    const limit = C.ARCHIVE_DEAD_AFTER_H * 3600 * 1000;
+    for (const p of this.players()) {
+      if (p.alive || !p.diedAt || now - p.diedAt < limit) continue;
+      this.state.archive.push({ id: p.id, name: p.name, apartment: p.apartment.number, createdAt: p.createdAt, diedAt: p.diedAt, deathCause: p.deathCause, shifts: p.shifts || 0 });
+      if (this.state.archive.length > 5000) this.state.archive.splice(0, this.state.archive.length - 5000);
+      delete this.state.players[p.id];
+      this.byToken.delete(p.token);
     }
   }
 
@@ -590,8 +615,7 @@ class Game extends EventEmitter {
   }
 
   hallucinate(p) {
-    const others = this.alivePlayers().filter((q) => q.id !== p.id);
-    const fake = others.length ? others[Math.floor(this.random() * others.length)] : null;
+    const voice = C.HALLUCINATION_VOICES[Math.floor(this.random() * C.HALLUCINATION_VOICES.length)];
     const msg = {
       id: newId('m'),
       ts: this.now(),
@@ -599,7 +623,7 @@ class Game extends EventEmitter {
       key: this.locationKey(p),
       to: p.id, // видит только сам игрок
       hallucination: true,
-      from: { name: fake ? fake.name : 'Сосед', apt: fake ? fake.apartment.number : '???' },
+      from: { name: voice, apt: '???' },
       text: C.HALLUCINATIONS[Math.floor(this.random() * C.HALLUCINATIONS.length)],
     };
     this.emit('chat', msg);
@@ -1354,8 +1378,11 @@ const ADMIN_COMMANDS = {
     const p = this.requirePlayer(id, { alive: false });
     if (p.alive) throw new Error('Жилец и так жив');
     if (this.alivePlayers().some((q) => q.apartment.number === p.apartment.number)) {
-      p.apartment = this.allocateApartment();
+      const apt = this.allocateApartment();
+      if (!apt) throw new Error('Дом переполнен — некуда вернуть жильца');
+      p.apartment = apt;
     }
+    if (this.nameTaken(p.name, p.id) && !C.RESERVED_NAMES.includes(p.name)) p.name = `${p.name} (вернулся)`.slice(0, 20);
     p.alive = true;
     p.deathCause = null;
     p.diedAt = null;
@@ -1446,7 +1473,12 @@ const ADMIN_COMMANDS = {
   chat({ text, as }) {
     const msg = sanitizeText(text, 300);
     if (!msg) throw new Error('Пустое сообщение');
-    const m = { id: newId('m'), ts: this.now(), channel: 'global', from: { name: sanitizeText(as, 30) || 'ЖЭК', system: true }, text: msg };
+    const who = sanitizeText(as, 30) || 'ЖЭК';
+    // От имени живого жильца писать нельзя: иначе скриншотом можно подставить невиновного
+    if (this.alivePlayers().some((q) => q.name.toLocaleLowerCase('ru') === who.toLocaleLowerCase('ru'))) {
+      throw new Error('Нельзя писать от имени живого жильца.');
+    }
+    const m = { id: newId('m'), ts: this.now(), channel: 'global', from: { name: who, system: true }, text: msg };
     this.pushGlobal(m);
     this.emit('chat', m);
   },
@@ -1661,7 +1693,24 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       cutleryStolen: w.cutleryStolen,
     },
     online: this.onlineSet.size,
-    players: this.players().map((p) => ({
+    archived: this.state.archive.length,
+    players: this.players().map((p) => (!p.alive ? {
+      id: p.id,
+      name: p.name,
+      apartment: p.apartment,
+      alive: false,
+      deathCause: p.deathCause,
+      diedAt: p.diedAt,
+      online: this.isOnline(p.id),
+      stats: { health: 0, hunger: 0, energy: 0, sanity: 0 },
+      money: 0,
+      inventory: {},
+      location: { ...p.location, title: this.placeTitle(p) },
+      travel: null,
+      conditions: [],
+      shifts: p.shifts || 0,
+      lastSeen: p.lastSeen,
+    } : {
       id: p.id,
       name: p.name,
       apartment: p.apartment,
