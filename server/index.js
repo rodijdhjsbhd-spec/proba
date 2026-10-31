@@ -214,8 +214,8 @@ game.on('dirty', (ids) => {
   for (const id of ids) pushView(id);
 });
 
-game.on('notify', ({ to, title, text, style }) => {
-  for (const id of to) sendToPlayer(id, { t: 'notify', title, text, style });
+game.on('notify', ({ to, title, text, style, action }) => {
+  for (const id of to) sendToPlayer(id, { t: 'notify', title, text, style, action });
 });
 
 game.on('chat', (msg) => {
@@ -245,6 +245,8 @@ const PLAYER_ACTIONS = {
   knock: (p, a) => game.knock(p, a.apt),
   search: (p) => game.searchChute(p),
   board: (p) => game.readBoard(p),
+  open_door: (p, a) => game.openDoor(p, a.guest),
+  evict: (p, a) => game.evict(p, a.guest),
   note: (p, a) => game.slipNote(p, a.apt, a.text, !!a.anon),
   parcel: (p, a) => game.leaveParcel(p, a.apt, a.give, a.text),
   pin: (p, a) => game.pinNote(p, a.text),

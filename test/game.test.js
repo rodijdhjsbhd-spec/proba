@@ -655,3 +655,108 @@ test('листок на доске: один на жильца, видят со�
   game.expireBoardNotes();
   assert.equal(game.readBoard(a).pinned.length, 0, 'листок снят по сроку');
 });
+
+/** Жилец a у своей двери снаружи, хозяин b дома у гермодвери. */
+function knockScene() {
+  const w = makeWorld();
+  const { game } = w;
+  const guest = join(game, 'Иван');
+  const host = join(game, 'Мария');
+  game.admin('teleport', { id: guest.id, place: 'corridor', floor: 101 });
+  walkTo(game, guest, (o) => o.type === 'apt' && o.number === host.apartment.number);
+  walkTo(game, host, type('hermodoor'));
+  return { ...w, guest, host };
+}
+
+test('гости: постучал — хозяин впустил — оба за одной гермодверью', () => {
+  const { game, guest, host } = knockScene();
+  assert.equal(game.openDoor(host, guest.id).ok, false, 'никто не стучал');
+  const notes = [];
+  game.on('notify', (n) => notes.push(n));
+  game.knock(guest, host.apartment.number);
+  const knock = notes.find((n) => n.title === 'Стук в дверь');
+  assert.deepEqual(knock.action, { label: 'Открыть', act: 'open_door', args: { guest: guest.id } });
+  assert.equal(game.playerView(host).you.knocker.id, guest.id);
+  assert.equal(game.openDoor(host, guest.id).ok, true);
+  assert.equal(game.locationKey(guest), `home:${host.apartment.number}`);
+  assert.equal(game.locationKey(guest), game.locationKey(host));
+  assert.equal(game.playerView(guest).here.ownHome, false);
+  assert.equal(game.playerView(host).here.ownHome, true);
+  // гермодверь общая: задраил гость — защищены оба
+  walkTo(game, guest, type('hermodoor'));
+  assert.equal(game.seal(guest, true).ok, true);
+  assert.equal(game.playerView(host).you.sealed, true);
+  assert.equal(game.move(guest, { place: 'corridor' }).ok, false, 'задраено — не выйти');
+  game.seal(guest, false);
+  assert.equal(game.move(guest, { place: 'corridor' }).ok, true);
+  assert.equal(game.locationKey(guest), 'corridor:101');
+  const door = game.sceneOf(guest).objects.find((o) => o.type === 'apt' && o.number === host.apartment.number);
+  assert.ok(Math.hypot(guest.pos.x - door.spot.x, guest.pos.y - door.spot.y) < 0.01, 'вышел у двери хозяина');
+});
+
+test('гость пережидает туман за чужой задраенной дверью', () => {
+  const { game, advance, guest, host } = knockScene();
+  game.admin('fog', { from: 101, to: 101, warnSec: 10, durationMin: 3 });
+  game.knock(guest, host.apartment.number);
+  game.openDoor(host, guest.id);
+  game.seal(host, true);
+  advance(2 * 60000);
+  assert.equal(Math.round(guest.stats.health), 100);
+  assert.equal(Math.round(host.stats.health), 100);
+});
+
+test('выставили в туман — дом узнает, если гость погибнет', () => {
+  const { game, advance, guest, host } = knockScene();
+  game.knock(guest, host.apartment.number);
+  game.openDoor(host, guest.id);
+  game.admin('fog', { from: 101, to: 101, warnSec: 0, durationMin: 10, intensity: 3 });
+  const chat = [];
+  game.on('chat', (m) => chat.push(m.text));
+  assert.equal(game.evict(host, guest.id).ok, true);
+  assert.equal(game.locationKey(guest), 'corridor:101');
+  advance(3 * 60000);
+  assert.equal(guest.alive, false);
+  assert.ok(chat.some((t) => /выставили за дверь/.test(t)), chat.join(' | '));
+});
+
+test('не открыли в туман — тоже станет известно', () => {
+  const { game, advance, guest, host } = knockScene();
+  game.admin('fog', { from: 101, to: 101, warnSec: 0, durationMin: 10, intensity: 3 });
+  const chat = [];
+  game.on('chat', (m) => chat.push(m.text));
+  game.knock(guest, host.apartment.number);
+  advance(3 * 60000);
+  assert.equal(guest.alive, false);
+  assert.ok(chat.some((t) => /ему не открыли/.test(t)));
+});
+
+test('впустить может только хозяин изнутри, и только того, кто ещё у двери', () => {
+  const { game, guest, host } = knockScene();
+  game.knock(guest, host.apartment.number);
+  walkTo(game, host, type('bed'));
+  assert.equal(game.openDoor(host, guest.id).ok, false, 'надо подойти к двери');
+  walkTo(game, host, type('hermodoor'));
+  walkTo(game, guest, type('lift'));
+  assert.equal(game.openDoor(host, guest.id).ok, false, 'гость ушёл');
+});
+
+test('умер хозяин — гости выходят в коридор', () => {
+  const { game, guest, host } = knockScene();
+  game.knock(guest, host.apartment.number);
+  game.openDoor(host, guest.id);
+  game.kill(host, 'тест');
+  assert.equal(game.locationKey(guest), 'corridor:101');
+});
+
+test('старое сохранение: гермодверь жильца переезжает на квартиру', () => {
+  const { game } = makeWorld();
+  const p = join(game, 'Иван');
+  const old = JSON.parse(JSON.stringify(game.state));
+  const saved = old.players[p.id];
+  saved.sealed = true;
+  delete saved.location.apt;
+  const g2 = new (require('../server/game').Game)(old);
+  assert.equal(g2.doorSealed(p.apartment.number), true);
+  assert.equal(g2.getPlayer(p.id).sealed, undefined);
+  assert.equal(g2.locationKey(g2.getPlayer(p.id)), `home:${p.apartment.number}`);
+});

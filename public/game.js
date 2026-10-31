@@ -422,11 +422,13 @@
       case 'exit':
         return { label: 'Выход', actions: [{ label: 'Выйти в коридор', run: () => act('move', { place: 'corridor' }) }] };
       case 'hermodoor': {
-        if (you.sealed) return { label: 'Гермодверь', sub: 'задраена', actions: [{ label: 'Открыть гермодверь', run: () => act('seal', { on: false }) }] };
+        // постучали — хозяин может впустить
+        const letIn = v.here.ownHome && you.knocker ? [{ label: `Впустить: ${you.knocker.name}`, run: () => act('open_door', { guest: you.knocker.id }) }] : [];
+        if (you.sealed) return { label: 'Гермодверь', sub: 'задраена', actions: [...letIn, { label: 'Открыть гермодверь', run: () => act('seal', { on: false }) }] };
         const out = { label: 'Выйти в коридор', run: () => act('move', { place: 'corridor' }) };
         const seal = { label: 'Задраить гермодверь', run: () => act('seal', { on: true }) };
         const danger = v.world.fog && v.world.fog.affectsYou;
-        return { label: 'Гермодверь', sub: 'открыта', actions: danger ? [seal, out] : [out, seal] };
+        return { label: 'Гермодверь', sub: you.knocker && v.here.ownHome ? `стучит ${you.knocker.name}` : 'открыта', actions: [...letIn, ...(danger ? [seal, out] : [out, seal])] };
       }
       case 'bed':
         return you.sleeping
@@ -862,7 +864,7 @@
       $('#place-title').replaceChildren(v.here.title, ...(showFloor ? [h('span', { class: 'floor-tag', text: ` ${v.here.floor} этаж` })] : []));
       $('#place-text').textContent = v.here.text;
     });
-    memo('nearby', [v.here.people, v.trades], () => renderNearby(v));
+    memo('nearby', [v.here.people, v.trades, v.here.ownHome], () => renderNearby(v));
     memo('journal', you.journal.length && you.journal[you.journal.length - 1].ts, () => {
       $('#journal').replaceChildren(...you.journal.slice().reverse().map(journalItem));
     });
@@ -971,7 +973,9 @@
 
   function renderNearby(v) {
     const kids = [];
-    for (const p of v.here.place === 'home' ? [] : v.here.people) {
+    for (const p of v.here.people) {
+      // у себя дома хозяин может выставить гостя
+      const evict = v.here.ownHome ? h('button', { class: 'btn small danger', text: 'Выставить', onclick: () => act('evict', { guest: p.id }) }) : null;
       kids.push(
         h(
           'span',
@@ -979,6 +983,7 @@
           h('b', { text: p.name }),
           p.symptoms.length ? h('span', { class: 'symptom', text: p.symptoms.join(', ') }) : null,
           h('button', { class: 'btn small', text: 'Обмен', onclick: () => tradeWith(p) }),
+          evict,
         ),
       );
     }
@@ -1154,8 +1159,23 @@
   // ---------------------------------------------------------------------------
   // Уведомления и модальные окна
   // ---------------------------------------------------------------------------
-  function toast({ title, text, style = 'info' }) {
-    const el = h('div', { class: `toast ${style}` }, title ? h('b', { text: title }) : null, text);
+  function toast({ title, text, style = 'info', action = null }) {
+    const el = h(
+      'div',
+      { class: `toast ${style}` },
+      title ? h('b', { text: title }) : null,
+      text,
+      action
+        ? h('button', {
+            class: 'btn small primary toast-action',
+            text: action.label,
+            onclick: async () => {
+              const res = await act(action.act, action.args || {});
+              if (res.ok) el.remove();
+            },
+          })
+        : null,
+    );
     $('#toasts').append(el);
     setTimeout(() => el.remove(), style === 'error' ? 4000 : 6000);
     while ($('#toasts').children.length > 4) $('#toasts').firstChild.remove();

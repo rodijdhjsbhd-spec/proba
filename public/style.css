@@ -391,3 +391,4 @@ body.sanity-critical .place h1 { animation: flicker 2s infinite; }
 .pin-form textarea, .note-form textarea { width: 100%; resize: vertical; }
 .note-form { display: grid; gap: 8px; }
 .trade-grid.single { grid-template-columns: 1fr; }
+.toast .toast-action { display: block; margin-top: 6px; }

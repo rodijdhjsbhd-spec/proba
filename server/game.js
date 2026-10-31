@@ -87,6 +87,7 @@ function freshState() {
     log: [],
     chatGlobal: [],
     archive: [], // погибшие давно: краткие записи домовой книги
+    doors: {}, // кв. → { sealed } — гермодверь принадлежит квартире, а не жильцу (внутри бывают гости)
     doorDrops: {}, // кв. → записки и передачки, ждущие хозяина у гермодвери
     boardNotes: {}, // этаж → листки жильцов на доске объявлений
     noteFeed: [], // лента записок и листков для Пульта
@@ -109,6 +110,8 @@ class Game extends EventEmitter {
     this.byToken = new Map();
     this.map = World.create(WORLD_CONFIG);
     this.lastKnock = new Map();
+    this.knocks = new Map(); // хозяин → кто стучит { guestId, ts }
+    this.refusals = new Map(); // гость → кто не открыл ему в туман или выставил { apt, owner, ts, kind }
     for (const p of Object.values(this.state.players)) {
       this.byToken.set(p.token, p.id);
       const scene = this.sceneOf(p);
@@ -118,7 +121,7 @@ class Game extends EventEmitter {
       if (p.alive) {
         p.leftAt = p.leftAt || p.lastSeen || this.now();
         p.absence = p.absence || { knocks: [] };
-        if (!this.isHome(p) && !p.homeward) p.homeward = { since: this.now(), arriveAt: null };
+        if (!this.isOwnHome(p) && !p.homeward) p.homeward = { since: this.now(), arriveAt: null };
       }
     }
   }
@@ -135,6 +138,9 @@ class Game extends EventEmitter {
       p.journal = p.journal || [];
       p.gasmaskCharge = p.gasmaskCharge ?? 100;
       p.job = null; // незаконченные смены после перезапуска сервера сгорают
+      if (p.sealed && p.apartment) s.doors[p.apartment.number] = { sealed: true };
+      delete p.sealed;
+      if (p.location && p.location.place === 'home' && !p.location.apt && p.apartment) p.location.apt = p.apartment.number;
     }
     return s;
   }
@@ -197,7 +203,7 @@ class Game extends EventEmitter {
     p.leftAt = now;
     p.absence = { knocks: [], stats: Object.fromEntries(STAT_KEYS.map((k) => [k, Math.round(p.stats[k])])), money: p.money };
     if (p.job) p.job = null;
-    if (this.isHome(p)) {
+    if (this.isOwnHome(p)) {
       p.sleeping = !this.hasCondition(p, 'insomnia');
     } else {
       // Выход из игры не спасает: тело идёт домой с обычной скоростью, застрявший остаётся в лифте,
@@ -217,7 +223,7 @@ class Game extends EventEmitter {
       const exit = this.sceneOf(p).objects.find((o) => o.type === 'exit' || o.type === 'hermodoor');
       sec += walk(from, exit && exit.spot) + 1;
       const corridor = this.map.scene(`corridor:${here.floor}`);
-      const door = corridor.objects.find((o) => (here.place === 'home' ? o.type === 'apt' : o.type === 'facility'));
+      const door = corridor.objects.find((o) => (here.place === 'home' ? o.type === 'apt' && o.number === this.currentApt(p) : o.type === 'facility'));
       from = door ? door.spot : this.map.spawn(corridor.key);
     }
     const home = this.map.scene(`corridor:${p.apartment.floor}`);
@@ -254,7 +260,7 @@ class Game extends EventEmitter {
     if (now < h.arriveAt) return;
     const witnesses = this.othersAt(p);
     p.homeward = null;
-    this.relocate(p, { place: 'home', floor: p.apartment.floor }, 'bed');
+    this.relocate(p, { place: 'home', floor: p.apartment.floor, apt: p.apartment.number }, 'bed');
     p.sleeping = !this.hasCondition(p, 'insomnia');
     this.dirty(witnesses.map((q) => q.id));
   }
@@ -327,10 +333,10 @@ class Game extends EventEmitter {
   }
 
   /** Уведомление (всплывашка) + запись в личный журнал. */
-  notify(players, { title, text, style = 'info', journal = true }) {
+  notify(players, { title, text, style = 'info', journal = true, action = null }) {
     const list = players.filter(Boolean);
     for (const p of list) if (journal) this.journal(p, title ? `${title}. ${text}` : text, style);
-    this.emit('notify', { to: list.map((p) => p.id), title, text, style });
+    this.emit('notify', { to: list.map((p) => p.id), title, text, style, action });
     this.dirty(list.map((p) => p.id));
   }
 
@@ -399,16 +405,34 @@ class Game extends EventEmitter {
   }
 
   // ---- география ----
+  /** Номер квартиры, в которой жилец сейчас находится (своя или чужая), или null. */
+  currentApt(p) {
+    return p.location.place === 'home' ? p.location.apt || p.apartment.number : null;
+  }
+
+  doorSealed(apt) {
+    return !!(apt && this.state.doors[apt] && this.state.doors[apt].sealed);
+  }
+
+  setDoorSealed(apt, on) {
+    if (on) this.state.doors[apt] = { sealed: true };
+    else delete this.state.doors[apt];
+  }
+
+  ownerOf(apt) {
+    return this.alivePlayers().find((q) => q.apartment.number === apt) || null;
+  }
+
   locationKey(p) {
     const l = p.location;
-    if (l.place === 'home') return `home:${p.apartment.number}`;
+    if (l.place === 'home') return `home:${this.currentApt(p)}`;
     if (l.place === 'corridor') return `corridor:${l.floor}`;
     return l.place;
   }
 
   placeTitle(p) {
     const l = p.location;
-    if (l.place === 'home') return `Кв. ${p.apartment.number}`;
+    if (l.place === 'home') return `Кв. ${this.currentApt(p)}`;
     if (l.place === 'corridor') return `Коридор ${l.floor} этажа`;
     return C.PLACES[l.place]?.name || l.place;
   }
@@ -425,12 +449,13 @@ class Game extends EventEmitter {
   /** Перенести жильца в другое место (сцену) — он появится у нужного входа. */
   relocate(p, location, entry = 'default') {
     p.location = { place: location.place, floor: location.floor };
+    if (location.place === 'home') p.location.apt = location.apt || p.apartment.number;
     p.pos = { ...this.map.spawn(this.locationKey(p), entry), d: 'down' };
     p.posSeq = (p.posSeq || 0) + 1;
     p.posAt = this.now();
     p.moveBudget = 1;
     if (p.homeward) {
-      if (this.isHome(p)) p.homeward = null;
+      if (this.isOwnHome(p)) p.homeward = null;
       else p.homeward.arriveAt = null;
     }
   }
@@ -562,11 +587,10 @@ class Game extends EventEmitter {
       money: B.start.money,
       inventory: {},
       gasmaskCharge: 100,
-      location: { place: 'home', floor: apartment.floor },
+      location: { place: 'home', floor: apartment.floor, apt: apartment.number },
       pos: { ...this.map.spawn(`home:${apartment.number}`, 'default'), d: 'up' },
       posSeq: 1,
       travel: null,
-      sealed: false,
       sleeping: false,
       conditions: [],
       job: null,
@@ -679,7 +703,7 @@ class Game extends EventEmitter {
       }
     }
 
-    const fogged = this.inFog(floor) && !(atHome && p.sealed);
+    const fogged = this.inFog(floor) && !(atHome && this.doorSealed(this.currentApt(p)));
     if (fogged) {
       let factor = this.world.fog.intensity || 1;
       if (this.hasItem(p, 'gasmask')) {
@@ -808,13 +832,13 @@ class Game extends EventEmitter {
     if (place === 'corridor') {
       if (!['home', ...Object.keys(C.FACILITIES)].includes(here.place)) return fail('Отсюда в коридор не выйти.');
       if (!this.nearTo(p, (o) => o.type === 'exit' || o.type === 'hermodoor')) return fail('Подойдите к двери.');
-      if (here.place === 'home' && p.sealed) return fail('Гермодверь задраена. Сначала откройте её.');
+      if (here.place === 'home' && this.doorSealed(this.currentApt(p))) return fail('Гермодверь задраена. Сначала откройте её.');
       target = { place: 'corridor', floor: here.floor };
-      entry = here.place === 'home' ? `apt:${p.apartment.number}` : 'facility';
+      entry = here.place === 'home' ? `apt:${this.currentApt(p)}` : 'facility';
     } else if (place === 'home') {
       if (here.place !== 'corridor' || here.floor !== p.apartment.floor) return fail(`Ваша квартира — на ${p.apartment.floor} этаже.`);
       if (!this.nearTo(p, (o) => o.type === 'apt' && o.number === p.apartment.number)) return fail('Подойдите к своей двери.');
-      target = { place: 'home', floor: p.apartment.floor };
+      target = { place: 'home', floor: p.apartment.floor, apt: p.apartment.number };
       entry = 'default';
     } else {
       const fac = C.FACILITIES[place];
@@ -889,10 +913,12 @@ class Game extends EventEmitter {
   // =========================================================================
   seal(p, on) {
     if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
-    if (p.location.place !== 'home') return { ok: false, error: 'Гермодверь есть только у вас дома.' };
+    if (p.location.place !== 'home') return { ok: false, error: 'Гермодверь есть только в квартире.' };
     if (!this.nearTo(p, (o) => o.type === 'hermodoor')) return { ok: false, error: 'Подойдите к гермодвери.' };
-    p.sealed = !!on;
+    const apt = this.currentApt(p);
+    this.setDoorSealed(apt, !!on);
     this.journal(p, on ? 'Вы задраили гермодверь.' : 'Вы открыли гермодверь.');
+    this.dirty(this.othersAt(p).map((q) => q.id));
     return { ok: true };
   }
 
@@ -948,8 +974,20 @@ class Game extends EventEmitter {
     if (now - (this.lastKnock.get(p.id) || 0) < 3000) return { ok: false, error: 'Не так часто.' };
     this.lastKnock.set(p.id, now);
     const owner = this.alivePlayers().find((q) => q.apartment.number === door.number);
-    if (owner && this.isOnline(owner.id) && owner.location.place === 'home') {
-      this.notify([owner], { title: 'Стук в дверь', text: `В глазок видно: ${p.name} из кв. ${p.apartment.number}.`, style: 'knock', journal: false });
+    if (owner && this.isOnline(owner.id) && this.isOwnHome(owner)) {
+      const symptoms = p.conditions.map((c) => C.CONDITIONS[c.id]?.symptom).filter(Boolean);
+      this.knocks.set(owner.id, { guestId: p.id, ts: now });
+      // туман на этаже, а хозяин дома — если не откроет, это запомнится
+      if (this.world.fog && door && this.fogPhase() && p.location.floor >= this.world.fog.from && p.location.floor <= this.world.fog.to) {
+        this.refusals.set(p.id, { apt: door.number, owner: owner.name, ts: now, kind: 'ignored' });
+      }
+      this.notify([owner], {
+        title: 'Стук в дверь',
+        text: `В глазок видно: ${p.name} из кв. ${p.apartment.number}${symptoms.length ? ` — ${symptoms.join(', ')}` : ''}.`,
+        style: 'knock',
+        journal: false,
+        action: { label: 'Открыть', act: 'open_door', args: { guest: p.id } },
+      });
       return { ok: true, message: 'Вы постучали. За дверью кто-то шевелится.' };
     }
     if (owner && !this.isOnline(owner.id) && owner.absence) {
@@ -990,9 +1028,76 @@ class Game extends EventEmitter {
     return { ok: true, notes, pinned };
   }
 
+  /** Кто сейчас стучит к хозяину (если стучали недавно и гость всё ещё у двери). */
+  knockerFor(owner) {
+    const k = this.knocks.get(owner.id);
+    if (!k || this.now() - k.ts > 60000) return null;
+    const guest = this.getPlayer(k.guestId);
+    if (!guest || !guest.alive || !this.isOnline(guest.id)) return null;
+    if (this.locationKey(guest) !== `corridor:${owner.apartment.floor}`) return null;
+    const door = this.map.scene(`corridor:${owner.apartment.floor}`).objects.find((o) => o.type === 'apt' && o.number === owner.apartment.number);
+    if (!door || !World.nearObject(door, guest.pos, World.REACH + 0.5)) return null;
+    return guest;
+  }
+
+  /** Хозяин открывает дверь тому, кто постучал. */
+  openDoor(owner, guestId) {
+    if (!owner.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (!this.isOwnHome(owner)) return { ok: false, error: 'Открыть можно только свою дверь — изнутри.' };
+    if (!this.nearTo(owner, (o) => o.type === 'hermodoor')) return { ok: false, error: 'Подойдите к гермодвери.' };
+    const guest = this.knockerFor(owner);
+    if (!guest || guest.id !== guestId) return { ok: false, error: 'За дверью уже никого.' };
+    this.knocks.delete(owner.id);
+    this.refusals.delete(guest.id);
+    const witnesses = this.othersAt(guest);
+    guest.sleeping = false;
+    this.relocate(guest, { place: 'home', floor: owner.apartment.floor, apt: owner.apartment.number });
+    // хозяин стоит у двери — гость проходит на шаг вглубь, чтобы не стоять друг в друге
+    for (const [dx, dy] of [[0, -1], [1, -1], [-1, -1], [1, 0], [-1, 0]]) {
+      const x = guest.pos.x + dx, y = guest.pos.y + dy;
+      if (World.canStand(this.sceneOf(guest), x, y) && Math.hypot(x - owner.pos.x, y - owner.pos.y) > 0.7) {
+        guest.pos = { x, y, d: 'up' };
+        break;
+      }
+    }
+    this.notify([guest], { title: 'Вас впустили', text: `${owner.name} открыл дверь кв. ${owner.apartment.number}. Вы в гостях.`, style: 'good' });
+    this.journal(owner, `Вы впустили ${guest.name} (кв. ${guest.apartment.number}).`, 'good');
+    this.log(`${owner.name} впустил к себе ${guest.name}${this.inFog(owner.apartment.floor) || (this.world.fog && this.fogPhase() === 'warning') ? ' — в туман' : ''}`, 'social', owner.id);
+    this.dirty([owner.id, ...witnesses.map((q) => q.id)]);
+    return { ok: true, message: `${guest.name} у вас в гостях.` };
+  }
+
+  /** Хозяин выставляет гостя за дверь. */
+  evict(owner, guestId) {
+    if (!owner.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (!this.isOwnHome(owner)) return { ok: false, error: 'Выставить можно только из своей квартиры.' };
+    const guest = this.getPlayer(guestId);
+    if (!guest || !guest.alive || guest.id === owner.id || this.locationKey(guest) !== this.locationKey(owner)) return { ok: false, error: 'Этого жильца у вас нет.' };
+    const fog = this.inFog(owner.apartment.floor);
+    this.relocate(guest, { place: 'corridor', floor: owner.apartment.floor }, `apt:${owner.apartment.number}`);
+    guest.sleeping = false;
+    if (fog) this.refusals.set(guest.id, { apt: owner.apartment.number, owner: owner.name, ts: this.now(), kind: 'evicted' });
+    this.notify([guest], { title: 'Вас выставили', text: `${owner.name} выставил вас за дверь кв. ${owner.apartment.number}.${fog ? ' В коридоре туман.' : ''}`, style: fog ? 'danger' : 'warn' });
+    this.journal(owner, `Вы выставили ${guest.name} за дверь.`, 'warn');
+    this.log(`${owner.name} выставил ${guest.name} за дверь${fog ? ' — в туман' : ''}`, 'social', owner.id);
+    this.dirty([owner.id, guest.id, ...this.othersAt(guest).map((q) => q.id)]);
+    return { ok: true };
+  }
+
+  /** Гостей хозяина, который умер или пропал, выводим в коридор. */
+  evictAllGuests(apt, floor) {
+    for (const q of this.alivePlayers()) {
+      if (q.location.place === 'home' && this.currentApt(q) === apt && q.apartment.number !== apt) {
+        this.relocate(q, { place: 'corridor', floor }, `apt:${apt}`);
+        this.journal(q, `Хозяина кв. ${apt} больше нет. Вы вышли в коридор.`, 'warn');
+        this.dirty([q.id]);
+      }
+    }
+  }
+
   /** Жилец у себя в квартире (а не в гостях). */
   isOwnHome(p) {
-    return p.location.place === 'home' && this.locationKey(p) === `home:${p.apartment.number}`;
+    return p.location.place === 'home' && this.currentApt(p) === p.apartment.number;
   }
 
   /** Лента для Пульта: записки и листки видны ЖЭК, в том числе авторы анонимок. */
@@ -1365,6 +1470,17 @@ class Game extends EventEmitter {
     this.emit('notify', { to: [p.id], title: 'Вы погибли', text: cause, style: 'death' });
     this.log(`☠ ${p.name} (кв. ${p.apartment.number}): ${cause}`, 'death', p.id);
     this.systemChat(`Квартира ${p.apartment.number} опечатана. Жилец ${p.name} больше не выйдет на смену.`);
+    const refusal = this.refusals.get(p.id);
+    if (refusal && cause === 'Погиб в тумане' && this.now() - refusal.ts < 5 * 60000) {
+      this.systemChat(
+        refusal.kind === 'evicted'
+          ? `${p.name} погиб в тумане. Незадолго до этого его выставили за дверь кв. ${refusal.apt}.`
+          : `${p.name} погиб в тумане. Он стучал в кв. ${refusal.apt}, но ему не открыли.`,
+      );
+      this.log(`${p.name} погиб в тумане после того, как ${refusal.kind === 'evicted' ? 'его выставил' : 'ему не открыл'} ${refusal.owner}`, 'social', p.id);
+    }
+    this.refusals.delete(p.id);
+    this.evictAllGuests(p.apartment.number, p.apartment.floor);
     this.dirty([p.id, ...this.othersAt(p).map((q) => q.id)]);
   }
 
@@ -1676,7 +1792,7 @@ const ADMIN_COMMANDS = {
     p.conditions = [];
     p.stats = { health: 50, hunger: 50, energy: 50, sanity: 40 };
     p.travel = null;
-    this.relocate(p, { place: 'home', floor: p.apartment.floor }, 'bed');
+    this.relocate(p, { place: 'home', floor: p.apartment.floor, apt: p.apartment.number }, 'bed');
     this.notify([p], { title: 'Вы очнулись', text: `Вы лежите у себя в кв. ${p.apartment.number}. Вы не помните, как здесь оказались.`, style: 'whisper' });
     this.log(`${p.name} воскрешён`, 'admin', p.id);
     this.systemChat(`Жилец ${p.name} снова замечен в коридорах. Не задавайте ему вопросов.`);
@@ -1690,9 +1806,8 @@ const ADMIN_COMMANDS = {
     else if (place !== 'corridor') f = C.FACILITIES[place].floor;
     p.travel = null;
     p.job = null;
-    p.sealed = false;
     p.sleeping = false;
-    this.relocate(p, { place, floor: f });
+    this.relocate(p, { place, floor: f, apt: p.apartment.number });
     this.notify([p], { title: 'Провал в памяти', text: `Вы моргнули — и оказались здесь: ${this.placeTitle(p)}.`, style: 'whisper' });
     this.log(`${p.name} перемещён: ${this.placeTitle(p)}`, 'admin', p.id);
   },
@@ -1844,8 +1959,12 @@ Game.prototype.playerView = function playerView(p) {
         }
       : null,
     searchInSec: Math.max(0, Math.ceil(((p.searchedAt || 0) + SEARCH_COOLDOWN_MS - now) / 1000)),
-    sealed: p.sealed,
+    sealed: this.doorSealed(this.currentApt(p) || p.apartment.number),
     sleeping: p.sleeping,
+    knocker: (() => {
+      const g = this.knockerFor(p);
+      return g ? { id: g.id, name: g.name, apt: g.apartment.number } : null;
+    })(),
     conditions: p.conditions.map((c) => ({
       id: c.id,
       name: C.CONDITIONS[c.id]?.name || c.id,
@@ -1918,9 +2037,20 @@ Game.prototype.describePlace = function describePlace(p) {
   const here = { key: this.locationKey(p), place: l.place, floor: l.floor, title: this.placeTitle(p), text: '', people, shop: null, residents: null, closed: null };
 
   switch (l.place) {
-    case 'home':
-      here.text = `Ваша квартира. Голые бетонные стены, продавленная кровать, радиоточка бормочет о перевыполнении плана. Гермодверь ${p.sealed ? 'задраена' : 'открыта'}.${p.sleeping ? ' Вы спите.' : ''}`;
+    case 'home': {
+      const apt = this.currentApt(p);
+      const door = `Гермодверь ${this.doorSealed(apt) ? 'задраена' : 'открыта'}.`;
+      here.ownHome = apt === p.apartment.number;
+      if (here.ownHome) {
+        here.text = `Ваша квартира. Голые бетонные стены, продавленная кровать, радиоточка бормочет о перевыполнении плана. ${door}${p.sleeping ? ' Вы спите.' : ''}`;
+      } else {
+        const owner = this.ownerOf(apt);
+        here.host = owner ? { id: owner.id, name: owner.name } : null;
+        here.title = `Кв. ${apt} · в гостях`;
+        here.text = `Чужая квартира${owner ? ` — здесь живёт ${owner.name}` : ''}. Вы в гостях. ${door}`;
+      }
       break;
+    }
     case 'corridor': {
       const kind = this.map.floorKind(l.floor);
       if (dark) here.text = `Коридор ${l.floor} этажа. Темно, хоть глаз выколи. Где-то капает.`;
@@ -2022,7 +2152,8 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       inventory: p.inventory,
       location: { ...p.location, title: this.placeTitle(p) },
       travel: p.travel ? { via: p.travel.via, toFloor: p.travel.toFloor, stuck: !!p.travel.stuck } : null,
-      sealed: p.sealed,
+      sealed: this.doorSealed(p.apartment.number),
+      guestAt: p.location.place === 'home' && this.currentApt(p) !== p.apartment.number ? this.currentApt(p) : null,
       sleeping: p.sleeping,
       homeward: !!p.homeward,
       working: !!p.job,
