@@ -1,0 +1,93 @@
+/* Пульт ЖЭК — дополнительные стили поверх style.css */
+body.admin { font-size: 14px; }
+
+.status-strip { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: #141615; min-height: 48px; align-items: center; }
+.status-strip .calm { color: var(--muted); font-style: italic; }
+.chip { display: inline-flex; gap: 8px; align-items: center; padding: 4px 6px 4px 10px; border-radius: 14px; border: 1px solid var(--line); background: var(--panel); font-size: 13px; }
+.chip.fog { border-color: #6d7a75; }
+.chip.warn { border-color: var(--amber-dim); }
+.chip.danger { border-color: var(--red); }
+.chip .t { font-family: var(--mono); color: var(--muted); }
+
+.admin-tabs { display: flex; gap: 4px; padding: 10px 16px 0; flex-wrap: wrap; }
+.admin-tabs .tab { padding: 6px 14px; }
+.admin-main { padding: 12px 16px 40px; max-width: 1600px; margin: 0 auto; }
+
+.players-layout { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 14px; align-items: start; }
+.players-tools { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+.players-tools input:not([type]) { flex: 1; min-width: 180px; }
+.check { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); font-size: 13px; cursor: pointer; }
+.table-wrap { overflow-x: auto; }
+table.players { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.players th.num { text-align: right; }
+table.players th { text-align: left; color: var(--muted); font-weight: 400; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+table.players td { padding: 6px 8px; border-bottom: 1px solid #2c3130; white-space: nowrap; }
+table.players td.num { font-family: var(--mono); text-align: right; }
+table.players td.low { color: var(--red); font-weight: 700; }
+table.players td.conds { white-space: normal; color: #ffb3ab; font-size: 12px; }
+table.players tbody tr { cursor: pointer; }
+table.players tbody tr:hover { background: #2b302e; }
+table.players tbody tr.selected { background: #3a3220; }
+table.players tbody tr.dead { opacity: .45; text-decoration: line-through; }
+
+.player-card { position: sticky; top: 70px; max-height: calc(100vh - 90px); overflow-y: auto; }
+.player-card h2 { color: var(--amber); font-size: 22px; text-transform: none; margin-bottom: 2px; }
+.card-meta { color: var(--muted); font-size: 13px; margin-bottom: 10px; }
+.card-section { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
+.card-section h3 { font-size: 12px; text-transform: uppercase; color: var(--muted); margin-bottom: 8px; letter-spacing: .05em; }
+.row { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-bottom: 6px; }
+.row > select, .row > input:not([type="checkbox"]) { flex: 1; min-width: 80px; }
+.row > input[type="number"] { flex: 0 0 76px; min-width: 0; }
+.stat-inputs { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-bottom: 6px; }
+.stat-inputs label { display: grid; gap: 2px; font-size: 11px; color: var(--muted); }
+.stat-inputs input { padding: 4px 6px; width: 100%; }
+.tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.tag { font-size: 12px; padding: 2px 8px; border-radius: 10px; background: var(--panel-2); border: 1px solid var(--line); display: inline-flex; gap: 6px; align-items: center; }
+.tag button { background: none; border: 0; color: var(--muted); cursor: pointer; padding: 0; }
+.tag button:hover { color: var(--red); }
+textarea { width: 100%; resize: vertical; min-height: 60px; }
+
+.event-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; align-items: start; }
+.event-card h2 { color: var(--text); font-size: 16px; text-transform: none; margin-bottom: 4px; }
+.event-card .hint { color: var(--muted); font-size: 12px; margin: 0 0 10px; }
+.event-card label.f { display: grid; gap: 3px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+.event-card .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.event-card .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.event-card .grid5 { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
+.event-card .grid5 input { padding: 4px 6px; }
+.event-card .actions { margin: 10px 0 0; }
+.event-card.fog-card { border-top: 3px solid #8a9690; }
+.event-card.danger-card { border-top: 3px solid var(--red); }
+.event-card.good-card { border-top: 3px solid var(--green); }
+.event-card.warn-card { border-top: 3px solid var(--amber); }
+.event-card.whisper-card { border-top: 3px solid var(--violet); }
+.target { display: grid; gap: 6px; margin-bottom: 8px; padding: 8px; background: #1c1f1e; border-radius: var(--radius); }
+.target .target-title { font-size: 12px; color: var(--muted); }
+.bd-row { display: grid; grid-template-columns: 90px 1fr auto; gap: 6px; align-items: center; margin-bottom: 6px; }
+.bd-row .state.broken { color: var(--red); }
+
+.admin-log { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: calc(100vh - 230px); overflow-y: auto; font-size: 13px; }
+.admin-log li { padding: 4px 8px; border-left: 3px solid var(--line); }
+.admin-log .clock-s { font-family: var(--mono); color: var(--muted); font-size: 11px; margin-right: 8px; }
+.admin-log .death { border-color: var(--red); color: #ffb3ab; }
+.admin-log .event { border-color: var(--amber); }
+.admin-log .accident { border-color: #ff8a5c; }
+.admin-log .disease { border-color: var(--violet); }
+.admin-log .trade { border-color: var(--green); }
+.admin-log .join { border-color: var(--blue); }
+.admin-log .admin { border-color: #666; color: var(--muted); }
+
+.radio-layout { max-width: 900px; }
+.chat-log.tall { height: calc(100vh - 300px); min-height: 300px; }
+.chat-log .where { color: var(--muted); font-family: var(--mono); font-size: 11px; margin-right: 6px; }
+.chat-log .ghost-tag { color: var(--violet); font-size: 11px; }
+.chat-form .as { flex: 0 0 110px; }
+
+@media (max-width: 1100px) {
+  .players-layout { grid-template-columns: 1fr; }
+  .player-card { position: static; max-height: none; }
+}
+@media (max-width: 600px) {
+  .stat-inputs, .event-card .grid5 { grid-template-columns: repeat(3, 1fr); }
+  .event-grid { grid-template-columns: 1fr; }
+}

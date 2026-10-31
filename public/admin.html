@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Пульт ЖЭК</title>
+  <meta name="description" content="Админ-панель Гигахрущёвки: симулятор бога">
+  <meta name="robots" content="noindex">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=PT+Mono&family=PT+Sans:wght@400;700&family=PT+Sans+Narrow:wght@700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="admin.css">
+</head>
+<body class="admin">
+  <section id="login" class="screen">
+    <div class="screen-card">
+      <div class="stamp red">СЕКРЕТНО</div>
+      <h1 class="logo">ПУЛЬТ ЖЭК</h1>
+      <p class="sub">Доступ только для ответственных лиц.</p>
+      <form id="login-form" autocomplete="off">
+        <label for="password">Пароль</label>
+        <input id="password" type="password" required autocomplete="current-password">
+        <button class="btn primary" type="submit">Войти</button>
+        <p id="login-error" class="error" role="alert"></p>
+      </form>
+    </div>
+  </section>
+
+  <div id="app" hidden>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-title">ПУЛЬТ ЖЭК</span>
+        <span class="brand-sub">симулятор бога</span>
+      </div>
+      <div class="clock" id="clock">—</div>
+      <div class="online" id="counts"></div>
+      <div class="top-tools">
+        <button class="btn" id="pause-btn">Пауза мира</button>
+      </div>
+    </header>
+
+    <div class="status-strip" id="status"></div>
+
+    <nav class="admin-tabs" role="tablist">
+      <button class="tab active" data-tab="players">Жильцы</button>
+      <button class="tab" data-tab="events">События дома</button>
+      <button class="tab" data-tab="log">Журнал</button>
+      <button class="tab" data-tab="radio">Чаты</button>
+    </nav>
+
+    <main class="admin-main">
+      <section class="tab-page" id="tab-players">
+        <div class="players-layout">
+          <div class="panel">
+            <div class="players-tools">
+              <input id="player-filter" placeholder="Поиск по имени или квартире">
+              <label class="check"><input type="checkbox" id="show-dead"> показывать мёртвых</label>
+            </div>
+            <div class="table-wrap">
+              <table class="players">
+                <thead>
+                  <tr>
+                    <th>Жилец</th><th class="num">Кв.</th><th>Где</th>
+                    <th class="num" title="Здоровье">❤</th><th class="num" title="Сытость">🍞</th><th class="num" title="Силы">⚡</th><th class="num" title="Рассудок">🧠</th>
+                    <th class="num" title="Талоны">₸</th><th>Состояния</th>
+                  </tr>
+                </thead>
+                <tbody id="players-body"></tbody>
+              </table>
+              <p class="empty" id="players-empty">В доме пока никто не живёт. Откройте игру в соседней вкладке и заселитесь.</p>
+            </div>
+          </div>
+          <aside class="panel player-card" id="player-card">
+            <p class="empty">Выберите жильца в таблице, чтобы решить его судьбу.</p>
+          </aside>
+        </div>
+      </section>
+
+      <section class="tab-page" id="tab-events" hidden>
+        <div class="event-grid" id="event-grid"></div>
+      </section>
+
+      <section class="tab-page" id="tab-log" hidden>
+        <div class="panel">
+          <div class="players-tools">
+            <select id="log-filter" aria-label="Фильтр журнала">
+              <option value="">Все записи</option>
+              <option value="event">События</option>
+              <option value="death">Смерти</option>
+              <option value="accident">Несчастные случаи</option>
+              <option value="disease">Болезни</option>
+              <option value="trade">Обмены</option>
+              <option value="join">Заселения</option>
+              <option value="admin">Действия админа</option>
+            </select>
+          </div>
+          <ul class="admin-log" id="log"></ul>
+        </div>
+      </section>
+
+      <section class="tab-page" id="tab-radio" hidden>
+        <div class="radio-layout">
+          <div class="panel">
+            <h2>Все разговоры в доме</h2>
+            <ul class="chat-log tall" id="admin-chat"></ul>
+            <form id="admin-chat-form" class="chat-form" autocomplete="off">
+              <input id="admin-chat-as" class="as" value="ЖЭК" maxlength="30" aria-label="От чьего имени">
+              <input id="admin-chat-text" maxlength="300" placeholder="Сказать в радиоточку (весь дом)">
+              <button class="btn" type="submit">⏎</button>
+            </form>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <div id="conn" class="conn" hidden>Нет связи с сервером. Переподключение…</div>
+
+  <script src="admin.js"></script>
+</body>
+</html>

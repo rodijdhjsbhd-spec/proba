@@ -1,0 +1,1524 @@
+'use strict';
+
+/**
+ * Игровой мир гигахрущёвки. Ничего не знает о сети: index.js подписывается
+ * на события (emit) и рассылает их по WebSocket.
+ *
+ * События, которые испускает Game:
+ *   'notify'  { to: [playerId...], title, text, style }  — всплывающее уведомление
+ *   'chat'    msg                                         — сообщение чата
+ *   'log'     entry                                       — запись в журнал админки
+ *   'dirty'   [playerId...]                               — этим игрокам надо обновить экран
+ */
+
+const { EventEmitter } = require('events');
+const crypto = require('crypto');
+const C = require('./content');
+const MG = require('./minigames');
+
+const B = C.BALANCE;
+const STAT_KEYS = ['health', 'hunger', 'energy', 'sanity'];
+const STAT_NAMES = { health: 'Здоровье', hunger: 'Сытость', energy: 'Силы', sanity: 'Рассудок' };
+const MOVE_PLACES = ['home', 'corridor', 'canteen', 'medpost', 'factory'];
+
+const clamp = (v, lo = 0, hi = 100) => Math.max(lo, Math.min(hi, v));
+const toInt = (v, def = 0) => {
+  const n = Math.trunc(Number(v));
+  return Number.isFinite(n) ? n : def;
+};
+const newId = (prefix) => `${prefix}_${crypto.randomBytes(5).toString('hex')}`;
+
+function sanitizeText(raw, max) {
+  return String(raw ?? '')
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, max);
+}
+
+function sanitizeName(raw) {
+  const name = sanitizeText(raw, 40).replace(/[^\p{L}\p{N} _.\-]/gu, '').trim().slice(0, 20);
+  return name.length >= 2 ? name : null;
+}
+
+function plural(n, one, few, many) {
+  const a = Math.abs(n) % 100;
+  const b = a % 10;
+  if (a > 10 && a < 20) return many;
+  if (b > 1 && b < 5) return few;
+  if (b === 1) return one;
+  return many;
+}
+const talons = (n) => `${n} ${plural(n, 'талон', 'талона', 'талонов')}`;
+
+function freshState() {
+  return {
+    version: 1,
+    world: {
+      tick: 0,
+      gameMinutes: 8 * 60, // День 1, 08:00
+      paused: false,
+      breakdowns: { lift: null, canteen: null, medpost: null, factory: null },
+      power: null, // { from, to, until }
+      fog: null, // { from, to, warnUntil, until, intensity, arrived }
+      cutleryStolen: false,
+    },
+    players: {},
+    trades: {},
+    log: [],
+    chatGlobal: [],
+  };
+}
+
+class Game extends EventEmitter {
+  /**
+   * @param {object|null} state сохранённое состояние (или null для нового мира)
+   * @param {object} opts { now: () => ms, random: () => 0..1 } — для тестов
+   */
+  constructor(state, opts = {}) {
+    super();
+    this.now = opts.now || (() => Date.now());
+    this.random = opts.random || Math.random;
+    this.state = Game.normalize(state);
+    this.onlineSet = new Set();
+    this.lastChatAt = new Map();
+    this.localChat = new Map(); // key → последние сообщения (только в памяти)
+    this.byToken = new Map();
+    for (const p of Object.values(this.state.players)) this.byToken.set(p.token, p.id);
+  }
+
+  static normalize(state) {
+    const fresh = freshState();
+    if (!state || typeof state !== 'object') return fresh;
+    const s = { ...fresh, ...state };
+    s.world = { ...fresh.world, ...(state.world || {}) };
+    s.world.breakdowns = { ...fresh.world.breakdowns, ...((state.world || {}).breakdowns || {}) };
+    for (const p of Object.values(s.players || {})) {
+      p.inventory = p.inventory || {};
+      p.conditions = p.conditions || [];
+      p.journal = p.journal || [];
+      p.gasmaskCharge = p.gasmaskCharge ?? 100;
+      p.job = null; // незаконченные смены после перезапуска сервера сгорают
+    }
+    return s;
+  }
+
+  // =========================================================================
+  // Вспомогательное
+  // =========================================================================
+  get world() {
+    return this.state.world;
+  }
+
+  players() {
+    return Object.values(this.state.players);
+  }
+
+  alivePlayers() {
+    return this.players().filter((p) => p.alive);
+  }
+
+  getPlayer(id) {
+    return this.state.players[id] || null;
+  }
+
+  playerByToken(token) {
+    const id = this.byToken.get(String(token || ''));
+    return id ? this.getPlayer(id) : null;
+  }
+
+  isOnline(id) {
+    return this.onlineSet.has(id);
+  }
+
+  setOnline(id, online) {
+    const p = this.getPlayer(id);
+    if (!p) return;
+    if (online) {
+      this.onlineSet.add(id);
+      p.lastSeen = this.now();
+      return;
+    }
+    this.onlineSet.delete(id);
+    p.lastSeen = this.now();
+    // Ушедший из игры жилец «засыпает» у себя дома.
+    if (p.alive) {
+      if (p.job) p.job = null;
+      if (p.location.place !== 'home') {
+        p.travel = null;
+        p.location = { place: 'home', floor: p.apartment.floor };
+        p.sealed = false;
+      }
+      p.sleeping = !this.hasCondition(p, 'insomnia');
+    }
+    this.dirty(this.othersAt(p).map((q) => q.id));
+  }
+
+  gameClock() {
+    const m = Math.floor(this.world.gameMinutes);
+    const day = Math.floor(m / 1440) + 1;
+    const hh = String(Math.floor((m % 1440) / 60)).padStart(2, '0');
+    const mm = String(m % 60).padStart(2, '0');
+    return { day, time: `${hh}:${mm}`, hour: Math.floor((m % 1440) / 60), label: `День ${day}, ${hh}:${mm}` };
+  }
+
+  dirty(ids) {
+    if (ids && ids.length) this.emit('dirty', ids);
+  }
+
+  log(text, kind = 'info', playerId = null) {
+    const entry = { ts: this.now(), clock: this.gameClock().label, text, kind, playerId };
+    this.state.log.push(entry);
+    if (this.state.log.length > 500) this.state.log.splice(0, this.state.log.length - 500);
+    this.emit('log', entry);
+  }
+
+  journal(p, text, kind = 'info') {
+    p.journal.push({ ts: this.now(), clock: this.gameClock().label, text, kind });
+    if (p.journal.length > 40) p.journal.splice(0, p.journal.length - 40);
+  }
+
+  /** Уведомление (всплывашка) + запись в личный журнал. */
+  notify(players, { title, text, style = 'info', journal = true }) {
+    const list = players.filter(Boolean);
+    for (const p of list) if (journal) this.journal(p, title ? `${title}. ${text}` : text, style);
+    this.emit('notify', { to: list.map((p) => p.id), title, text, style });
+    this.dirty(list.map((p) => p.id));
+  }
+
+  systemChat(text) {
+    const msg = { id: newId('m'), ts: this.now(), channel: 'global', from: { name: 'Радиоточка', system: true }, text };
+    this.pushGlobal(msg);
+    this.emit('chat', msg);
+  }
+
+  pushGlobal(msg) {
+    this.state.chatGlobal.push(msg);
+    if (this.state.chatGlobal.length > 100) this.state.chatGlobal.splice(0, this.state.chatGlobal.length - 100);
+  }
+
+  // ---- инвентарь ----
+  hasItem(p, id, n = 1) {
+    return (p.inventory[id] || 0) >= n;
+  }
+
+  addItem(p, id, n = 1) {
+    if (!C.ITEMS[id] || n <= 0) return;
+    p.inventory[id] = (p.inventory[id] || 0) + n;
+  }
+
+  removeItem(p, id, n = 1) {
+    const have = p.inventory[id] || 0;
+    const removed = Math.min(have, n);
+    if (have - removed <= 0) delete p.inventory[id];
+    else p.inventory[id] = have - removed;
+    return removed;
+  }
+
+  // ---- состояния ----
+  hasCondition(p, id) {
+    return p.conditions.some((c) => c.id === id);
+  }
+
+  hasBlock(p, what) {
+    return p.conditions.some((c) => (C.CONDITIONS[c.id]?.blocks || []).includes(what));
+  }
+
+  addCondition(p, id, { silent = false } = {}) {
+    const def = C.CONDITIONS[id];
+    if (!def || !p.alive) return false;
+    const now = this.now();
+    const until = def.durationMin ? now + def.durationMin * 60000 : null;
+    const existing = p.conditions.find((c) => c.id === id);
+    if (existing) {
+      existing.until = until; // повторное заражение продлевает
+    } else {
+      p.conditions.push({ id, since: now, until });
+    }
+    if (id === 'insomnia') p.sleeping = false;
+    if (!silent) this.journal(p, `Вам нехорошо: ${def.name}.`, 'danger');
+    return true;
+  }
+
+  cureCondition(p, id) {
+    const before = p.conditions.length;
+    p.conditions = id === 'all' ? [] : p.conditions.filter((c) => c.id !== id);
+    return before !== p.conditions.length;
+  }
+
+  applyStats(p, deltas) {
+    for (const k of STAT_KEYS) if (deltas[k]) p.stats[k] = clamp(p.stats[k] + deltas[k]);
+  }
+
+  // ---- география ----
+  locationKey(p) {
+    const l = p.location;
+    if (l.place === 'home') return `home:${p.apartment.number}`;
+    if (l.place === 'corridor') return `corridor:${l.floor}`;
+    return l.place;
+  }
+
+  placeTitle(p) {
+    const l = p.location;
+    if (l.place === 'home') return `Кв. ${p.apartment.number}`;
+    if (l.place === 'corridor') return `Коридор ${l.floor} этажа`;
+    return C.PLACES[l.place]?.name || l.place;
+  }
+
+  othersAt(p) {
+    const key = this.locationKey(p);
+    return this.alivePlayers().filter((q) => q.id !== p.id && this.isOnline(q.id) && this.locationKey(q) === key);
+  }
+
+  isDark(floor) {
+    const pw = this.world.power;
+    return !!pw && floor >= pw.from && floor <= pw.to;
+  }
+
+  fogPhase() {
+    const f = this.world.fog;
+    if (!f) return null;
+    return this.now() < f.warnUntil ? 'warning' : 'active';
+  }
+
+  inFog(floor) {
+    const f = this.world.fog;
+    return this.fogPhase() === 'active' && floor >= f.from && floor <= f.to;
+  }
+
+  facilityStatus(key) {
+    const fac = C.FACILITIES[key];
+    if (this.world.breakdowns[key]) {
+      const b = this.world.breakdowns[key];
+      return { open: false, reason: b.reason || C.BREAKDOWNS[key].brokenText };
+    }
+    if (this.isDark(fac.floor)) return { open: false, reason: 'На этаже нет света — закрыто.' };
+    return { open: true, reason: null };
+  }
+
+  allocateApartment() {
+    const taken = new Set(this.alivePlayers().map((p) => p.apartment.number));
+    for (let floor = C.BUILDING.firstResidentialFloor; floor <= C.BUILDING.maxFloor; floor++) {
+      for (let i = 1; i <= C.BUILDING.apartmentsPerFloor; i++) {
+        const number = `${floor}${String(i).padStart(2, '0')}`;
+        if (!taken.has(number)) return { floor, number };
+      }
+    }
+    throw new Error('Дом переполнен');
+  }
+
+  // =========================================================================
+  // Регистрация
+  // =========================================================================
+  register(rawName) {
+    const name = sanitizeName(rawName);
+    if (!name) return { ok: false, error: 'Имя — от 2 до 20 букв или цифр.' };
+    const id = newId('p');
+    const token = crypto.randomBytes(24).toString('hex');
+    const apartment = this.allocateApartment();
+    const now = this.now();
+    const p = {
+      id,
+      token,
+      name,
+      createdAt: now,
+      lastSeen: now,
+      apartment,
+      alive: true,
+      deathCause: null,
+      diedAt: null,
+      stats: { health: B.start.health, hunger: B.start.hunger, energy: B.start.energy, sanity: B.start.sanity },
+      money: B.start.money,
+      inventory: {},
+      gasmaskCharge: 100,
+      location: { place: 'home', floor: apartment.floor },
+      travel: null,
+      sealed: false,
+      sleeping: false,
+      conditions: [],
+      job: null,
+      shifts: 0,
+      journal: [],
+      lastHarm: null,
+    };
+    this.state.players[id] = p;
+    this.byToken.set(token, id);
+    this.journal(p, `Ордер на заселение получен. Ваша квартира — №${apartment.number}, ${apartment.floor} этаж. Голые стены, кровать и радиоточка.`);
+    this.journal(p, `Еда стоит талонов. Талоны дают за смену в цеху (${C.FACILITIES.factory.floor} этаж). Столовая — на ${C.FACILITIES.canteen.floor} этаже.`);
+    this.log(`Заселился новый жилец: ${name}, кв. ${apartment.number}`, 'join', id);
+    this.systemChat(`В квартиру ${apartment.number} заселился новый жилец — ${name}.`);
+    return { ok: true, player: p, token };
+  }
+
+  // =========================================================================
+  // Тик мира
+  // =========================================================================
+  tick() {
+    const w = this.world;
+    if (w.paused) return;
+    const now = this.now();
+    w.tick++;
+    w.gameMinutes += B.tickMs / 1000; // 1 реальная секунда = 1 игровая минута
+    this.updateWorldTimers(now);
+
+    const dt = B.tickMs / 60000; // доля минуты
+    const alive = this.alivePlayers();
+    const groups = new Map();
+    for (const p of alive) {
+      const key = this.locationKey(p);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(p);
+    }
+    for (const p of alive) this.tickPlayer(p, now, dt, groups);
+  }
+
+  updateWorldTimers(now) {
+    const w = this.world;
+    for (const key of Object.keys(w.breakdowns)) {
+      const b = w.breakdowns[key];
+      if (b && b.until && now >= b.until) this.setBreakdown(key, false, {});
+    }
+    if (w.power && w.power.until && now >= w.power.until) this.restorePower();
+    if (w.fog) {
+      if (!w.fog.arrived && now >= w.fog.warnUntil) {
+        w.fog.arrived = true;
+        const f = w.fog;
+        const victims = this.alivePlayers().filter((p) => p.location.floor >= f.from && p.location.floor <= f.to);
+        this.notify(victims, {
+          title: 'ТУМАН',
+          text: 'Туман пришёл на ваш этаж. Если вы не за закрытой гермодверью — бегите.',
+          style: 'fog',
+        });
+        this.log(`Туман накрыл этажи ${f.from}–${f.to}`, 'event');
+      }
+      if (now >= w.fog.until) this.endFog();
+    }
+    for (const t of Object.values(this.state.trades)) {
+      if (now - t.createdAt > 3 * 60000) delete this.state.trades[t.id];
+    }
+  }
+
+  tickPlayer(p, now, dt, groups) {
+    const online = this.isOnline(p.id);
+    const d = dt * (online ? 1 : B.offlineFactor);
+    if (p.travel) this.updateTravel(p, now);
+
+    const delta = { health: 0, hunger: 0, energy: 0, sanity: 0 };
+    const harm = {};
+    const hurt = (cause, amount) => {
+      if (amount < 0) harm[cause] = (harm[cause] || 0) - amount;
+    };
+    const atHome = p.location.place === 'home';
+    const floor = p.location.floor;
+
+    delta.hunger += B.hungerPerMin * d;
+    if (p.sleeping) delta.energy += B.energySleepRegenPerMin * d;
+    else if (atHome) delta.energy += B.energyHomeRegenPerMin * d;
+    else delta.energy += B.energyPassivePerMin * d;
+    if (atHome) delta.sanity += B.sanityHomeRegenPerMin * d;
+
+    for (const c of p.conditions) {
+      const def = C.CONDITIONS[c.id];
+      if (!def) continue;
+      for (const [k, v] of Object.entries(def.perMin || {})) {
+        delta[k] += v * d;
+        if (k === 'health') hurt(`Скончался: ${def.name.toLowerCase()}`, v * d);
+      }
+    }
+
+    const fogged = this.inFog(floor) && !(atHome && p.sealed);
+    if (fogged) {
+      let factor = this.world.fog.intensity || 1;
+      if (this.hasItem(p, 'gasmask')) {
+        factor *= B.gasMaskFactor;
+        this.wearGasmask(p, d);
+      }
+      const hp = (atHome ? B.fogHpHomeUnsealedPerMin : B.fogHpOutsidePerMin) * factor * d;
+      delta.health += hp;
+      hurt('Погиб в тумане', hp);
+      delta.sanity += (atHome ? B.fogSanityHomeUnsealedPerMin : B.fogSanityOutsidePerMin) * factor * d;
+      if (!this.hasCondition(p, 'fogsick') && this.random() < B.fogSicknessChancePerMin * factor * d) {
+        this.addCondition(p, 'fogsick');
+        this.log(`${p.name} подхватил туманную хворь`, 'disease', p.id);
+      }
+    }
+
+    if (this.isDark(floor) && !this.hasItem(p, 'flashlight')) delta.sanity += B.darkSanityPerMin * d;
+
+    if (p.stats.hunger <= 0) {
+      const hp = B.starvationHpPerMin * d;
+      delta.health += hp;
+      hurt('Умер от голода', hp);
+    } else if (p.stats.hunger > 50 && p.conditions.length === 0 && !fogged) {
+      delta.health += B.healthRegenPerMin * d;
+    }
+    if (p.stats.sanity <= 0) {
+      const hp = B.sanityZeroHpPerMin * d;
+      delta.health += hp;
+      hurt('Сошёл с ума', hp);
+    }
+
+    this.applyStats(p, delta);
+    const causes = Object.entries(harm).sort((a, b) => b[1] - a[1]);
+    if (causes.length) p.lastHarm = causes[0][0];
+
+    // истечение болезней и травм
+    const healed = p.conditions.filter((c) => c.until && now >= c.until);
+    if (healed.length) {
+      p.conditions = p.conditions.filter((c) => !healed.includes(c));
+      for (const c of healed) this.journal(p, `Вы поправились: ${C.CONDITIONS[c.id]?.name || c.id}.`, 'good');
+      this.dirty([p.id]);
+    }
+
+    // заражение соседей по локации
+    const group = groups.get(this.locationKey(p)) || [];
+    for (const c of p.conditions) {
+      const def = C.CONDITIONS[c.id];
+      if (!def?.contagious) continue;
+      for (const q of group) {
+        if (q === p || !q.alive || this.hasCondition(q, c.id)) continue;
+        if (this.random() < def.contagious * d) {
+          this.addCondition(q, c.id);
+          this.log(`${q.name} заразился от ${p.name}: ${def.name}`, 'disease', q.id);
+        }
+      }
+    }
+
+    if (p.sleeping && p.stats.energy >= 100 && online) {
+      p.sleeping = false;
+      this.journal(p, 'Вы выспались.', 'good');
+    }
+
+    if (online && p.stats.sanity < 20 && this.random() < 0.02) this.hallucinate(p);
+
+    if (p.stats.health <= 0) this.kill(p, p.lastHarm || 'Умер при невыясненных обстоятельствах');
+  }
+
+  wearGasmask(p, d) {
+    p.gasmaskCharge -= 20 * d; // одного противогаза хватает примерно на 5 минут тумана
+    if (p.gasmaskCharge <= 0) {
+      this.removeItem(p, 'gasmask', 1);
+      p.gasmaskCharge = 100;
+      this.journal(p, 'Фильтр противогаза забился. Противогаз пришёл в негодность.', 'danger');
+      this.dirty([p.id]);
+    }
+  }
+
+  hallucinate(p) {
+    const others = this.alivePlayers().filter((q) => q.id !== p.id);
+    const fake = others.length ? others[Math.floor(this.random() * others.length)] : null;
+    const msg = {
+      id: newId('m'),
+      ts: this.now(),
+      channel: 'local',
+      key: this.locationKey(p),
+      to: p.id, // видит только сам игрок
+      hallucination: true,
+      from: { name: fake ? fake.name : 'Сосед', apt: fake ? fake.apartment.number : '???' },
+      text: C.HALLUCINATIONS[Math.floor(this.random() * C.HALLUCINATIONS.length)],
+    };
+    this.emit('chat', msg);
+  }
+
+  // =========================================================================
+  // Перемещение
+  // =========================================================================
+  move(p, dest = {}) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (p.travel) return { ok: false, error: p.travel.stuck ? 'Вы застряли в лифте.' : 'Вы уже в пути.' };
+    const place = dest.place;
+    if (!MOVE_PLACES.includes(place)) return { ok: false, error: 'Туда не пройти.' };
+
+    let floor;
+    if (place === 'home') floor = p.apartment.floor;
+    else if (place === 'corridor') floor = dest.floor == null ? p.location.floor : toInt(dest.floor, -1);
+    else floor = C.FACILITIES[place].floor;
+    if (floor < C.BUILDING.minFloor || floor > C.BUILDING.maxFloor) {
+      return { ok: false, error: `Этажи — с ${C.BUILDING.minFloor} по ${C.BUILDING.maxFloor}.` };
+    }
+    if (p.location.place === place && p.location.floor === floor) return { ok: false, error: 'Вы уже здесь.' };
+
+    const from = p.location.floor;
+    const diff = Math.abs(floor - from);
+    const liftWorks = !this.world.breakdowns.lift;
+    const via = diff === 0 ? 'walk' : dest.via === 'stairs' || !liftWorks ? 'stairs' : 'lift';
+
+    if (via === 'stairs') {
+      if (this.hasBlock(p, 'stairs')) {
+        return { ok: false, error: 'С переломом ноги по лестнице не пройти. Ждите лифт или лечитесь.' };
+      }
+      const cost = diff * B.stairsEnergyPerFloor;
+      if (p.stats.energy < cost) {
+        return { ok: false, error: `Не хватит сил на ${diff} эт. по лестнице (нужно ${Math.ceil(cost)} сил).` };
+      }
+      p.stats.energy -= cost;
+    }
+
+    // уходим
+    p.sleeping = false;
+    if (p.job) {
+      p.job = null;
+      this.journal(p, 'Вы ушли со смены, не закончив её.', 'warn');
+    }
+    if (p.location.place === 'home' && p.sealed) p.sealed = false;
+    const witnesses = this.othersAt(p);
+
+    if (via === 'walk') {
+      p.location = { place, floor };
+    } else {
+      const sec = via === 'lift' ? B.liftBaseSec + diff * B.liftSecPerFloor : diff * B.stairsSecPerFloor;
+      const now = this.now();
+      p.travel = { via, toPlace: place, toFloor: floor, fromFloor: from, startedAt: now, arriveAt: now + sec * 1000 };
+      p.location = { place: via, floor: from };
+    }
+    this.dirty([...witnesses, ...this.othersAt(p)].map((q) => q.id));
+    return { ok: true };
+  }
+
+  updateTravel(p, now) {
+    const t = p.travel;
+    if (t.via === 'lift' && this.world.breakdowns.lift) {
+      if (!t.stuck) {
+        t.stuck = true;
+        t.remainingMs = Math.max(0, t.arriveAt - now);
+        this.notify([p], { title: 'Лифт встал', text: 'Кабина дёрнулась и замерла между этажами. Свет мигает. Вы застряли.', style: 'warn' });
+      }
+      return;
+    }
+    if (t.stuck) {
+      t.stuck = false;
+      t.arriveAt = now + t.remainingMs;
+      this.journal(p, 'Лифт дёрнулся и поехал дальше.', 'good');
+    }
+    if (now >= t.arriveAt) this.arrive(p);
+  }
+
+  arrive(p) {
+    const t = p.travel;
+    p.travel = null;
+    p.location = { place: t.toPlace, floor: t.toFloor };
+    this.dirty([p.id, ...this.othersAt(p).map((q) => q.id)]);
+  }
+
+  // =========================================================================
+  // Действия дома
+  // =========================================================================
+  seal(p, on) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (p.location.place !== 'home') return { ok: false, error: 'Гермодверь есть только у вас дома.' };
+    p.sealed = !!on;
+    this.journal(p, on ? 'Вы задраили гермодверь.' : 'Вы открыли гермодверь.');
+    return { ok: true };
+  }
+
+  sleep(p, on) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (on) {
+      if (p.location.place !== 'home') return { ok: false, error: 'Спать можно только дома.' };
+      if (this.hasCondition(p, 'insomnia')) return { ok: false, error: 'Бессонница. Глаза не закрываются.' };
+    }
+    p.sleeping = !!on;
+    return { ok: true };
+  }
+
+  useItem(p, itemId) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    const def = C.ITEMS[itemId];
+    if (!def || !this.hasItem(p, itemId)) return { ok: false, error: 'У вас этого нет.' };
+    if (def.equip) return { ok: false, error: 'Работает сам, пока лежит у вас в кармане.' };
+    if (!def.use) return { ok: false, error: 'Это не используется. Зато можно обменять.' };
+    const u = def.use;
+    const curable = (u.cure || []).filter((id) => this.hasCondition(p, id));
+    const shortenable = (u.shorten || []).filter((id) => this.hasCondition(p, id));
+    const onlyCures = !u.hunger && !u.health && !u.sanity;
+    if (onlyCures && !curable.length && !shortenable.length) return { ok: false, error: 'Вам это сейчас не нужно.' };
+
+    p.sleeping = false;
+    this.removeItem(p, itemId, 1);
+    this.applyStats(p, u);
+    const parts = [];
+    for (const id of curable) {
+      this.cureCondition(p, id);
+      parts.push(`прошло: ${C.CONDITIONS[id].name}`);
+    }
+    for (const id of shortenable) {
+      const c = p.conditions.find((x) => x.id === id);
+      if (c && c.until) c.until = this.now() + (c.until - this.now()) / 2;
+      parts.push(`${C.CONDITIONS[id].name} заживает быстрее`);
+    }
+    this.journal(p, `Использовано: ${def.name}${parts.length ? ` (${parts.join(', ')})` : ''}.`);
+    return { ok: true };
+  }
+
+  // =========================================================================
+  // Магазины: столовая и медпункт
+  // =========================================================================
+  shopEntries(shopId) {
+    return (C.SHOPS[shopId] || []).map((e) => {
+      const item = e.item ? C.ITEMS[e.item] : null;
+      return { key: e.id || e.item, name: e.name || item.name, desc: item?.desc || '', ...e };
+    });
+  }
+
+  buy(p, shopId, key) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (!C.SHOPS[shopId]) return { ok: false, error: 'Такого места нет.' };
+    if (p.location.place !== shopId) return { ok: false, error: 'Вы не там.' };
+    const status = this.facilityStatus(shopId);
+    if (!status.open) return { ok: false, error: status.reason };
+    const entry = this.shopEntries(shopId).find((e) => e.key === key);
+    if (!entry) return { ok: false, error: 'Этого нет в продаже.' };
+    if (entry.hiddenIfStolen && this.world.cutleryStolen) return { ok: false, error: 'Ложек нет. Все украли.' };
+    if (entry.needsSpoon && this.world.cutleryStolen && !this.hasItem(p, 'spoon')) {
+      return { ok: false, error: 'В столовой украли ложки. Без своей ложки суп не съесть.' };
+    }
+    if (p.money < entry.price) return { ok: false, error: `Не хватает талонов (нужно ${entry.price}).` };
+    p.money -= entry.price;
+    if (entry.eat) {
+      this.applyStats(p, entry.effect || {});
+      this.journal(p, `${entry.name} — за ${talons(entry.price)}.`);
+    } else {
+      this.addItem(p, entry.item, 1);
+      this.journal(p, `Куплено: ${entry.name} за ${talons(entry.price)}.`);
+    }
+    return { ok: true };
+  }
+
+  // =========================================================================
+  // Работа (мини-игры)
+  // =========================================================================
+  workStart(p, gameId) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (p.location.place !== 'factory') return { ok: false, error: 'Работа — в цеху.' };
+    const status = this.facilityStatus('factory');
+    if (!status.open) return { ok: false, error: status.reason };
+    if (p.job) return { ok: false, error: 'Вы уже на смене.' };
+    if (this.hasBlock(p, 'work')) return { ok: false, error: 'С такой травмой мастер к станку не допустит.' };
+    if (p.stats.energy < B.workEnergyCost) return { ok: false, error: 'Нет сил работать. Поспите.' };
+    const job = MG.createJob(gameId);
+    if (!job) return { ok: false, error: 'Такой работы нет.' };
+    job.id = newId('j');
+    job.startedAt = this.now();
+    p.job = job;
+    p.sleeping = false;
+    this.applyStats(p, { energy: -B.workEnergyCost, hunger: -B.workHungerCost });
+    return { ok: true, job: { id: job.id, game: job.game, data: job.publicData } };
+  }
+
+  workSubmit(p, jobId, rawAnswers) {
+    const job = p.job;
+    if (!job || job.id !== jobId) return { ok: false, error: 'Смена уже закрыта.' };
+    p.job = null;
+    const answers = Array.isArray(rawAnswers) ? rawAnswers.slice(0, 50).map((a) => (typeof a === 'number' ? a : String(a).slice(0, 20))) : [];
+    const score = MG.scoreJob(job, answers, this.now() - job.startedAt);
+    let reward = MG.rewardFor(score);
+    const notes = [];
+    const hour = this.gameClock().hour;
+    if (reward > 0 && (hour >= 22 || hour < 6)) {
+      reward += 1;
+      notes.push('ночная надбавка +1');
+    }
+    if (reward > 0 && p.conditions.some((c) => C.CONDITIONS[c.id]?.kind === 'disease')) {
+      reward = Math.max(1, Math.floor(reward * 0.75));
+      notes.push('больной работает хуже');
+    }
+    p.money += reward;
+    p.shifts = (p.shifts || 0) + 1;
+    const pct = Math.round(score * 100);
+    const text = reward
+      ? `Смена «${MG.GAMES[job.game].name}»: качество ${pct}%. Начислено: ${talons(reward)}${notes.length ? ` (${notes.join(', ')})` : ''}.`
+      : `Смена «${MG.GAMES[job.game].name}»: качество ${pct}%. Мастер записал брак — талонов нет.`;
+    this.journal(p, text, reward ? 'good' : 'warn');
+    return { ok: true, result: { score, reward, text } };
+  }
+
+  workCancel(p) {
+    if (!p.job) return { ok: false, error: 'Вы не на смене.' };
+    p.job = null;
+    this.journal(p, 'Вы бросили смену. Силы потрачены зря.', 'warn');
+    return { ok: true };
+  }
+
+  // =========================================================================
+  // Чат
+  // =========================================================================
+  chat(p, channel, rawText) {
+    if (!p.alive) return { ok: false, error: 'Мёртвые не разговаривают.' };
+    const text = sanitizeText(rawText, 300);
+    if (!text) return { ok: false, error: 'Пустое сообщение.' };
+    const now = this.now();
+    if (now - (this.lastChatAt.get(p.id) || 0) < 700) return { ok: false, error: 'Не так быстро.' };
+    this.lastChatAt.set(p.id, now);
+    const msg = { id: newId('m'), ts: now, channel, from: { id: p.id, name: p.name, apt: p.apartment.number }, text };
+    if (channel === 'global') {
+      this.pushGlobal(msg);
+    } else {
+      msg.channel = 'local';
+      msg.key = this.locationKey(p);
+      msg.where = this.placeTitle(p);
+      const list = this.localChat.get(msg.key) || [];
+      list.push(msg);
+      if (list.length > 30) list.shift();
+      this.localChat.set(msg.key, list);
+      // живое общение помогает не сойти с ума
+      if (this.othersAt(p).length && now - (p.lastChatBonus || 0) > B.chatSanityCooldownMs) {
+        p.lastChatBonus = now;
+        this.applyStats(p, { sanity: B.chatSanityBonus });
+      }
+    }
+    this.emit('chat', msg);
+    return { ok: true };
+  }
+
+  chatHistory(p) {
+    return { global: this.state.chatGlobal.slice(-50), local: (this.localChat.get(this.locationKey(p)) || []).slice() };
+  }
+
+  // =========================================================================
+  // Обмен и подарки
+  // =========================================================================
+  normalizeBundle(raw) {
+    const out = { money: Math.max(0, toInt(raw?.money)), items: {} };
+    for (const [id, n] of Object.entries(raw?.items || {})) {
+      const count = Math.max(0, toInt(n));
+      if (C.ITEMS[id] && count > 0) out.items[id] = Math.min(count, 99);
+    }
+    return out;
+  }
+
+  bundleEmpty(b) {
+    return !b.money && !Object.keys(b.items).length;
+  }
+
+  hasBundle(p, b) {
+    if (p.money < b.money) return false;
+    return Object.entries(b.items).every(([id, n]) => this.hasItem(p, id, n));
+  }
+
+  moveBundle(from, to, b) {
+    from.money -= b.money;
+    to.money += b.money;
+    for (const [id, n] of Object.entries(b.items)) {
+      this.removeItem(from, id, n);
+      this.addItem(to, id, n);
+    }
+  }
+
+  bundleText(b) {
+    const parts = [];
+    if (b.money) parts.push(talons(b.money));
+    for (const [id, n] of Object.entries(b.items)) parts.push(`${C.ITEMS[id].name}${n > 1 ? ` ×${n}` : ''}`);
+    return parts.join(', ') || 'ничего';
+  }
+
+  tradeOffer(p, toId, rawGive, rawWant) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    const q = this.getPlayer(toId);
+    if (!q || !q.alive || q.id === p.id) return { ok: false, error: 'Некому предлагать.' };
+    if (!this.isOnline(q.id) || this.locationKey(q) !== this.locationKey(p)) return { ok: false, error: 'Этого жильца нет рядом.' };
+    const give = this.normalizeBundle(rawGive);
+    const want = this.normalizeBundle(rawWant);
+    if (this.bundleEmpty(give) && this.bundleEmpty(want)) return { ok: false, error: 'Пустой обмен.' };
+    if (!this.hasBundle(p, give)) return { ok: false, error: 'У вас нет того, что вы предлагаете.' };
+
+    if (this.bundleEmpty(want)) {
+      this.moveBundle(p, q, give);
+      const what = this.bundleText(give);
+      this.journal(p, `Вы отдали жильцу ${q.name}: ${what}.`);
+      this.notify([q], { title: 'Подарок', text: `${p.name} (кв. ${p.apartment.number}) отдал вам: ${what}.`, style: 'good' });
+      this.log(`${p.name} → ${q.name}: подарок (${what})`, 'trade', p.id);
+      return { ok: true, gift: true };
+    }
+
+    const mine = Object.values(this.state.trades).filter((t) => t.from === p.id);
+    if (mine.length >= 5) return { ok: false, error: 'Слишком много открытых предложений.' };
+    const t = { id: newId('t'), from: p.id, to: q.id, give, want, createdAt: this.now() };
+    this.state.trades[t.id] = t;
+    this.notify([q], {
+      title: 'Предложение обмена',
+      text: `${p.name} предлагает: ${this.bundleText(give)} — в обмен на: ${this.bundleText(want)}.`,
+      style: 'trade',
+      journal: false,
+    });
+    this.dirty([p.id]);
+    return { ok: true, trade: t.id };
+  }
+
+  tradeRespond(p, tradeId, accept) {
+    const t = this.state.trades[tradeId];
+    if (!t || (t.to !== p.id && t.from !== p.id)) return { ok: false, error: 'Предложение уже неактуально.' };
+    const a = this.getPlayer(t.from);
+    const b = this.getPlayer(t.to);
+    if (!accept) {
+      delete this.state.trades[t.id];
+      const other = p.id === a.id ? b : a;
+      this.notify([other], { title: 'Обмен отменён', text: `${p.name} отказался от обмена.`, style: 'warn', journal: false });
+      return { ok: true };
+    }
+    if (t.to !== p.id) return { ok: false, error: 'Принять может только второй участник.' };
+    if (!a.alive || !this.isOnline(a.id) || this.locationKey(a) !== this.locationKey(b)) {
+      return { ok: false, error: `${a.name} уже ушёл.` };
+    }
+    if (!this.hasBundle(a, t.give)) return { ok: false, error: `У ${a.name} уже нет обещанного.` };
+    if (!this.hasBundle(b, t.want)) return { ok: false, error: 'У вас нет того, что просят.' };
+    this.moveBundle(a, b, t.give);
+    this.moveBundle(b, a, t.want);
+    delete this.state.trades[t.id];
+    this.journal(a, `Обмен с ${b.name}: отдали ${this.bundleText(t.give)}, получили ${this.bundleText(t.want)}.`, 'good');
+    this.journal(b, `Обмен с ${a.name}: отдали ${this.bundleText(t.want)}, получили ${this.bundleText(t.give)}.`, 'good');
+    this.notify([a], { title: 'Обмен состоялся', text: `${b.name} принял ваше предложение.`, style: 'good', journal: false });
+    this.log(`Обмен ${a.name} ⇄ ${b.name}: ${this.bundleText(t.give)} ⇄ ${this.bundleText(t.want)}`, 'trade', a.id);
+    return { ok: true };
+  }
+
+  // =========================================================================
+  // Смерть
+  // =========================================================================
+  kill(p, cause) {
+    if (!p.alive) return;
+    p.alive = false;
+    p.deathCause = cause;
+    p.diedAt = this.now();
+    p.travel = null;
+    p.job = null;
+    p.sleeping = false;
+    p.stats.health = 0;
+    for (const t of Object.values(this.state.trades)) if (t.from === p.id || t.to === p.id) delete this.state.trades[t.id];
+    this.journal(p, `Вы погибли. ${cause}.`, 'death');
+    this.emit('notify', { to: [p.id], title: 'Вы погибли', text: cause, style: 'death' });
+    this.log(`☠ ${p.name} (кв. ${p.apartment.number}): ${cause}`, 'death', p.id);
+    this.systemChat(`Квартира ${p.apartment.number} опечатана. Жилец ${p.name} больше не выйдет на смену.`);
+    this.dirty([p.id, ...this.othersAt(p).map((q) => q.id)]);
+  }
+
+  // =========================================================================
+  // ======================  АДМИНКА — «СИМУЛЯТОР БОГА»  ======================
+  // =========================================================================
+
+  /**
+   * Цель события:
+   *   { type: 'all' }                       — все живые
+   *   { type: 'online' }                    — все, кто сейчас в игре
+   *   { type: 'floors', from, to }          — кто сейчас на этажах from..to
+   *   { type: 'place', place }              — кто сейчас в столовой/цеху/…
+   *   { type: 'player', id }                — конкретный жилец
+   *   { type: 'random', count, online }     — N случайных
+   */
+  resolveTargets(target = {}) {
+    const alive = this.alivePlayers();
+    switch (target.type) {
+      case 'online':
+        return alive.filter((p) => this.isOnline(p.id));
+      case 'floors': {
+        const from = toInt(target.from);
+        const to = toInt(target.to, from);
+        return alive.filter((p) => p.location.floor >= Math.min(from, to) && p.location.floor <= Math.max(from, to));
+      }
+      case 'place':
+        return alive.filter((p) => p.location.place === target.place);
+      case 'player': {
+        const p = this.getPlayer(target.id);
+        return p && p.alive ? [p] : [];
+      }
+      case 'random': {
+        const pool = target.online ? alive.filter((p) => this.isOnline(p.id)) : alive.slice();
+        for (let i = pool.length - 1; i > 0; i--) {
+          const j = Math.floor(this.random() * (i + 1));
+          [pool[i], pool[j]] = [pool[j], pool[i]];
+        }
+        return pool.slice(0, Math.max(1, toInt(target.count, 1)));
+      }
+      case 'all':
+      default:
+        return alive;
+    }
+  }
+
+  /** Применить эффект к жильцу. Возвращает список изменений текстом. */
+  applyEffect(p, effect = {}, cause = 'Несчастный случай') {
+    const parts = [];
+    for (const k of STAT_KEYS) {
+      const v = Number(effect[k]);
+      if (!v) continue;
+      p.stats[k] = clamp(p.stats[k] + v);
+      parts.push(`${STAT_NAMES[k]} ${v > 0 ? '+' : ''}${v}`);
+      if (k === 'health' && v < 0) p.lastHarm = cause;
+    }
+    if (effect.money === 'all') {
+      if (p.money) parts.push(`−${talons(p.money)}`);
+      p.money = 0;
+    } else if (Number(effect.money)) {
+      const v = toInt(effect.money);
+      p.money = Math.max(0, p.money + v);
+      parts.push(`${v > 0 ? '+' : '−'}${talons(Math.abs(v))}`);
+    }
+    for (const [id, nRaw] of Object.entries(effect.items || {})) {
+      const n = toInt(nRaw);
+      if (!C.ITEMS[id] || !n) continue;
+      if (n > 0) {
+        this.addItem(p, id, n);
+        parts.push(`${C.ITEMS[id].name} +${n}`);
+      } else {
+        const removed = this.removeItem(p, id, -n);
+        if (removed) parts.push(`${C.ITEMS[id].name} −${removed}`);
+      }
+    }
+    if (effect.cure) {
+      this.cureCondition(p, effect.cure);
+      parts.push('исцеление');
+    }
+    if (effect.condition && C.CONDITIONS[effect.condition]) {
+      this.addCondition(p, effect.condition, { silent: true });
+      parts.push(C.CONDITIONS[effect.condition].name);
+    }
+    if (effect.kill) this.kill(p, cause);
+    else if (p.stats.health <= 0) this.kill(p, cause);
+    this.dirty([p.id]);
+    return parts;
+  }
+
+  /** Точка входа для всех команд админки. */
+  admin(cmd, args = {}) {
+    const fn = ADMIN_COMMANDS[cmd];
+    if (!fn) return { ok: false, error: `Неизвестная команда: ${cmd}` };
+    try {
+      return fn.call(this, args) || { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message };
+    }
+  }
+
+  requirePlayer(id, { alive = true } = {}) {
+    const p = this.getPlayer(id);
+    if (!p) throw new Error('Жилец не найден');
+    if (alive && !p.alive) throw new Error('Жилец мёртв');
+    return p;
+  }
+
+  // ---- туман ----
+  startFog({ from, to, warnSec = 30, durationMin = 3, intensity = 1 } = {}) {
+    if (this.world.fog) this.endFog(true);
+    const a = toInt(from, C.BUILDING.firstResidentialFloor);
+    const b = toInt(to, a);
+    const now = this.now();
+    this.world.fog = {
+      from: Math.min(a, b),
+      to: Math.max(a, b),
+      warnUntil: now + Math.max(0, Number(warnSec) || 0) * 1000,
+      until: now + Math.max(0, Number(warnSec) || 0) * 1000 + Math.max(0.1, Number(durationMin) || 1) * 60000,
+      intensity: Math.max(0.1, Math.min(5, Number(intensity) || 1)),
+      arrived: false,
+    };
+    const f = this.world.fog;
+    const onFloors = this.alivePlayers().filter((p) => p.location.floor >= f.from && p.location.floor <= f.to);
+    const elsewhere = this.alivePlayers().filter((p) => !onFloors.includes(p));
+    this.notify(onFloors, {
+      title: 'СИРЕНА',
+      text: `Туман идёт на этажи ${f.from}–${f.to}! До прихода ${Math.round(warnSec)} с. Домой, задраить гермодверь!`,
+      style: 'siren',
+    });
+    this.notify(elsewhere, { title: 'Сирена', text: `Где-то воет сирена: туман на этажах ${f.from}–${f.to}.`, style: 'warn' });
+    this.systemChat(`ВНИМАНИЕ! Туман на этажах ${f.from}–${f.to}. Жильцам немедленно укрыться в квартирах.`);
+    this.log(`Объявлен туман: этажи ${f.from}–${f.to}, сила ${f.intensity}, ${durationMin} мин`, 'event');
+    if (f.warnUntil <= now) this.updateWorldTimers(now);
+    return { ok: true };
+  }
+
+  endFog(silent = false) {
+    if (!this.world.fog) return { ok: false, error: 'Тумана нет.' };
+    const f = this.world.fog;
+    this.world.fog = null;
+    if (!silent) {
+      this.notify(this.alivePlayers(), { title: 'Отбой', text: `Туман на этажах ${f.from}–${f.to} рассеялся.`, style: 'good' });
+      this.systemChat(`Отбой тревоги. Туман на этажах ${f.from}–${f.to} рассеялся.`);
+    }
+    this.log(`Туман на этажах ${f.from}–${f.to} закончился`, 'event');
+    return { ok: true };
+  }
+
+  // ---- поломки ----
+  setBreakdown(key, broken, { durationMin, reason } = {}) {
+    if (!C.BREAKDOWNS[key]) throw new Error('Нет такого оборудования');
+    const def = C.BREAKDOWNS[key];
+    if (broken) {
+      const until = Number(durationMin) > 0 ? this.now() + Number(durationMin) * 60000 : null;
+      const text = sanitizeText(reason, 200) || def.brokenText;
+      this.world.breakdowns[key] = { since: this.now(), until, reason: text };
+      if (key === 'factory') {
+        const workers = this.alivePlayers().filter((p) => p.job);
+        for (const p of workers) p.job = null;
+        this.notify(workers, { title: 'Авария в цеху', text: 'Линия встала. Смена сорвана.', style: 'warn' });
+      }
+      this.notify(this.alivePlayers(), { title: `Поломка: ${def.name}`, text, style: 'warn' });
+      this.log(`Сломано: ${def.name}${until ? ` (на ${durationMin} мин)` : ''} — ${text}`, 'event');
+    } else {
+      if (!this.world.breakdowns[key]) return { ok: false, error: 'Это и так работает.' };
+      this.world.breakdowns[key] = null;
+      this.notify(this.alivePlayers(), { title: 'Починили', text: `${def.name} снова работает.`, style: 'good' });
+      this.log(`Починено: ${def.name}`, 'event');
+    }
+    return { ok: true };
+  }
+
+  cutPower({ from, to, durationMin } = {}) {
+    const a = toInt(from, C.BUILDING.firstResidentialFloor);
+    const b = toInt(to, a);
+    const until = Number(durationMin) > 0 ? this.now() + Number(durationMin) * 60000 : null;
+    this.world.power = { from: Math.min(a, b), to: Math.max(a, b), until };
+    const pw = this.world.power;
+    const victims = this.alivePlayers().filter((p) => p.location.floor >= pw.from && p.location.floor <= pw.to);
+    this.notify(victims, { title: 'Свет погас', text: 'Лампы мигнули и потухли. Темнота давит на рассудок. Фонарик бы...', style: 'warn' });
+    this.log(`Отключён свет на этажах ${pw.from}–${pw.to}`, 'event');
+    return { ok: true };
+  }
+
+  restorePower() {
+    const pw = this.world.power;
+    if (!pw) return { ok: false, error: 'Свет и так есть.' };
+    this.world.power = null;
+    const lit = this.alivePlayers().filter((p) => p.location.floor >= pw.from && p.location.floor <= pw.to);
+    this.notify(lit, { title: 'Свет дали', text: 'Лампы загудели снова.', style: 'good' });
+    this.log(`Свет восстановлен на этажах ${pw.from}–${pw.to}`, 'event');
+    return { ok: true };
+  }
+
+  // ---- столовые приборы ----
+  stealCutlery({ percent = 30 } = {}) {
+    this.world.cutleryStolen = true;
+    const share = Math.max(0, Math.min(100, Number(percent) || 0)) / 100;
+    const owners = this.alivePlayers().filter((p) => this.hasItem(p, 'spoon') || this.hasItem(p, 'fork'));
+    const victims = owners.filter(() => this.random() < share);
+    for (const p of victims) {
+      this.removeItem(p, 'spoon', 999);
+      this.removeItem(p, 'fork', 999);
+    }
+    this.notify(victims, { title: 'Пропажа', text: 'Вы обнаружили, что ваши ложки и вилки исчезли.', style: 'warn' });
+    this.systemChat('В Столовой №3 украдены все столовые приборы. Суп выдаётся только жильцам со своей ложкой.');
+    this.log(`Украдены столовые приборы. Пострадали жильцы: ${victims.map((p) => p.name).join(', ') || 'никто'}`, 'event');
+    return { ok: true };
+  }
+
+  returnCutlery() {
+    this.world.cutleryStolen = false;
+    this.systemChat('Столовая №3 получила новую партию ложек. Приятного аппетита.');
+    this.log('Ложки в столовой вернули', 'event');
+    return { ok: true };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Команды админки. this — экземпляр Game.
+// ---------------------------------------------------------------------------
+const ADMIN_COMMANDS = {
+  pause({ paused }) {
+    this.world.paused = !!paused;
+    this.log(paused ? 'Мир поставлен на паузу' : 'Мир снят с паузы', 'admin');
+  },
+
+  // ---- воздействие на конкретного жильца ----
+  setStats({ id, stats = {} }) {
+    const p = this.requirePlayer(id);
+    for (const k of STAT_KEYS) if (stats[k] !== undefined && stats[k] !== '') p.stats[k] = clamp(Number(stats[k]) || 0);
+    if (stats.money !== undefined && stats.money !== '') p.money = Math.max(0, toInt(stats.money));
+    this.log(`Параметры ${p.name} изменены вручную`, 'admin', p.id);
+    if (p.stats.health <= 0) this.kill(p, 'Умер при невыясненных обстоятельствах');
+    this.dirty([p.id]);
+  },
+
+  /** Несчастный случай: { id } — с одним жильцом, или { target } — с группой. */
+  accident({ id, target, accident }) {
+    const acc = C.ACCIDENTS[accident];
+    if (!acc) throw new Error('Нет такого несчастного случая');
+    const victims = id ? [this.requirePlayer(id)] : this.resolveTargets(target);
+    for (const p of victims) {
+      this.notify([p], { title: acc.name, text: acc.text, style: 'danger' });
+      const parts = this.applyEffect(p, { ...acc.effect, condition: acc.condition }, acc.name);
+      this.log(`Несчастный случай с ${p.name}: ${acc.name} (${parts.join(', ') || '—'})`, 'accident', p.id);
+    }
+    return { ok: true, message: `Пострадало жильцов: ${victims.length}` };
+  },
+
+  infect({ target, condition, silent }) {
+    const def = C.CONDITIONS[condition];
+    if (!def) throw new Error('Нет такой болезни/травмы');
+    const victims = this.resolveTargets(target);
+    for (const p of victims) {
+      this.addCondition(p, condition, { silent: true });
+      if (!silent) this.notify([p], { title: 'Самочувствие', text: `Вам нехорошо: ${def.name}.`, style: 'danger' });
+    }
+    this.log(`${def.name}: ${victims.map((p) => p.name).join(', ') || 'никто'}`, 'disease');
+    return { ok: true, message: `Затронуто жильцов: ${victims.length}` };
+  },
+
+  cure({ id, condition = 'all' }) {
+    const p = this.requirePlayer(id);
+    this.cureCondition(p, condition);
+    this.journal(p, 'Вам вдруг стало легче.', 'good');
+    this.log(`${p.name} исцелён (${condition === 'all' ? 'всё' : C.CONDITIONS[condition]?.name})`, 'admin', p.id);
+    this.dirty([p.id]);
+  },
+
+  give({ id, item, count = 1, silent }) {
+    const p = this.requirePlayer(id);
+    const n = toInt(count, 1);
+    const parts = this.applyEffect(p, { items: { [item]: n } });
+    if (!silent && parts.length) {
+      this.notify([p], {
+        title: n > 0 ? 'Находка' : 'Пропажа',
+        text: n > 0 ? `Вы нашли: ${C.ITEMS[item].name} ×${n}.` : `У вас пропало: ${C.ITEMS[item].name}.`,
+        style: n > 0 ? 'good' : 'warn',
+      });
+    }
+    this.log(`${p.name}: ${parts.join(', ')}`, 'admin', p.id);
+  },
+
+  money({ id, delta, silent }) {
+    const p = this.requirePlayer(id);
+    const parts = this.applyEffect(p, { money: toInt(delta) });
+    if (!silent && parts.length) this.notify([p], { title: 'Талоны', text: parts.join(', '), style: toInt(delta) > 0 ? 'good' : 'warn' });
+    this.log(`${p.name}: ${parts.join(', ')}`, 'admin', p.id);
+  },
+
+  kill({ id, cause }) {
+    const p = this.requirePlayer(id);
+    this.kill(p, sanitizeText(cause, 120) || 'Умер при невыясненных обстоятельствах');
+  },
+
+  revive({ id }) {
+    const p = this.requirePlayer(id, { alive: false });
+    if (p.alive) throw new Error('Жилец и так жив');
+    if (this.alivePlayers().some((q) => q.apartment.number === p.apartment.number)) {
+      p.apartment = this.allocateApartment();
+    }
+    p.alive = true;
+    p.deathCause = null;
+    p.diedAt = null;
+    p.conditions = [];
+    p.stats = { health: 50, hunger: 50, energy: 50, sanity: 40 };
+    p.location = { place: 'home', floor: p.apartment.floor };
+    this.notify([p], { title: 'Вы очнулись', text: `Вы лежите у себя в кв. ${p.apartment.number}. Вы не помните, как здесь оказались.`, style: 'whisper' });
+    this.log(`${p.name} воскрешён`, 'admin', p.id);
+    this.systemChat(`Жилец ${p.name} снова замечен в коридорах. Не задавайте ему вопросов.`);
+  },
+
+  teleport({ id, place, floor }) {
+    const p = this.requirePlayer(id);
+    if (!MOVE_PLACES.includes(place)) throw new Error('Нет такого места');
+    let f = toInt(floor, p.location.floor);
+    if (place === 'home') f = p.apartment.floor;
+    else if (place !== 'corridor') f = C.FACILITIES[place].floor;
+    p.travel = null;
+    p.job = null;
+    p.sealed = false;
+    p.sleeping = false;
+    p.location = { place, floor: f };
+    this.notify([p], { title: 'Провал в памяти', text: `Вы моргнули — и оказались здесь: ${this.placeTitle(p)}.`, style: 'whisper' });
+    this.log(`${p.name} перемещён: ${this.placeTitle(p)}`, 'admin', p.id);
+  },
+
+  whisper({ target, text, from = 'Голос за стеной' }) {
+    const msg = sanitizeText(text, 500);
+    if (!msg) throw new Error('Пустое сообщение');
+    const victims = this.resolveTargets(target);
+    this.notify(victims, { title: sanitizeText(from, 60) || 'Голос', text: msg, style: 'whisper' });
+    this.log(`Шёпот (${victims.map((p) => p.name).join(', ')}): ${msg}`, 'admin');
+    return { ok: true, message: `Услышали: ${victims.length}` };
+  },
+
+  erase({ id }) {
+    const p = this.requirePlayer(id, { alive: false });
+    delete this.state.players[p.id];
+    this.byToken.delete(p.token);
+    this.log(`Жилец ${p.name} стёрт из домовой книги`, 'admin');
+  },
+
+  // ---- события дома ----
+  fog(args) {
+    return this.startFog(args);
+  },
+
+  fogEnd() {
+    return this.endFog();
+  },
+
+  breakdown({ key, broken, durationMin, reason }) {
+    return this.setBreakdown(key, broken, { durationMin, reason });
+  },
+
+  power({ on, from, to, durationMin }) {
+    return on ? this.restorePower() : this.cutPower({ from, to, durationMin });
+  },
+
+  cutlery({ steal, percent }) {
+    return steal ? this.stealCutlery({ percent }) : this.returnCutlery();
+  },
+
+  aid({ target, money, items, title, text }) {
+    const victims = this.resolveTargets(target);
+    const effect = { money: toInt(money), items: items || {} };
+    for (const p of victims) {
+      const parts = this.applyEffect(p, effect);
+      this.notify([p], {
+        title: sanitizeText(title, 80) || 'Гуманитарная помощь',
+        text: `${sanitizeText(text, 300) || 'ЖЭК выдал паёк.'} (${parts.join(', ') || 'пусто'})`,
+        style: 'good',
+      });
+    }
+    this.log(`Гуманитарка для ${victims.length} жильцов: ${this.bundleText(this.normalizeBundle(effect))}`, 'event');
+    return { ok: true, message: `Получили: ${victims.length}` };
+  },
+
+  announce({ title, text }) {
+    const msg = sanitizeText(text, 500);
+    if (!msg) throw new Error('Пустое объявление');
+    this.notify(this.alivePlayers(), { title: sanitizeText(title, 80) || 'Объявление ЖЭК', text: msg, style: 'announce' });
+    this.systemChat(msg);
+    this.log(`Объявление: ${msg}`, 'event');
+  },
+
+  chat({ text, as }) {
+    const msg = sanitizeText(text, 300);
+    if (!msg) throw new Error('Пустое сообщение');
+    const m = { id: newId('m'), ts: this.now(), channel: 'global', from: { name: sanitizeText(as, 30) || 'ЖЭК', system: true }, text: msg };
+    this.pushGlobal(m);
+    this.emit('chat', m);
+  },
+
+  /** Произвольное событие: любые эффекты на любую цель. */
+  custom({ target, title, text, effect = {}, style = 'danger' }) {
+    const t = sanitizeText(title, 80) || 'Происшествие';
+    const victims = this.resolveTargets(target);
+    const clean = {};
+    for (const k of [...STAT_KEYS, 'money']) if (Number(effect[k])) clean[k] = Number(effect[k]);
+    if (effect.items) clean.items = effect.items;
+    if (effect.condition) clean.condition = effect.condition;
+    if (effect.cure) clean.cure = 'all';
+    if (effect.kill) clean.kill = true;
+    const allowedStyles = ['danger', 'warn', 'good', 'whisper', 'announce', 'info'];
+    for (const p of victims) {
+      this.notify([p], { title: t, text: sanitizeText(text, 500) || t, style: allowedStyles.includes(style) ? style : 'danger' });
+      this.applyEffect(p, clean, t);
+    }
+    this.log(`Событие «${t}» → ${victims.map((p) => p.name).join(', ') || 'никто'}`, 'event');
+    return { ok: true, message: `Затронуто жильцов: ${victims.length}` };
+  },
+};
+
+// ===========================================================================
+// Представления (что видит игрок / админ)
+// ===========================================================================
+Game.prototype.playerView = function playerView(p) {
+  const now = this.now();
+  const w = this.world;
+  const clock = this.gameClock();
+  const round = (s) => Object.fromEntries(STAT_KEYS.map((k) => [k, Math.round(s[k])]));
+
+  const you = {
+    id: p.id,
+    name: p.name,
+    apartment: p.apartment,
+    alive: p.alive,
+    deathCause: p.deathCause,
+    stats: round(p.stats),
+    money: p.money,
+    inventory: Object.entries(p.inventory).map(([id, count]) => ({
+      id,
+      count,
+      name: C.ITEMS[id]?.name || id,
+      desc: C.ITEMS[id]?.desc || '',
+      usable: !!C.ITEMS[id]?.use,
+      equip: !!C.ITEMS[id]?.equip,
+    })),
+    gasmaskCharge: Math.round(p.gasmaskCharge),
+    location: { ...p.location, title: this.placeTitle(p) },
+    travel: p.travel
+      ? {
+          via: p.travel.via,
+          toPlace: p.travel.toPlace,
+          toFloor: p.travel.toFloor,
+          stuck: !!p.travel.stuck,
+          etaMs: p.travel.stuck ? null : Math.max(0, p.travel.arriveAt - now),
+        }
+      : null,
+    sealed: p.sealed,
+    sleeping: p.sleeping,
+    conditions: p.conditions.map((c) => ({
+      id: c.id,
+      name: C.CONDITIONS[c.id]?.name || c.id,
+      kind: C.CONDITIONS[c.id]?.kind,
+      remainingSec: c.until ? Math.max(0, Math.round((c.until - now) / 1000)) : null,
+    })),
+    job: p.job ? { id: p.job.id, game: p.job.game } : null,
+    shifts: p.shifts || 0,
+    journal: p.journal.slice(-30),
+  };
+
+  const fog = w.fog
+    ? {
+        phase: this.fogPhase(),
+        from: w.fog.from,
+        to: w.fog.to,
+        inSec: Math.max(0, Math.round((w.fog.warnUntil - now) / 1000)),
+        endsInSec: Math.max(0, Math.round((w.fog.until - now) / 1000)),
+        affectsYou: p.location.floor >= w.fog.from && p.location.floor <= w.fog.to,
+      }
+    : null;
+
+  const facilities = {};
+  for (const key of Object.keys(C.FACILITIES)) facilities[key] = { name: C.FACILITIES[key].name, floor: C.FACILITIES[key].floor, ...this.facilityStatus(key) };
+
+  const here = this.describePlace(p);
+
+  const trades = Object.values(this.state.trades)
+    .filter((t) => t.to === p.id || t.from === p.id)
+    .map((t) => ({
+      id: t.id,
+      incoming: t.to === p.id,
+      other: (() => {
+        const o = this.getPlayer(t.to === p.id ? t.from : t.to);
+        return o ? { id: o.id, name: o.name } : null;
+      })(),
+      give: this.bundleText(t.give),
+      want: this.bundleText(t.want),
+    }));
+
+  return {
+    building: C.BUILDING.name,
+    you,
+    world: {
+      clock,
+      paused: w.paused,
+      fog,
+      power: w.power ? { from: w.power.from, to: w.power.to } : null,
+      dark: this.isDark(p.location.floor),
+      lift: { broken: !!w.breakdowns.lift, reason: w.breakdowns.lift?.reason || null },
+      cutleryStolen: w.cutleryStolen,
+      online: this.onlineSet.size,
+    },
+    facilities,
+    here,
+    trades,
+  };
+};
+
+Game.prototype.describePlace = function describePlace(p) {
+  const l = p.location;
+  const w = this.world;
+  const dark = this.isDark(l.floor);
+  const people = this.othersAt(p).map((q) => ({
+    id: q.id,
+    name: q.name,
+    apt: q.apartment.number,
+    symptoms: q.conditions.map((c) => C.CONDITIONS[c.id]?.symptom).filter(Boolean),
+  }));
+  const here = { place: l.place, floor: l.floor, title: this.placeTitle(p), text: '', people, shop: null, residents: null, closed: null };
+
+  switch (l.place) {
+    case 'home':
+      here.text = `Ваша квартира. Голые бетонные стены, продавленная кровать, радиоточка бормочет о перевыполнении плана. Гермодверь ${p.sealed ? 'задраена' : 'открыта'}.${p.sleeping ? ' Вы спите.' : ''}`;
+      break;
+    case 'corridor': {
+      here.text = dark
+        ? `Коридор ${l.floor} этажа. Темно, хоть глаз выколи. Где-то капает.`
+        : `Коридор ${l.floor} этажа. Лампы дневного света гудят и мигают. Пахнет сыростью и чужим ужином.`;
+      const residents = [];
+      for (let i = 1; i <= C.BUILDING.apartmentsPerFloor; i++) {
+        const number = `${l.floor}${String(i).padStart(2, '0')}`;
+        const r = this.alivePlayers().find((q) => q.apartment.number === number);
+        residents.push({ number, name: r ? r.name : null, online: r ? this.isOnline(r.id) : false, you: r?.id === p.id });
+      }
+      here.residents = residents;
+      break;
+    }
+    case 'canteen':
+    case 'medpost': {
+      const st = this.facilityStatus(l.place);
+      here.text = l.place === 'canteen'
+        ? 'Столовая №3. Запах тушёной капусты и хлорки. Над раздачей плакат: «Хлеб — всему голова».'
+        : 'Медпункт. Кушетка, шкаф с амбарным замком, плакат «Туман — не шутка!». Фельдшер смотрит устало.';
+      if (!st.open) here.closed = st.reason;
+      here.shop = this.shopEntries(l.place)
+        .filter((e) => !(e.hiddenIfStolen && w.cutleryStolen))
+        .map((e) => ({
+          key: e.key,
+          name: e.name,
+          desc: e.desc,
+          price: e.price,
+          eat: !!e.eat,
+          note: e.needsSpoon && w.cutleryStolen ? 'нужна своя ложка' : null,
+        }));
+      break;
+    }
+    case 'factory': {
+      const st = this.facilityStatus('factory');
+      here.text = 'Цех №4. Грохот станков, конвейер уходит в темноту. Мастер с журналом выдаёт наряды.';
+      if (!st.open) here.closed = st.reason;
+      here.jobs = Object.entries(MG.GAMES).map(([id, g]) => ({ id, name: g.name }));
+      here.workCost = { energy: B.workEnergyCost, hunger: B.workHungerCost };
+      break;
+    }
+    case 'lift':
+      here.text = p.travel?.stuck
+        ? 'Лифт застрял между этажами. Лампа мигает. Кнопка вызова диспетчера не работает.'
+        : `Лифт скрипит и гудит. Табличка: «Грузоподъёмность 400 кг». Едем на ${p.travel?.toFloor ?? '?'} этаж.`;
+      break;
+    case 'stairs':
+      here.text = `Бесконечные пролёты лестницы. Идёте на ${p.travel?.toFloor ?? '?'} этаж.`;
+      break;
+    default:
+      here.text = '';
+  }
+  return here;
+};
+
+Game.prototype.adminSnapshot = function adminSnapshot() {
+  const now = this.now();
+  const w = this.world;
+  return {
+    clock: this.gameClock(),
+    world: {
+      paused: w.paused,
+      fog: w.fog ? { ...w.fog, phase: this.fogPhase(), inSec: Math.max(0, Math.round((w.fog.warnUntil - now) / 1000)), endsInSec: Math.max(0, Math.round((w.fog.until - now) / 1000)) } : null,
+      power: w.power ? { ...w.power, endsInSec: w.power.until ? Math.round((w.power.until - now) / 1000) : null } : null,
+      breakdowns: Object.fromEntries(
+        Object.entries(w.breakdowns).map(([k, b]) => [k, b ? { reason: b.reason, endsInSec: b.until ? Math.round((b.until - now) / 1000) : null } : null]),
+      ),
+      cutleryStolen: w.cutleryStolen,
+    },
+    online: this.onlineSet.size,
+    players: this.players().map((p) => ({
+      id: p.id,
+      name: p.name,
+      apartment: p.apartment,
+      alive: p.alive,
+      deathCause: p.deathCause,
+      online: this.isOnline(p.id),
+      stats: Object.fromEntries(STAT_KEYS.map((k) => [k, Math.round(p.stats[k])])),
+      money: p.money,
+      inventory: p.inventory,
+      location: { ...p.location, title: this.placeTitle(p) },
+      travel: p.travel ? { via: p.travel.via, toFloor: p.travel.toFloor, stuck: !!p.travel.stuck } : null,
+      sealed: p.sealed,
+      sleeping: p.sleeping,
+      working: !!p.job,
+      shifts: p.shifts || 0,
+      conditions: p.conditions.map((c) => ({ id: c.id, name: C.CONDITIONS[c.id]?.name || c.id, remainingSec: c.until ? Math.round((c.until - now) / 1000) : null })),
+      lastSeen: p.lastSeen,
+    })),
+  };
+};
+
+Game.prototype.adminContent = function adminContent() {
+  const pickNames = (obj) => Object.fromEntries(Object.entries(obj).map(([k, v]) => [k, { name: v.name, ...(v.kind ? { kind: v.kind } : {}) }]));
+  return {
+    building: C.BUILDING,
+    facilities: C.FACILITIES,
+    items: pickNames(C.ITEMS),
+    conditions: pickNames(C.CONDITIONS),
+    accidents: Object.fromEntries(Object.entries(C.ACCIDENTS).map(([k, v]) => [k, { name: v.name, text: v.text }])),
+    breakdowns: pickNames(C.BREAKDOWNS),
+    places: Object.fromEntries(MOVE_PLACES.map((k) => [k, C.PLACES[k].name])),
+  };
+};
+
+module.exports = { Game, freshState, sanitizeName, sanitizeText, ADMIN_COMMANDS };

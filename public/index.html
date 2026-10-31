@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Гигахрущёвка</title>
+  <meta name="description" content="Выживание в бесконечном доме">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=PT+Mono&family=PT+Sans:wght@400;700&family=PT+Sans+Narrow:wght@700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Экран заселения -->
+  <section id="register" class="screen" hidden>
+    <div class="screen-card">
+      <div class="stamp">ЖЭК №7</div>
+      <h1 class="logo">ГИГАХРУЩЁВКА</h1>
+      <p class="sub">Корпус 7-Б. Ордер на заселение.</p>
+      <p class="lore">
+        Дом бесконечен. У вас будет квартира — и больше ничего.
+        Еду дают за талоны, талоны — за смену в цеху.
+        Соседи могут помочь. А могут и нет.
+      </p>
+      <p class="lore warn-line">Если завоет сирена — бегите домой и задрайте гермодверь.</p>
+      <form id="register-form" autocomplete="off">
+        <label for="register-name">Фамилия или имя жильца</label>
+        <input id="register-name" maxlength="20" minlength="2" required placeholder="например, Сидоров">
+        <button type="submit" class="btn primary">Получить ордер</button>
+        <p id="register-error" class="error" role="alert"></p>
+      </form>
+    </div>
+  </section>
+
+  <!-- Экран смерти -->
+  <section id="death" class="screen" hidden>
+    <div class="screen-card death-card">
+      <div class="stamp red">ОПЕЧАТАНО</div>
+      <h1>Вы погибли</h1>
+      <p id="death-cause" class="death-cause"></p>
+      <ul id="death-journal" class="journal"></ul>
+      <form id="rebirth-form" autocomplete="off">
+        <label for="rebirth-name">Дом не пустует долго. Новый жилец:</label>
+        <input id="rebirth-name" maxlength="20" minlength="2" required placeholder="имя нового жильца">
+        <button type="submit" class="btn primary">Заселиться</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- Игра -->
+  <div id="app" hidden>
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-title">ГИГАХРУЩЁВКА</span>
+        <span class="brand-sub" id="building"></span>
+      </div>
+      <div class="clock" id="clock">—</div>
+      <div class="who">
+        <span id="who-name"></span>
+        <span class="apt" id="who-apt"></span>
+      </div>
+      <div class="money" title="Талоны">
+        <span class="money-icon" aria-hidden="true">₸</span>
+        <span id="money">0</span>
+      </div>
+      <div class="top-tools">
+        <span class="online" id="online" title="Жильцов в сети"></span>
+        <button class="icon-btn" id="sound-toggle" title="Звук" aria-label="Звук">🔊</button>
+      </div>
+    </header>
+
+    <div id="banners"></div>
+
+    <main class="layout">
+      <aside class="col col-left">
+        <section class="panel">
+          <h2>Самочувствие</h2>
+          <div id="stats"></div>
+          <ul id="conditions" class="conditions"></ul>
+        </section>
+        <section class="panel">
+          <h2>Карманы</h2>
+          <ul id="inventory" class="inventory"></ul>
+        </section>
+      </aside>
+
+      <section class="col col-center">
+        <section class="panel place" id="place"></section>
+        <section class="panel work" id="work" hidden></section>
+        <nav class="panel nav" id="nav" aria-label="Перемещение">
+          <h2>Куда идти</h2>
+          <div class="nav-grid" id="nav-buttons"></div>
+          <form class="lift-form" id="lift-form">
+            <label for="lift-floor">На этаж</label>
+            <input id="lift-floor" type="number" min="1" max="999" inputmode="numeric" placeholder="101">
+            <button class="btn" type="submit">В коридор</button>
+            <span class="lift-status" id="lift-status"></span>
+          </form>
+        </nav>
+      </section>
+
+      <aside class="col col-right">
+        <section class="panel chat">
+          <div class="tabs" role="tablist">
+            <button class="tab active" data-tab="local" role="tab">Здесь</button>
+            <button class="tab" data-tab="global" role="tab">Весь дом</button>
+          </div>
+          <ul id="chat-log" class="chat-log" aria-live="polite"></ul>
+          <form id="chat-form" class="chat-form" autocomplete="off">
+            <input id="chat-input" maxlength="300" placeholder="Сказать...">
+            <button class="btn" type="submit">⏎</button>
+          </form>
+        </section>
+        <section class="panel">
+          <h2>Журнал</h2>
+          <ul id="journal" class="journal"></ul>
+        </section>
+      </aside>
+    </main>
+  </div>
+
+  <!-- Оверлеи атмосферы -->
+  <div id="fog" class="fog-overlay" aria-hidden="true"><div class="fog-layer a"></div><div class="fog-layer b"></div></div>
+  <div id="dark" class="dark-overlay" aria-hidden="true"></div>
+
+  <!-- Уведомления -->
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+  <div id="modal" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true">
+      <h3 id="modal-title"></h3>
+      <div id="modal-body"></div>
+      <div class="modal-actions" id="modal-actions"></div>
+    </div>
+  </div>
+
+  <div id="conn" class="conn" hidden>Связь с домом потеряна. Переподключение…</div>
+
+  <script src="game.js"></script>
+</body>
+</html>
