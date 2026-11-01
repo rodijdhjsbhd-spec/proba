@@ -153,7 +153,7 @@
       ],
       legend: {
         P: { type: 'poster', label: 'Плакат', wall: true, decor: true },
-        J: { type: 'jobboard', label: 'Доска нарядов', wall: true, decor: true },
+        J: { type: 'jobboard', label: 'Доска нарядов', wall: true },
         Q: { type: 'clock', label: 'Часы', wall: true, decor: true },
         '=': { type: 'conveyor', label: 'Конвейер', decor: true },
         1: { type: 'station', game: 'sort', label: 'Сортировочный стол' },

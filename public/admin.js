@@ -205,7 +205,8 @@
         ['stingy', 'Самые скупые…'],
         ['assignmentDone', 'Сдавшие разнарядку…'],
         ['assignmentFailed', 'Не сдавшие разнарядку…'],
-        ['debtors', 'Должники (просрочены расписки)'],
+        ['debtors', 'Должники (квартплата, расписки)'],
+        ['barygaClients', 'Клиенты барыги (за сутки)'],
         ['elders', 'Старшие по этажам'],
         ['petitionSigners', 'Подписавшие заявление…'],
       ],
@@ -657,6 +658,19 @@
     );
     withSchedule(grid.lastElementChild, { label: () => `Опасность: ${C.hazards[hzKind.value]}`, cmd: 'hazard', args: hzArgs });
 
+    // --- Барыга ---
+    const barFloor = num(99, { min: 1, max: 100 });
+    A.barygaInfo = h('p', { class: 'hint' });
+    grid.append(
+      card(
+        'Барыга',
+        'Торговец на техническом этаже: скупает лампочки, вилки, ложки, фильтры, батарейки и бумаги. В туман дороже, ложки и вилки — вдвое после кражи. Облава — только по вашему решению; кто продавал за сутки — цель «Клиенты барыги».',
+        'warn-card',
+        A.barygaInfo,
+        h('div', { class: 'row' }, 'Этаж', barFloor, button('Поставить', () => cmd('barygaPlace', { floor: barFloor.value }), 'small'), button('Убрать', () => cmd('barygaRemove', {}), 'small'), button('Облава', () => cmd('barygaRaid', {}), 'small danger')),
+      ),
+    );
+
     // --- Квартплата ---
     const rentAmt = num(2, { min: 0, max: 50 });
     A.rentInfo = h('p', { class: 'hint' });
@@ -864,6 +878,11 @@
     renderHazards();
     renderRadio();
     renderAssignments();
+    if (A.barygaInfo) {
+      const b = s.world.baryga;
+      const pl = s.world.plan;
+      A.barygaInfo.textContent = `${b ? `Барыга на ${b.floor} этаже, наличных ${b.purse ?? '—'} ₸.` : 'Барыги нет.'}${pl ? ` План дома (неделя ${pl.week}): ${pl.done} из ${pl.target} смен, участников ${pl.participants}.` : ''}`;
+    }
     if (A.rentInfo) {
       const debtors = s.players.filter((p) => p.alive && p.rentDebt > 0);
       A.rentInfo.textContent = `Сейчас: ${s.world.rent ? `${s.world.rent} ₸ в сутки` : 'квартплаты нет'}. Должников: ${debtors.length}${debtors.length ? ` (${debtors.map((p) => `${p.name} ${p.rentDebt} ₸`).join(', ')})` : ''}.`;
@@ -1071,7 +1090,7 @@
           ? h('div', { class: 'card-section' }, h('h3', { text: 'Модерация' }), actions(button('Разбанить паспорт и адрес', () => cmd('unban', { id }), 'small')))
           : null,
       );
-      box.replaceChildren(...kids);
+      box.replaceChildren(...kids.filter(Boolean));
       return;
     }
 
@@ -1468,11 +1487,13 @@
     if (!A.radioInfo || !r) return;
     memo('radio', [r.queue.map((q) => q.id), r.silenceSec > 0, (r.log || []).map((l) => l.ts)], () => {
       A.radioInfo.replaceChildren(
+        ...[
         r.silenceSec > 0 ? h('p', { class: 'note bad', text: 'В эфире тишина.' }) : null,
         r.queue.length
           ? h('ul', { class: 'hazard-list' }, r.queue.map((q) => h('li', null, h('span', { class: 'txt', text: `В очереди: ${q.text}` }), button('✕', () => cmd('radioRemove', { id: q.id }), 'small'))))
           : null,
         (r.log || []).length ? h('ul', { class: 'hazard-list' }, r.log.slice(-4).map((l) => h('li', { class: 'fenced' }, h('span', { class: 'txt' }, h('small', { text: `${l.clock} ` }), l.text)))) : null,
+        ].filter(Boolean),
       );
     });
   }

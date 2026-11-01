@@ -153,10 +153,58 @@ function scoreGauge(job, answers, elapsedMs) {
 }
 
 // ---------------------------------------------------------------------------
+// 4–5. Подработка за паёк: раздача в столовой и фасовка в медпункте (та же механика, что сортировка)
+// ---------------------------------------------------------------------------
+const SIDE = {
+  serve: {
+    title: 'Подработка: раздача',
+    rules: 'Разложите заказы по окнам раздачи. Порченое — в «Списание».',
+    bins: [{ id: 'first', name: 'Первое' }, { id: 'second', name: 'Второе' }, { id: 'drink', name: 'Напиток' }, { id: 'defect', name: 'Списание' }],
+    parts: {
+      first: { names: ['Щи', 'Борщ', 'Суп гороховый', 'Рассольник'], ok: ['горячий', 'с хлебом', 'полная тарелка'], bad: ['прокисший', 'с мухой', 'холодный'] },
+      second: { names: ['Каша перловая', 'Котлета', 'Макароны', 'Пюре'], ok: ['с подливой', 'свежая порция', 'горячее'], bad: ['подгорелое', 'с волосом', 'вчерашнее'] },
+      drink: { names: ['Кисель', 'Компот', 'Чай'], ok: ['тёплый', 'полный стакан', 'сладкий'], bad: ['мутный', 'с осадком', 'разлитый'] },
+    },
+  },
+  pack: {
+    title: 'Подработка: фасовка',
+    rules: 'Разложите по коробкам: таблетки, бинты, ампулы. Битое и просроченное — в «Брак».',
+    bins: [{ id: 'pills', name: 'Таблетки' }, { id: 'bandage', name: 'Бинты' }, { id: 'ampoule', name: 'Ампулы' }, { id: 'defect', name: 'Брак' }],
+    parts: {
+      pills: { names: ['Аспирин', 'Анальгин', 'Активированный уголь'], ok: ['в блистере', 'запечатанный', 'годен'], bad: ['просрочен', 'раскрошился', 'без маркировки'] },
+      bandage: { names: ['Бинт стерильный', 'Бинт эластичный', 'Пластырь'], ok: ['в упаковке', 'целый', 'годен'], bad: ['вскрыт', 'в пятнах', 'отсырел'] },
+      ampoule: { names: ['Ампула сыворотки', 'Ампула глюкозы', 'Ампула но-шпы'], ok: ['целая', 'прозрачная', 'годна'], bad: ['треснула', 'мутная', 'без этикетки'] },
+    },
+  },
+};
+
+function createSide(kind) {
+  const def = SIDE[kind];
+  const items = [];
+  const answers = [];
+  const types = Object.keys(def.parts);
+  for (let i = 0; i < 10; i++) {
+    const type = pick(types);
+    const part = def.parts[type];
+    const defect = Math.random() < 0.3;
+    items.push(`${pick(part.names)}, ${defect ? pick(part.bad) : pick(part.ok)}`);
+    answers.push(defect ? 'defect' : type);
+  }
+  return {
+    publicData: { title: def.title, rules: def.rules, items, bins: def.bins, limitSec: 35 },
+    secret: { answers },
+    limitSec: 35,
+    minSec: 4,
+  };
+}
+
+// ---------------------------------------------------------------------------
 const GAMES = {
   sort: { name: 'Сортировка деталей', create: createSort, score: scoreSort },
   meter: { name: 'Показания счётчиков', create: createMeter, score: scoreMeter },
   gauge: { name: 'Стравливание давления', create: createGauge, score: scoreGauge },
+  serve: { name: 'Раздача', create: () => createSide('serve'), score: scoreSort, side: true },
+  pack: { name: 'Фасовка', create: () => createSide('pack'), score: scoreSort, side: true },
 };
 
 /** Талоны за смену в зависимости от качества (0..1). */
@@ -185,4 +233,7 @@ function scoreJob(job, answers, elapsedMs) {
   return score;
 }
 
-module.exports = { GAMES, createJob, scoreJob, rewardFor, gaugePos, SORT_BINS };
+/** Станки цеха (без подработок) — у них разряды и трудовая книжка. */
+const WORK_GAMES = Object.fromEntries(Object.entries(GAMES).filter(([, g]) => !g.side));
+
+module.exports = { GAMES, WORK_GAMES, createJob, scoreJob, rewardFor, gaugePos, SORT_BINS };

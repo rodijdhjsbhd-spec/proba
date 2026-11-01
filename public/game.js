@@ -278,6 +278,10 @@
       e.preventDefault();
     } else if (e.code === 'KeyE') {
       e.preventDefault();
+      if (S.npcNear) {
+        openBaryga();
+        return;
+      }
       if (S.hazardNear) {
         fenceNear();
         return;
@@ -498,9 +502,11 @@
           actions: [{ label: 'Слушать', run: () => listenRadio() }],
         };
       case 'counter':
-        return { label: 'Раздача', sub: v.facilities.canteen.open ? null : 'закрыто', actions: [{ label: 'Подойти к раздаче', run: () => openShop('canteen', o) }] };
+        return { label: 'Раздача', sub: v.facilities.canteen.open ? sideSub(v) : 'закрыто', actions: [{ label: 'Подойти к раздаче', run: () => openShop('canteen', o) }, ...sideAction(v, o)] };
       case 'window_med':
-        return { label: 'Окошко фельдшера', sub: v.facilities.medpost.open ? null : 'закрыто', actions: [{ label: 'Постучать в окошко', run: () => openShop('medpost', o) }] };
+        return { label: 'Окошко фельдшера', sub: v.facilities.medpost.open ? sideSub(v) : 'закрыто', actions: [{ label: 'Постучать в окошко', run: () => openShop('medpost', o) }, ...sideAction(v, o)] };
+      case 'jobboard':
+        return { label: 'Доска нарядов', sub: 'план дома и доска почёта', actions: [{ label: 'Читать', run: () => openPlan(o) }] };
       case 'station': {
         const job = (v.here.jobs || []).find((j) => j.id === o.game);
         const sub = !v.facilities.factory.open ? 'цех стоит' : `${job ? job.rank : 1} разряд · смен в этот час: ${v.here.shiftsLeft ?? '—'}`;
@@ -632,6 +638,22 @@
 
   function renderPrompt() {
     const busy = !S.view || S.view.you.travel || S.view.you.down;
+    const npc = busy || !S.me ? null : [...S.actors.values()].find((a) => a.npc && Math.hypot(a.x - S.me.x, a.y - S.me.y) <= 1.8);
+    S.npcNear = npc || null;
+    if (npc) {
+      S.near = null;
+      S.lampNear = null;
+      S.hazardNear = null;
+      S.lastWordNear = null;
+      const sig = `npc${npc.id}`;
+      if (S.memo.prompt === sig) return;
+      S.memo.prompt = sig;
+      $('#prompt').replaceChildren(
+        h('span', { class: 'label' }, npc.name, h('small', { text: ' · скупает лампочки, вилки, ложки и бумаги' })),
+        h('button', { class: 'btn small primary', onclick: () => openBaryga() }, h('kbd', { text: 'E' }), 'Поговорить'),
+      );
+      return;
+    }
     const lw = busy ? null : nearestLastWord();
     S.lastWordNear = lw;
     if (lw && !nearestHazard()) {
@@ -717,6 +739,11 @@
     unlockAudio();
     const pt = worldPoint(e);
     const a = actorAt(pt);
+    if (a && a.npc === 'baryga') {
+      if (Math.hypot(a.x - S.me.x, a.y - S.me.y) <= 2) openBaryga();
+      else approach(a.id, openBaryga);
+      return;
+    }
     if (a) {
       const person = { id: a.id, name: a.name, apt: a.apt };
       const open = () => (a.down ? openAid(person, true) : openTrade(person));
@@ -1927,16 +1954,70 @@
   // ---------------------------------------------------------------------------
   const BIN_KEYS = ['1', '2', '3', '4'];
 
-  async function startWork(gameId) {
+  async function startWork(gameId, side = null) {
     if (S.job) return;
-    const res = await act('work_start', { game: gameId });
+    const res = side ? await act('side_start', { kind: gameId }) : await act('work_start', { game: gameId });
     if (!res.ok) return;
     const job = res.job;
     S.keys.clear();
-    const station = S.scene.objects.find((o) => o.type === 'station' && o.game === gameId);
+    const station = side || S.scene.objects.find((o) => o.type === 'station' && o.game === gameId);
     openSheet('work', job.data.title, station);
     S.job = { ...job, gameId, startedAt: performance.now(), state: 'playing', timers: [] };
-    ({ sort: playSort, meter: playMeter, gauge: playGauge })[job.game](S.job);
+    ({ sort: playSort, meter: playMeter, gauge: playGauge, serve: playSort, pack: playSort })[job.game](S.job);
+  }
+
+  // ---- подработка за паёк ----
+  function sideSub(v) {
+    const sj = v.here.sideJob;
+    if (!sj) return null;
+    return sj.open ? (sj.done ? `подработка: в эти часы уже были` : `подработка: ${sj.name.toLowerCase()} — сейчас`) : `подработка: ${sj.hours}`;
+  }
+
+  function sideAction(v, o) {
+    const sj = v.here.sideJob;
+    return sj && sj.open && !sj.done ? [{ label: `Подработать: ${sj.name}`, run: () => startWork(sj.kind, o) }] : [];
+  }
+
+  // ---- доска нарядов: план дома и доска почёта ----
+  async function openPlan(obj) {
+    const r = await act('plan');
+    if (!r.ok) return;
+    const p = r.plan;
+    const body = openSheet('plan', `План дома · неделя ${p.week}`, obj);
+    const pct = Math.min(100, Math.round((p.done / p.target) * 100));
+    body.replaceChildren(
+      h('p', { text: `Смен за неделю: ${p.done} из ${p.target}. Осталось дней: ${p.daysLeft}. Выполним — каждому участнику премия ${p.bonus} ₸.` }),
+      h('div', { class: 'plan-bar' }, h('i', { style: `width:${pct}%` })),
+      h('p', { class: 'note', text: `Ваших смен в плане: ${p.mine}.` }),
+      ...(p.top.length ? [h('ol', { class: 'plan-top' }, p.top.map((t) => h('li', null, `${t.name} — ${t.shifts}`)))] : []),
+      h('h4', { class: 'board-h', text: 'Доска почёта' }),
+      r.honor
+        ? h(
+            'div',
+            { class: 'honor' },
+            h('p', { class: 'note', text: `Неделя ${r.honor.week}: ${r.honor.done >= r.honor.target ? 'план выполнен' : 'план сорван'} (${r.honor.done}/${r.honor.target}).` }),
+            h('p', null, h('b', { text: 'Ударники: ' }), r.honor.workers.length ? r.honor.workers.map((w) => `${w.name} (${w.shifts})`).join(', ') : '—'),
+            h('p', null, h('b', { text: 'Самые щедрые: ' }), r.honor.generous.length ? r.honor.generous.map((w) => w.name).join(', ') : '—'),
+          )
+        : h('p', { class: 'note', text: 'Пока пусто: первая неделя ещё идёт.' }),
+    );
+  }
+
+  // ---- барыга ----
+  async function openBaryga() {
+    const r = await act('baryga');
+    if (!r.ok) return;
+    const body = openSheet('baryga', 'Барыга');
+    body.replaceChildren(
+      h('p', { class: 'hint', text: `«Беру: ${r.wants.join(', ')}. Наличных у меня сегодня — ${r.purse} ₸».` }),
+      r.items.length
+        ? h(
+            'ul',
+            { class: 'inventory' },
+            r.items.map((x) => h('li', null, h('span', { class: 'name', text: `${x.name} ×${x.have} — ${x.price} ₸` }), h('button', { class: 'btn small', text: 'Продать 1', onclick: async () => { const res = await act('baryga_sell', { item: x.id, count: 1 }); if (res.ok) { say(res.message); openBaryga(); } } }))),
+          )
+        : h('p', { class: 'note', text: '«Нечего тебе продать. Приходи с лампочками».' }),
+    );
   }
 
   function workShell(job, ...content) {

@@ -103,6 +103,10 @@ function freshState() {
       radio: { queue: [], silenceUntil: null, lastAirMin: 0, lastNewsTs: 0, slot: 0, log: [] },
       rent: null, // талонов в сутки; null — по умолчанию из BALANCE.rent, 0 — квартплаты нет
       lastDay: null, // игровые сутки, для которых уже прошла полночь (порча еды, квартплата)
+      baryga: null, // { floor, x, y, purse, purseDay } — барыга на техническом этаже (ставит ЖЭК)
+      barygaClients: {}, // жилец → когда последний раз продавал барыге
+      plan: null, // план дома на неделю { week, target, done, participants }
+      honor: null, // доска почёта прошлой недели { week, workers, generous }
     },
     players: {},
     trades: {},
@@ -179,6 +183,7 @@ class Game extends EventEmitter {
     s.world.lampsOut = s.world.lampsOut || {};
     s.world.hazards = s.world.hazards || {};
     s.world.scars = s.world.scars || {};
+    s.world.barygaClients = s.world.barygaClients || {};
     s.assignments = Array.isArray(s.assignments) ? s.assignments : [];
     s.petitions = Array.isArray(s.petitions) ? s.petitions : [];
     s.elders = s.elders && typeof s.elders === 'object' ? s.elders : {};
@@ -364,7 +369,7 @@ class Game extends EventEmitter {
     heir.heirOf = dead.id;
     heir.tutorial = { done: C.TUTORIAL.map((t) => t.id), rewarded: true, drill: true }; // памятка — только для совсем новых
     const skills = {};
-    for (const g of Object.keys(MG.GAMES)) {
+    for (const g of Object.keys(MG.WORK_GAMES)) {
       const rank = this.rankOf(dead, g);
       if (rank > 1) skills[g] = C.RANKS[rank - 2];
     }
@@ -751,7 +756,15 @@ class Game extends EventEmitter {
         down: !!p.down,
         newbie: this.isNewbie(p),
         mask: this.maskWorks(p) && this.inFog(p.location.floor),
-      }));
+      }))
+      .concat(this.npcsAt(key));
+  }
+
+  /** Неигровые персонажи сцены (пока — барыга). */
+  npcsAt(key) {
+    const b = this.world.baryga;
+    if (!b || key !== `corridor:${b.floor}`) return [];
+    return [{ id: 'npc:baryga', name: 'Барыга', npc: 'baryga', x: b.x, y: b.y, d: 'down', m: false, apt: '' }];
   }
 
   /** Темно ли там, где стоит жилец: нет света на этаже или в коридоре погасла половина ламп. */
@@ -1399,7 +1412,208 @@ class Game extends EventEmitter {
     this.world.lastDay = day;
     this.spoilFood(day);
     this.chargeRent(now);
+    this.planCheck();
   }
+
+  // =========================================================================
+  // План дома и Доска почёта
+  // =========================================================================
+  planWeek() {
+    return Math.floor((this.gameDay() - 1) / 7);
+  }
+
+  /** Неделя кончилась — подвести итог и выдать новый план. */
+  planCheck() {
+    const w = this.world;
+    const week = this.planWeek();
+    if (w.plan && w.plan.week === week) return;
+    if (w.plan) this.closePlan(w.plan);
+    w.plan = { week, target: Math.max(20, this.alivePlayers().length * B.planShiftsPerResident), done: 0, participants: {} };
+  }
+
+  planShift(p) {
+    this.planCheck();
+    const plan = this.world.plan;
+    plan.done++;
+    plan.participants[p.id] = (plan.participants[p.id] || 0) + 1;
+  }
+
+  closePlan(plan) {
+    const alive = this.alivePlayers();
+    const workers = alive
+      .filter((q) => plan.participants[q.id])
+      .sort((a, b) => plan.participants[b.id] - plan.participants[a.id])
+      .slice(0, 3)
+      .map((q) => ({ name: q.name, apt: q.apartment.number, shifts: plan.participants[q.id] }));
+    const generous = alive
+      .filter((q) => this.goodness(q) > 0)
+      .sort((a, b) => this.goodness(b) - this.goodness(a))
+      .slice(0, 3)
+      .map((q) => ({ name: q.name, apt: q.apartment.number }));
+    this.world.honor = { week: plan.week + 1, workers, generous, done: plan.done, target: plan.target };
+    if (plan.done >= plan.target) {
+      const winners = alive.filter((q) => plan.participants[q.id]);
+      for (const q of winners) {
+        q.money += B.planBonus;
+        this.journal(q, `План дома за неделю выполнен (${plan.done} из ${plan.target}). Премия участникам: ${talons(B.planBonus)}.`, 'good');
+      }
+      this.systemChat(`План дома выполнен: ${plan.done} смен из ${plan.target}. Участникам — премия. Ударники: ${workers.map((x) => x.name).join(', ') || '—'}.`);
+      this.log(`План недели выполнен (${plan.done}/${plan.target}), премия ${winners.length} жильцам`, 'event', null, { public: `план дома выполнен: ${plan.done} смен из ${plan.target}` });
+    } else {
+      this.systemChat(`План дома сорван: ${plan.done} смен из ${plan.target}. Премии не будет.`);
+      this.log(`План недели сорван (${plan.done}/${plan.target})`, 'event', null, { public: `план дома сорван: ${plan.done} смен из ${plan.target}` });
+    }
+  }
+
+  /** Доска нарядов в цеху: план недели и доска почёта. */
+  readPlan(p) {
+    if (!this.nearTo(p, (o) => o.type === 'jobboard')) return { ok: false, error: 'Подойдите к доске нарядов.' };
+    this.planCheck();
+    const plan = this.world.plan;
+    const daysLeft = 7 - ((this.gameDay() - 1) % 7);
+    const top = Object.entries(plan.participants)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([id, n]) => ({ name: (this.getPlayer(id) || {}).name || '—', shifts: n }));
+    return { ok: true, plan: { week: plan.week + 1, target: plan.target, done: plan.done, mine: plan.participants[p.id] || 0, daysLeft, bonus: B.planBonus, top }, honor: this.world.honor };
+  }
+
+  // =========================================================================
+  // Подработка за паёк
+  // =========================================================================
+  /** Окно подработки в этом месте сейчас: открыто ли, в какие часы, работали ли уже в это окно. */
+  sideJobHere(p) {
+    for (const [kind, def] of Object.entries(C.SIDE_JOBS)) {
+      if (def.place !== p.location.place) continue;
+      const hour = this.gameClock().hour;
+      const idx = def.hours.findIndex(([a, b]) => hour >= a && hour < b);
+      const key = `${this.gameDay()}:${idx}`;
+      return {
+        kind,
+        name: def.name,
+        open: idx >= 0,
+        hours: def.hours.map(([a, b]) => `${String(a).padStart(2, '0')}:00–${String(b).padStart(2, '0')}:00`).join(', '),
+        done: idx >= 0 && (p.sideDone || {})[kind] === key,
+        key,
+      };
+    }
+    return null;
+  }
+
+  sideJobStart(p, kind) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    const def = C.SIDE_JOBS[kind];
+    const here = this.sideJobHere(p);
+    if (!def || !here || here.kind !== kind) return { ok: false, error: 'Здесь такой подработки нет.' };
+    if (!here.open) return { ok: false, error: `Подработка — в часы: ${here.hours}.` };
+    if (here.done) return { ok: false, error: 'В эти часы вы уже подрабатывали.' };
+    const status = this.facilityStatus(def.place);
+    if (!status.open) return { ok: false, error: status.reason };
+    if (!this.nearTo(p, (o) => o.type === def.object)) return { ok: false, error: 'Подойдите поближе.' };
+    if (p.job) return { ok: false, error: 'Вы уже на смене.' };
+    if (this.hasBlock(p, 'work')) return { ok: false, error: 'С такой травмой не допустят.' };
+    const cost = Math.ceil(B.workEnergyCost / 2);
+    if (p.stats.energy < cost) return { ok: false, error: 'Нет сил. Поспите.' };
+    const job = MG.createJob(kind);
+    job.id = newId('j');
+    job.startedAt = this.now();
+    job.side = here.key;
+    p.job = job;
+    p.sleeping = false;
+    p.sideDone = { ...(p.sideDone || {}), [kind]: here.key };
+    this.applyStats(p, { energy: -cost });
+    return { ok: true, job: { id: job.id, game: job.game, data: job.publicData } };
+  }
+
+  /** Конец подработки: оплата натурой. Больной на раздаче заражает тех, кто обедает рядом. */
+  sideJobFinish(p, job, score) {
+    const def = C.SIDE_JOBS[job.game];
+    let pay = null;
+    for (const [need, items] of def.pay) if (score >= need) pay = items;
+    if (pay) for (const [id, n] of Object.entries(pay)) this.addItem(p, id, n);
+    const what = pay ? Object.entries(pay).map(([id, n]) => `${C.ITEMS[id].name}${n > 1 ? ` ×${n}` : ''}`).join(', ') : null;
+    if (job.game === 'serve') {
+      for (const c of p.conditions) {
+        const cond = C.CONDITIONS[c.id];
+        if (!cond || !cond.contagious) continue;
+        for (const q of this.othersAt(p)) if (this.random() < Math.min(0.9, cond.contagious * 3)) this.addCondition(q, c.id);
+      }
+    }
+    const pct = Math.round(score * 100);
+    const text = pay ? `${def.name}: качество ${pct}%. Расчёт натурой: ${what}.` : `${def.name}: качество ${pct}%. Заведующая ничего не дала.`;
+    this.journal(p, text, pay ? 'good' : 'warn');
+    this.log(`${p.name}: подработка «${def.name}» ${pct}%${what ? ` → ${what}` : ''}`, 'trade', p.id);
+    return { ok: true, result: { score, reward: 0, text } };
+  }
+
+  // =========================================================================
+  // Барыга на техническом этаже (ставит и убирает ЖЭК)
+  // =========================================================================
+  barygaPrice(itemId) {
+    const def = C.ITEMS[itemId];
+    if (!def) return null;
+    let price = def.paper ? 1 : C.BARYGA_PRICES[itemId];
+    if (!price) return null;
+    if (this.world.fog) price *= 1.5; // в туман всё дороже
+    if (this.world.cutleryStolen && (itemId === 'fork' || itemId === 'spoon')) price *= 2;
+    return Math.ceil(price);
+  }
+
+  barygaNear(p) {
+    const b = this.world.baryga;
+    return !!(b && p.location.place === 'corridor' && p.location.floor === b.floor && Math.hypot(p.pos.x - b.x, p.pos.y - b.y) <= 2.2);
+  }
+
+  barygaPurse() {
+    const b = this.world.baryga;
+    if (b.purseDay !== this.gameDay()) {
+      b.purseDay = this.gameDay();
+      b.purse = B.barygaPurse;
+    }
+    return b.purse;
+  }
+
+  barygaOffer(p) {
+    if (!this.barygaNear(p)) return { ok: false, error: 'Тут никого нет.' };
+    const items = Object.entries(p.inventory)
+      .map(([id, n]) => ({ id, name: C.ITEMS[id]?.name || id, have: n, price: this.barygaPrice(id) }))
+      .filter((x) => x.price);
+    return { ok: true, purse: this.barygaPurse(), items, wants: Object.keys(C.BARYGA_PRICES).map((id) => `${C.ITEMS[id].name} — ${this.barygaPrice(id)} ₸`).concat(['бумаги — 1 ₸']) };
+  }
+
+  barygaSell(p, itemId, count = 1) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (!this.barygaNear(p)) return { ok: false, error: 'Тут никого нет.' };
+    const price = this.barygaPrice(itemId);
+    if (!price) return { ok: false, error: '«Это не возьму».' };
+    const n = Math.max(1, Math.min(10, toInt(count, 1)));
+    if ((p.inventory[itemId] || 0) < n) return { ok: false, error: 'У вас столько нет.' };
+    const total = price * n;
+    if (this.barygaPurse() < total) return { ok: false, error: '«Денег нет. Приходи завтра».' };
+    this.removeItem(p, itemId, n);
+    p.money += total;
+    this.world.baryga.purse -= total;
+    this.world.barygaClients[p.id] = this.now();
+    this.log(`${p.name} продал барыге: ${C.ITEMS[itemId].name} ×${n} за ${talons(total)}`, 'trade', p.id);
+    return { ok: true, message: `Барыга отсчитал ${talons(total)}. «Никому не говори».` };
+  }
+
+  /** Свободная клетка поближе к середине коридора — там стоит барыга. */
+  barygaSpot(floor) {
+    const sc = this.map.scene(`corridor:${floor}`);
+    const cx = Math.floor(sc.w / 2);
+    for (let r = 0; r < sc.w; r++) {
+      for (const x of [cx + r, cx - r]) {
+        for (let y = sc.h - 2; y >= 1; y--) {
+          if (!World.isSolidTile(sc, x, y) && !sc.objects.some((o) => o.spot && Math.hypot(o.spot.x - (x + 0.5), o.spot.y - (y + 0.5)) < 1)) return { x: x + 0.5, y: y + 0.5 };
+        }
+      }
+    }
+    return { x: 2.5, y: sc.h - 2.5 };
+  }
+
+  // =========================================================================
+  // Коллективная жалоба в ЖЭК
 
   rentAmount() {
     return this.world.rent == null ? B.rent : this.world.rent;
@@ -2417,7 +2631,7 @@ class Game extends EventEmitter {
 
   /** Лучший разряд — его видят соседи. */
   bestRank(p) {
-    return Math.max(...Object.keys(MG.GAMES).map((g) => this.rankOf(p, g)));
+    return Math.max(...Object.keys(MG.WORK_GAMES).map((g) => this.rankOf(p, g)));
   }
 
   /** Новосёл: первые часы его нельзя обокрасть (злые механики сначала бьют по новичкам). */
@@ -2885,7 +3099,7 @@ class Game extends EventEmitter {
     const status = this.facilityStatus('factory');
     if (!status.open) return { ok: false, error: status.reason };
     if (p.job) return { ok: false, error: 'Вы уже на смене.' };
-    if (!MG.GAMES[gameId]) return { ok: false, error: 'Такой работы нет.' };
+    if (!MG.WORK_GAMES[gameId]) return { ok: false, error: 'Такой работы нет.' };
     if (!this.nearTo(p, (o) => o.type === 'station' && o.game === gameId)) return { ok: false, error: 'Подойдите к рабочему месту.' };
     if (this.hasBlock(p, 'work')) return { ok: false, error: 'С такой травмой мастер к станку не допустит.' };
     if (p.stats.energy < B.workEnergyCost) return { ok: false, error: 'Нет сил работать. Поспите.' };
@@ -2912,6 +3126,7 @@ class Game extends EventEmitter {
     p.job = null;
     const answers = Array.isArray(rawAnswers) ? rawAnswers.slice(0, 50).map((a) => (typeof a === 'number' ? a : String(a).slice(0, 20))) : [];
     const score = MG.scoreJob(job, answers, this.now() - job.startedAt);
+    if (job.side) return this.sideJobFinish(p, job, score);
     let reward = MG.rewardFor(score);
     const notes = [];
     const hour = this.gameClock().hour;
@@ -2940,6 +3155,7 @@ class Game extends EventEmitter {
     if (reward > 0) {
       this.world.shiftsToday = (this.world.shiftsToday || 0) + 1;
       this.assignmentShift(p);
+      this.planShift(p);
     }
     this.tutorialStep(p, 'shift');
     p.money += reward;
@@ -3198,6 +3414,10 @@ class Game extends EventEmitter {
         if (!a) return [];
         const inRange = alive.filter((p) => p.apartment.floor >= a.from && p.apartment.floor <= a.to);
         return inRange.filter((p) => !!a.done[p.apartment.number] === (target.type === 'assignmentDone'));
+      }
+      case 'barygaClients': {
+        const since = this.now() - 24 * 3600 * 1000;
+        return alive.filter((p) => (this.world.barygaClients[p.id] || 0) > since);
       }
       case 'debtors': {
         // долг за квартиру или просроченная расписка
@@ -3780,6 +4000,32 @@ const ADMIN_COMMANDS = {
     return { ok: true, message: this.isOwnHome(p) ? 'Записка у жильца' : 'Записка ждёт под дверью' };
   },
 
+  /** Поставить барыгу на технический этаж. */
+  barygaPlace({ floor }) {
+    const f = toInt(floor, 99);
+    if (this.map.floorKind(f) !== 'technical') throw new Error('Барыга торгует только на техническом этаже (ниже жилых, кроме столовой, медпункта и цеха)');
+    const spot = this.barygaSpot(f);
+    this.world.baryga = { floor: f, x: spot.x, y: spot.y, purse: B.barygaPurse, purseDay: this.gameDay() };
+    this.log(`Барыга появился на ${f} этаже`, 'admin');
+    return { ok: true, message: `Барыга на ${f} этаже` };
+  },
+
+  barygaRemove() {
+    this.world.baryga = null;
+    return { ok: true, message: 'Барыга ушёл' };
+  },
+
+  /** Облава: барыгу уводят, свидетели на этаже это видят; кто ему продавал за сутки — цель «Клиенты барыги». */
+  barygaRaid() {
+    const b = this.world.baryga;
+    if (!b) throw new Error('Барыги нет');
+    const witnesses = this.alivePlayers().filter((p) => p.location.place === 'corridor' && p.location.floor === b.floor);
+    this.notify(witnesses, { title: 'Облава', text: 'Люди в серых плащах увели барыгу. Говорят, у него была тетрадка с именами.', style: 'danger' });
+    this.world.baryga = null;
+    this.log('Облава на барыгу', 'event', null, { public: `облава на техническом этаже ${b.floor}` });
+    return { ok: true, message: `Облава. Клиентов за сутки: ${this.resolveTargets({ type: 'barygaClients' }).length}` };
+  },
+
   /** Квартплата: сколько талонов в сутки (0 — отменить). */
   rentSet({ amount }) {
     const n = Math.max(0, Math.min(50, toInt(amount, B.rent)));
@@ -4134,7 +4380,7 @@ Game.prototype.playerView = function playerView(p) {
     })),
     gasmaskCharge: Math.round(p.gasmaskCharge),
     flashCharge: Math.round(p.flashCharge ?? 100),
-    skills: Object.entries(MG.GAMES).map(([id, g]) => {
+    skills: Object.entries(MG.WORK_GAMES).map(([id, g]) => {
       const rank = this.rankOf(p, id);
       return { id, name: g.name, rank, xp: (p.skills && p.skills[id]) || 0, next: C.RANKS[rank] ?? null };
     }),
@@ -4278,7 +4524,7 @@ Game.prototype.describePlace = function describePlace(p) {
     case 'corridor': {
       const kind = this.map.floorKind(l.floor);
       if (dark) here.text = `Коридор ${l.floor} этажа. Темно, хоть глаз выколи. Где-то капает.`;
-      else if (kind === 'technical') here.text = `Технический этаж ${l.floor}. Голый бетон, трубы под потолком, запертые двери. Здесь никто не живёт — и, кажется, давно.`;
+      else if (kind === 'technical') here.text = `Технический этаж ${l.floor}. Голый бетон, трубы под потолком, запертые двери. Здесь никто не живёт — и, кажется, давно.${this.world.baryga && this.world.baryga.floor === l.floor ? ' Из тёмного угла тянет табаком: там кто-то торгует.' : ''}`;
       else if (kind === 'service') here.text = `Служебный этаж ${l.floor}. Двери подсобок заперты. Табличка у двустворчатой двери: «${C.FACILITIES[this.map.facilityByFloor[l.floor]].name}».`;
       else here.text = `Коридор ${l.floor} этажа. Лампы дневного света гудят и мигают. Пахнет сыростью и чужим ужином.`;
       here.floorKind = kind;
@@ -4315,13 +4561,14 @@ Game.prototype.describePlace = function describePlace(p) {
           note: e.needsSpoon && w.cutleryStolen ? 'нужна своя ложка' : null,
         }));
       here.supplyAt = `0${B.supplyHour}:00`;
+      here.sideJob = this.sideJobHere(p);
       break;
     }
     case 'factory': {
       const st = this.facilityStatus('factory');
       here.text = 'Цех №4. Грохот станков, конвейер уходит в темноту. Мастер с журналом выдаёт наряды.';
       if (!st.open) here.closed = st.reason;
-      here.jobs = Object.entries(MG.GAMES).map(([id, g]) => ({ id, name: g.name, rank: this.rankOf(p, id) }));
+      here.jobs = Object.entries(MG.WORK_GAMES).map(([id, g]) => ({ id, name: g.name, rank: this.rankOf(p, id) }));
       p.shiftLog = (p.shiftLog || []).filter((t) => this.now() - t < 3600 * 1000);
       here.shiftsLeft = Math.max(0, B.shiftsPerHour - p.shiftLog.length);
       here.workCost = { energy: B.workEnergyCost, hunger: B.workHungerCost };
@@ -4358,6 +4605,8 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       supplyNext: w.supplyNext ?? 1,
       lampsOutFloors: Object.keys(w.lampsOut).length,
       rent: this.rentAmount(),
+      baryga: w.baryga ? { floor: w.baryga.floor, purse: w.baryga.purse } : null,
+      plan: w.plan ? { done: w.plan.done, target: w.plan.target, week: w.plan.week + 1, participants: Object.keys(w.plan.participants).length } : null,
       stock: this.state.stock,
       radio: { queue: w.radio.queue, silenceSec: w.radio.silenceUntil ? Math.max(0, Math.round((w.radio.silenceUntil - now) / 1000)) : 0, log: w.radio.log },
       scarsCount: Object.values(w.scars).reduce((n, l) => n + l.length, 0),
@@ -4417,7 +4666,7 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       suspicious: (p.sameIpGifts || 0) >= 2,
       debts: this.state.ious.filter((x) => x.debtorId === p.id && this.iouOverdue(x)).length,
       goodness: Math.round(this.goodness(p) * 10) / 10,
-      ranks: Object.fromEntries(Object.keys(MG.GAMES).map((g) => [g, this.rankOf(p, g)])),
+      ranks: Object.fromEntries(Object.keys(MG.WORK_GAMES).map((g) => [g, this.rankOf(p, g)])),
       newbie: this.isNewbie(p),
       banned: !!this.banInfo(p),
       down: p.down ? Math.max(0, Math.ceil((p.down.until - now) / 1000)) : null,

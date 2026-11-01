@@ -1887,3 +1887,67 @@ test('честная экономика: новосёл дарит не боль
   game.tradeOffer(a, b.id, { money: 2, items: {} }, { money: 0, items: {} });
   assert.equal(game.adminSnapshot().players.find((p) => p.id === a.id).suspicious, true);
 });
+
+test('подработка за паёк: по часам, раз в окно, оплата натурой', () => {
+  const { game, clock } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'canteen' });
+  walkTo(game, p, type('counter'));
+  game.world.gameMinutes = Math.floor(game.world.gameMinutes / 1440) * 1440 + 10 * 60; // 10:00
+  assert.equal(game.sideJobStart(p, 'serve').ok, false, 'раздача — с 12:00');
+  game.world.gameMinutes += 2 * 60 + 5; // 12:05
+  const r = game.sideJobStart(p, 'serve');
+  assert.equal(r.ok, true, r.error);
+  clock.t += 10000;
+  const answers = p.job.secret.answers;
+  const res = game.workSubmit(p, r.job.id, answers);
+  assert.equal(res.ok, true);
+  assert.equal(p.inventory.bread, 1);
+  assert.equal(p.inventory.kissel, 1);
+  assert.equal(p.money, 0, 'талонов не платят');
+  assert.equal(game.sideJobStart(p, 'serve').ok, false, 'в это окно уже работали');
+  assert.equal(game.playerView(p).you.skills.length, 3, 'подработка — не станок');
+});
+
+test('барыга: только на техническом этаже, цены растут в туман, облава и цель «клиенты»', () => {
+  const { game } = makeWorld();
+  const p = join(game, 'Иван');
+  assert.equal(game.admin('barygaPlace', { floor: 101 }).ok, false);
+  assert.equal(game.admin('barygaPlace', { floor: 99 }).ok, true);
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 99 });
+  assert.ok(game.sceneActors('corridor:99').some((a) => a.npc === 'baryga'));
+  assert.equal(game.barygaOffer(p).ok, false, 'далеко');
+  p.pos = { x: game.world.baryga.x + 1, y: game.world.baryga.y, d: 'left' };
+  game.admin('give', { id: p.id, item: 'bulb', count: 2, silent: true });
+  game.admin('give', { id: p.id, item: 'paper_list', count: 1, silent: true });
+  const offer = game.barygaOffer(p);
+  assert.equal(offer.items.find((x) => x.id === 'bulb').price, 2);
+  assert.equal(offer.items.find((x) => x.id === 'paper_list').price, 1);
+  assert.equal(game.barygaSell(p, 'bulb', 1).ok, true);
+  assert.equal(p.money, 2);
+  game.admin('fog', { from: 101, to: 101, warnSec: 30, durationMin: 1 });
+  assert.equal(game.barygaPrice('bulb'), 3, 'в туман дороже');
+  assert.equal(game.admin('barygaRaid', {}).ok, true);
+  assert.equal(game.world.baryga, null);
+  assert.deepEqual(game.resolveTargets({ type: 'barygaClients' }).map((q) => q.id), [p.id]);
+});
+
+test('план дома: смены копятся, через неделю — премия участникам и доска почёта', () => {
+  const { game } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  game.planCheck();
+  game.world.plan.target = 3;
+  for (let i = 0; i < 3; i++) game.planShift(a);
+  game.admin('teleport', { id: a.id, place: 'factory' });
+  walkTo(game, a, type('jobboard'));
+  const view = game.readPlan(a);
+  assert.equal(view.plan.done, 3);
+  assert.equal(view.plan.mine, 3);
+  const before = a.money;
+  game.world.gameMinutes += 7 * 1440;
+  game.dayCheck(game.now());
+  assert.equal(a.money - before, C.BALANCE.planBonus - (a.createdAt > game.now() - C.BALANCE.newbieProtectionH * 3600e3 ? 0 : C.BALANCE.rent));
+  assert.equal(game.world.honor.workers[0].name, 'Иван');
+  assert.equal(b.money, 0, 'не участвовал — премии нет');
+});

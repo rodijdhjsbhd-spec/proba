@@ -85,6 +85,11 @@ const BALANCE = {
   windowCapacity: 10,
   // Новосёл может подарить не больше стольких талонов в сутки (защита от «ферм» из новых жильцов)
   newbieGiftLimit: 5,
+  // План дома: премия участникам выполненного недельного плана; сколько смен на жильца в неделю
+  planBonus: 5,
+  planShiftsPerResident: 10,
+  // Барыга: сколько талонов у него на скупку в сутки
+  barygaPurse: 30,
 
   hungerPerMin: -3, // сытость падает: 100 → 0 примерно за 33 минуты
   starvationHpPerMin: -6, // урон здоровью при сытости 0
@@ -160,6 +165,15 @@ const ITEMS = {
   sour_kissel: { name: 'Прокисший кисель', desc: 'Пахнет так себе. Но съедобно.', use: { hunger: 3 } },
   fog_bread: { name: 'Хлеб с серым налётом', desc: 'Лежал за окном, пока шёл туман.', use: { hunger: 8, sanity: -6 } },
 };
+
+// Подработка за паёк: где, у чего, в какие игровые часы и чем платят (по качеству).
+const SIDE_JOBS = {
+  serve: { name: 'Раздача', place: 'canteen', object: 'counter', hours: [[12, 14], [18, 20]], pay: [[0.5, { bread: 1 }], [0.8, { bread: 1, kissel: 1 }]] },
+  pack: { name: 'Фасовка', place: 'medpost', object: 'window_med', hours: [[10, 12], [16, 17]], pay: [[0.6, { bandage: 1 }], [0.9, { bandage: 1, pills: 1 }]] },
+};
+
+// Барыга на техническом этаже: что скупает и почём (бумаги — по 1). В туман дороже, ложки и вилки — после кражи.
+const BARYGA_PRICES = { bulb: 2, fork: 2, spoon: 3, filter: 3, battery: 2 };
 
 // Порча еды: за ночь (в полночь) свежее становится несвежим. Сухари и тушёнка вечны.
 // «Туманной» еда становится только от тумана, который наслал бог (если лежала за окном).
@@ -395,5 +409,5 @@ const NOTES = {
 module.exports = {
   BUILDING, FACILITIES, BALANCE, ITEMS, SHOPS, CONDITIONS, ACCIDENTS, PLACES, BREAKDOWNS, HALLUCINATIONS,
   HALLUCINATION_VOICES, RESERVED_NAMES, ARCHIVE_DEAD_AFTER_H, NOTES, RANKS, TUTORIAL, ECHO_PHRASES, HAZARDS,
-  LORE, RADIO, DEEDS, SPOIL, FOGGED,
+  LORE, RADIO, DEEDS, SPOIL, FOGGED, SIDE_JOBS, BARYGA_PRICES,
 };
