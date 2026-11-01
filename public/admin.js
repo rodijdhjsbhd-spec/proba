@@ -205,6 +205,9 @@
         ['stingy', 'Самые скупые…'],
         ['assignmentDone', 'Сдавшие разнарядку…'],
         ['assignmentFailed', 'Не сдавшие разнарядку…'],
+        ['debtors', 'Должники (просрочены расписки)'],
+        ['elders', 'Старшие по этажам'],
+        ['petitionSigners', 'Подписавшие заявление…'],
       ],
       defaultType,
     );
@@ -229,6 +232,8 @@
     };
     rows.stingy = rows.generous; // одно поле «сколько» на обе цели
     rows.assignmentFailed = rows.assignmentDone;
+    const petSel = h('select', { 'aria-label': 'Заявление' });
+    rows.petitionSigners = h('div', { class: 'row' }, petSel);
     const sync = () => {
       for (const [k, r] of Object.entries(rows)) if (r !== rows[type.value]) r.hidden = true;
       if (rows[type.value]) rows[type.value].hidden = false;
@@ -247,7 +252,17 @@
         player.replaceChildren(...list.map((p) => h('option', { value: p.id, text: `${p.name} · кв. ${p.apartment.number}` })));
         if (list.some((p) => p.id === keep)) player.value = keep;
       },
+      refreshPetitions() {
+        const list = A.snap?.petitions || [];
+        const sig = list.map((x) => x.id).join('|');
+        if (sig === picker.petSig) return;
+        picker.petSig = sig;
+        const keep = petSel.value;
+        petSel.replaceChildren(...(list.length ? list.map((x) => h('option', { value: x.id, text: `«${x.text.slice(0, 40)}» (${x.floor} эт.)` })) : [h('option', { value: '', text: '— заявлений нет —' })]));
+        if (list.some((x) => x.id === keep)) petSel.value = keep;
+      },
       refreshAssignments() {
+        picker.refreshPetitions();
         const list = A.snap?.assignments || [];
         const sig = list.map((a) => a.id).join('|');
         if (sig === picker.asgSig) return;
@@ -263,6 +278,7 @@
           case 'stingy': return { type: type.value, count: topN.value };
           case 'assignmentDone':
           case 'assignmentFailed': return { type: type.value, id: asg.value };
+          case 'petitionSigners': return { type: 'petitionSigners', id: petSel.value };
           case 'floors': return { type: 'floors', from: from.value, to: to.value };
           case 'place': return { type: 'place', place: place.value };
           case 'player': return { type: 'player', id: player.value };
@@ -641,6 +657,17 @@
     );
     withSchedule(grid.lastElementChild, { label: () => `Опасность: ${C.hazards[hzKind.value]}`, cmd: 'hazard', args: hzArgs });
 
+    // --- Коллективные заявления ---
+    A.petitionList = h('ul', { class: 'hazard-list' });
+    grid.append(
+      card(
+        'Заявления жильцов',
+        'Коллективные жалобы с досок: когда наберут подписи, приходят сюда. Ответ увидят подписавшие. «Наказать» — минус рассудок и пара талонов; для своего наказания — цель «Подписавшие заявление» в любой карточке.',
+        'whisper-card',
+        A.petitionList,
+      ),
+    );
+
     // --- Разнарядка на этажи ---
     const asgFrom = num(firstFloor, { min: 1, max: 999 });
     const asgTo = num(firstFloor + 4, { min: 1, max: 999 });
@@ -823,6 +850,7 @@
     renderHazards();
     renderRadio();
     renderAssignments();
+    renderPetitions();
     renderEyeSide();
     for (const picker of A.pickers) {
       picker.refresh();
@@ -1193,7 +1221,7 @@
     const DEED_NAMES = { gift: 'подарки', aid: 'помощь', rescue: 'спас лежачих', shelter: 'пускал переждать', care: 'берёг дом', assignment: 'разнарядки', theft: 'кражи', rob: 'обирал лежачих', cold: 'не открыл в туман' };
     const deeds = Object.entries(p.deeds || {}).map(([k, n]) => `${DEED_NAMES[k] || k}: ${n}`);
     A.card.rumor.textContent = p.alive
-      ? `Молва: ${p.rumor && p.rumor.length ? p.rumor.join(', ') : 'ничего не говорят'}${deeds.length ? ` · досье — ${deeds.join(', ')}` : ''}${p.goodness ? ` · за сутки ${p.goodness > 0 ? '+' : ''}${p.goodness}` : ''}`
+      ? `${p.elder ? '★ старший по этажу · ' : ''}${p.debts ? `просрочено расписок: ${p.debts} · ` : ''}Молва: ${p.rumor && p.rumor.length ? p.rumor.join(', ') : 'ничего не говорят'}${deeds.length ? ` · досье — ${deeds.join(', ')}` : ''}${p.goodness ? ` · за сутки ${p.goodness > 0 ? '+' : ''}${p.goodness}` : ''}`
       : '';
     A.card.harm.textContent = p.harmsHour ? `Бед от ЖЭК за час: ${p.harmsHour}${p.harmsHour >= 3 ? ' — не слишком ли часто одному?' : ''}` : '';
     A.card.harm.className = `card-meta${p.harmsHour >= 3 ? ' harm-warn' : ''}`;
@@ -1359,6 +1387,35 @@
               );
             })
           : [h('li', { class: 'calm', text: 'Режиссёру нечего подсказать.' })]),
+      );
+    });
+  }
+
+  function renderPetitions() {
+    const list = (A.snap.petitions || []).slice().reverse();
+    if (!A.petitionList) return;
+    const label = { open: 'собирает подписи', sent: 'ЖДЁТ ОТВЕТА', done: 'выполнено', ignored: 'без ответа', punished: 'наказали' };
+    memo('petitions', list.map((x) => [x.id, x.count, x.status]), () => {
+      A.petitionList.replaceChildren(
+        ...(list.length
+          ? list.map((x) => {
+              const reply = h('input', { maxlength: '200', placeholder: 'Ответ (необязательно)' });
+              const open = x.status === 'open' || x.status === 'sent';
+              return h(
+                'li',
+                { class: open ? '' : 'fenced' },
+                h('span', { class: 'txt' }, h('b', { text: `«${x.text}»` }), ` · ${x.floor} эт. · ${label[x.status] || x.status} · ${x.count}/${x.needed}: ${x.signers.join(', ')}`),
+                open
+                  ? [
+                      reply,
+                      button('Выполнить', () => cmd('petitionResolve', { id: x.id, verdict: 'done', reply: reply.value }), 'small'),
+                      button('Игнорировать', () => cmd('petitionResolve', { id: x.id, verdict: 'ignored', reply: reply.value }), 'small'),
+                      button('Наказать подписавших', () => confirm('Наказать всех, кто подписал?') && cmd('petitionResolve', { id: x.id, verdict: 'punished', reply: reply.value }), 'small danger'),
+                    ]
+                  : null,
+              );
+            })
+          : [h('li', { class: 'calm', text: 'Заявлений нет.' })]),
       );
     });
   }

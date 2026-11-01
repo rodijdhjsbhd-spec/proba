@@ -114,6 +114,9 @@ function freshState() {
     schedule: [], // планировщик ЖЭК: отложенные и повторяющиеся команды
     accounts: {}, // логин (строчными) → паспорт жильца { login, salt, hash, playerIds, banned }
     assignments: [], // разнарядки ЖЭК на этажи { id, from, to, text, kind, item, amount, until, done: { кв.: ts } }
+    petitions: [], // коллективные жалобы { id, floor, text, authorId, signers: [{ id, name, apt }], status, createdAt }
+    elders: {}, // этаж → { votes: { голосующий: кандидат } } — старший по этажу
+    ious: [], // долговые расписки { id, debtorId, holderId, bundle, dueDay, createdAt, status }
     palette: { conditions: {}, accidents: {}, items: {} }, // беды и предметы, придуманные в Пульте
     stock: null, // запасы столовой и медпункта на сегодня: { canteen: { ключ: штук } } — заполняется при загрузке
     bannedIps: {}, // адрес → { until, reason }
@@ -174,6 +177,9 @@ class Game extends EventEmitter {
     s.world.hazards = s.world.hazards || {};
     s.world.scars = s.world.scars || {};
     s.assignments = Array.isArray(s.assignments) ? s.assignments : [];
+    s.petitions = Array.isArray(s.petitions) ? s.petitions : [];
+    s.elders = s.elders && typeof s.elders === 'object' ? s.elders : {};
+    s.ious = Array.isArray(s.ious) ? s.ious : [];
     s.world.radio = { ...fresh.world.radio, ...(s.world.radio || {}) };
     s.world.breakdowns = { ...fresh.world.breakdowns, ...((state.world || {}).breakdowns || {}) };
     for (const p of Object.values(s.players || {})) {
@@ -1150,6 +1156,9 @@ class Game extends EventEmitter {
     for (const [shop, items] of Object.entries(this.state.stock || {})) {
       for (const [key, n] of Object.entries(items)) if (n <= 0) empty.push(C.ITEMS[key]?.name || this.shopEntries(shop).find((e) => e.key === key)?.name || key);
     }
+    for (const pet of this.state.petitions.filter((x) => x.status === 'sent')) {
+      hints.push({ id: `petition:${pet.id}`, level: 'warn', text: `Коллективное заявление с ${pet.floor} этажа (${pet.signers.length} подп.): «${pet.text.slice(0, 80)}». Ждут ответа ЖЭК.` });
+    }
     if (empty.length) hints.push({ id: `stock:${empty.join(',')}`, level: 'info', text: `Кончилось: ${empty.join(', ')}. Завоз в 0${B.supplyHour}:00.` });
     const events = this.state.log.filter((e) => ['event', 'accident', 'death', 'disease'].includes(e.kind));
     const last = events[events.length - 1];
@@ -1199,6 +1208,8 @@ class Game extends EventEmitter {
     }
     this.radioTick(now);
     if (this.state.assignments.length) this.closeAssignments(now);
+    if (this.world.tick % 30 === 0 && this.state.petitions.length) this.expirePetitions(now);
+    this.elderWarnings(now);
   }
 
   // =========================================================================
@@ -1372,6 +1383,211 @@ class Game extends EventEmitter {
     }
     // закрытые больше суток назад — в архив (нужны только для целей «сдавшие/не сдавшие»)
     this.state.assignments = this.state.assignments.filter((a) => !a.closed || now - a.closedAt < 24 * 3600 * 1000).slice(-30);
+  }
+
+  // =========================================================================
+  // Коллективная жалоба в ЖЭК
+  // =========================================================================
+  petitionsNeeded() {
+    return Math.min(B.petitionSignatures, Math.max(2, this.alivePlayers().length));
+  }
+
+  createPetition(p, rawText) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (this.mutedFor(p)) return { ok: false, error: `ЖЭК запретил вам писать ещё ${this.mutedFor(p)} мин.` };
+    if (!this.nearTo(p, (o) => o.type === 'board')) return { ok: false, error: 'Заявления пишут у доски объявлений.' };
+    const text = sanitizeText(rawText, 300);
+    if (!text || text.length < 10) return { ok: false, error: 'Опишите, на что жалуетесь (хотя бы пару слов).' };
+    if (this.state.petitions.some((x) => x.status === 'open' && x.authorId === p.id)) return { ok: false, error: 'У вас уже есть заявление, которое собирает подписи.' };
+    const floor = p.location.floor;
+    if (this.state.petitions.filter((x) => x.status === 'open' && x.floor === floor).length >= 3) return { ok: false, error: 'На доске уже три заявления — подпишите одно из них.' };
+    const pet = { id: newId('j'), floor, text, authorId: p.id, authorName: p.name, signers: [{ id: p.id, name: p.name, apt: p.apartment.number }], status: 'open', createdAt: this.now() };
+    this.state.petitions.push(pet);
+    this.log(`${p.name} вывесил коллективное заявление на ${floor} этаже: «${text}»`, 'petition', p.id);
+    this.checkPetition(pet);
+    return { ok: true, message: `Заявление на доске. Нужно подписей: ${this.petitionsNeeded()}.` };
+  }
+
+  signPetition(p, id) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (!this.nearTo(p, (o) => o.type === 'board')) return { ok: false, error: 'Подписывают у доски объявлений.' };
+    const pet = this.state.petitions.find((x) => x.id === id);
+    if (!pet || pet.floor !== p.location.floor) return { ok: false, error: 'Такого заявления здесь нет.' };
+    if (pet.status !== 'open') return { ok: false, error: 'Подписи уже не собирают.' };
+    if (pet.signers.some((x) => x.id === p.id)) return { ok: false, error: 'Вы уже подписали.' };
+    pet.signers.push({ id: p.id, name: p.name, apt: p.apartment.number });
+    this.log(`${p.name} подписал заявление «${pet.text}»`, 'petition', p.id);
+    this.checkPetition(pet);
+    return { ok: true, message: pet.status === 'sent' ? 'Подписей хватило — заявление ушло в ЖЭК.' : 'Подписано.' };
+  }
+
+  checkPetition(pet) {
+    if (pet.status !== 'open' || pet.signers.length < this.petitionsNeeded()) return;
+    pet.status = 'sent';
+    pet.sentAt = this.now();
+    const signers = pet.signers.map((x) => this.getPlayer(x.id)).filter((q) => q && q.alive);
+    this.notify(signers, { title: 'Заявление ушло в ЖЭК', text: `«${pet.text}». Подписей: ${pet.signers.length}. Ждите ответа.`, style: 'announce' });
+    this.log(`Коллективное заявление в ЖЭК (${pet.floor} этаж, подписей ${pet.signers.length}): «${pet.text}» — ${pet.signers.map((x) => x.name).join(', ')}`, 'petition');
+  }
+
+  expirePetitions(now) {
+    for (const pet of this.state.petitions) if (pet.status === 'open' && now - pet.createdAt > B.petitionTtlH * 3600 * 1000) pet.status = 'expired';
+    this.state.petitions = this.state.petitions.filter((x) => ['open', 'sent'].includes(x.status) || now - (x.resolvedAt || x.createdAt) < 24 * 3600 * 1000).slice(-50);
+  }
+
+  petitionView(pet, p) {
+    return {
+      id: pet.id,
+      text: pet.text,
+      author: pet.authorName,
+      signers: pet.signers.map((x) => `${x.name} (${x.apt})`),
+      count: pet.signers.length,
+      needed: this.petitionsNeeded(),
+      status: pet.status,
+      reply: pet.reply || null,
+      signed: p ? pet.signers.some((x) => x.id === p.id) : false,
+    };
+  }
+
+  // =========================================================================
+  // Старший по этажу
+  // =========================================================================
+  floorResidents(floor) {
+    return this.alivePlayers().filter((q) => q.apartment.floor === floor);
+  }
+
+  /** Старший — за кого проголосовало не меньше половины жильцов этажа. */
+  elderOf(floor) {
+    const rec = this.state.elders[floor];
+    if (!rec) return null;
+    const residents = this.floorResidents(floor);
+    const ids = new Set(residents.map((q) => q.id));
+    const tally = new Map();
+    for (const [voter, cand] of Object.entries(rec.votes || {})) {
+      if (!ids.has(voter) || !ids.has(cand)) continue;
+      tally.set(cand, (tally.get(cand) || 0) + 1);
+    }
+    const need = Math.max(1, Math.ceil(residents.length / 2));
+    let best = null;
+    for (const [cand, n] of tally) if (n >= need && (!best || n > best.n)) best = { id: cand, n };
+    return best ? this.getPlayer(best.id) : null;
+  }
+
+  voteElder(p, candidateId) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (!this.nearTo(p, (o) => o.type === 'board') || p.location.floor !== p.apartment.floor) return { ok: false, error: 'Голосуют у доски своего этажа.' };
+    const c = this.getPlayer(candidateId);
+    if (!c || !c.alive || c.apartment.floor !== p.apartment.floor) return { ok: false, error: 'Выбирать можно только жильца своего этажа.' };
+    const floor = p.apartment.floor;
+    const before = this.elderOf(floor);
+    this.state.elders[floor] = this.state.elders[floor] || { votes: {} };
+    this.state.elders[floor].votes[p.id] = c.id;
+    const after = this.elderOf(floor);
+    if (after && (!before || before.id !== after.id)) {
+      this.notify(this.floorResidents(floor), { title: 'Старший по этажу', text: `Этаж ${floor} выбрал старшего: ${after.name} (кв. ${after.apartment.number}).`, style: 'announce' });
+      this.log(`Старший по ${floor} этажу: ${after.name}`, 'social', after.id);
+    }
+    return { ok: true, message: `Ваш голос — за ${c.name}.` };
+  }
+
+  /** Старшему звонят из ЖЭК: туман из расписания придёт на его этаж через несколько минут. Делиться ли — решает он. */
+  elderWarnings(now) {
+    for (const e of this.state.schedule) {
+      if (e.cmd !== 'fog' || e.elderWarnedAt === e.at || e.at <= now || e.at - now > B.elderLeadMin * 60000) continue;
+      e.elderWarnedAt = e.at;
+      const a = toInt(e.args && e.args.from, C.BUILDING.firstResidentialFloor);
+      const b = toInt(e.args && e.args.to, a);
+      const warn = Math.max(0, Number(e.args && e.args.warnSec) || 30);
+      for (const floor of Object.keys(this.state.elders).map(Number)) {
+        if (floor < Math.min(a, b) || floor > Math.max(a, b)) continue;
+        const elder = this.elderOf(floor);
+        if (!elder) continue;
+        const mins = Math.max(1, Math.round((e.at - now + warn * 1000) / 60000));
+        this.notify([elder], { title: 'Звонок из ЖЭК', text: `Только для старшего по этажу: примерно через ${mins} мин на этажи ${Math.min(a, b)}–${Math.max(a, b)} придёт туман. Сирены пока не будет. Сказать ли соседям — решать вам.`, style: 'whisper' });
+        this.log(`Старшему ${elder.name} (${floor} этаж) позвонили о тумане заранее`, 'social', elder.id);
+      }
+    }
+  }
+
+  // =========================================================================
+  // Долговые расписки
+  // =========================================================================
+  gameDay() {
+    return Math.floor(this.world.gameMinutes / 1440) + 1;
+  }
+
+  iouOverdue(iou) {
+    return iou.status === 'open' && this.gameDay() > iou.dueDay;
+  }
+
+  iouView(iou) {
+    const debtor = this.getPlayer(iou.debtorId);
+    const holder = this.getPlayer(iou.holderId);
+    return {
+      id: iou.id,
+      debtorId: iou.debtorId,
+      debtor: debtor ? `${debtor.name} (кв. ${debtor.apartment.number})` : '?',
+      holder: holder ? `${holder.name} (кв. ${holder.apartment.number})` : '?',
+      what: this.bundleText(iou.bundle),
+      dueDay: iou.dueDay,
+      overdue: this.iouOverdue(iou),
+    };
+  }
+
+  /** Вернуть долг тому, у кого сейчас расписка. Можно откуда угодно — расписку несут ЖЭК-почтой. */
+  repayIou(p, id) {
+    const iou = this.state.ious.find((x) => x.id === id && x.status === 'open');
+    if (!iou || iou.debtorId !== p.id) return { ok: false, error: 'Такой расписки за вами нет.' };
+    const holder = this.getPlayer(iou.holderId);
+    if (!holder || !holder.alive) return { ok: false, error: 'Держателя расписки больше нет.' };
+    if (!this.hasBundle(p, iou.bundle)) return { ok: false, error: 'Нечем отдавать.' };
+    this.moveBundle(p, holder, iou.bundle);
+    iou.status = 'paid';
+    iou.closedAt = this.now();
+    const what = this.bundleText(iou.bundle);
+    this.journal(p, `Вы вернули долг ${holder.name}: ${what}.`, 'good');
+    this.notify([holder], { title: 'Долг возвращён', text: `${p.name} вернул по расписке: ${what}.`, style: 'good' });
+    this.log(`${p.name} вернул долг ${holder.name}: ${what}`, 'trade', p.id);
+    this.dirty([p.id, holder.id]);
+    return { ok: true, message: 'Долг возвращён.' };
+  }
+
+  /** Передать (перепродать) расписку соседу рядом: теперь долг отдают ему. */
+  transferIou(p, id, toId) {
+    const iou = this.state.ious.find((x) => x.id === id && x.status === 'open');
+    if (!iou || iou.holderId !== p.id) return { ok: false, error: 'Такой расписки у вас нет.' };
+    const q = this.getPlayer(toId);
+    if (!q || !q.alive || q.id === p.id || this.locationKey(q) !== this.locationKey(p) || this.distance(p, q) > 3) return { ok: false, error: 'Передать можно только соседу рядом.' };
+    if (q.id === iou.debtorId) return { ok: false, error: 'Отдать расписку самому должнику — значит простить долг.' };
+    iou.holderId = q.id;
+    const debtor = this.getPlayer(iou.debtorId);
+    this.journal(p, `Вы передали расписку ${debtor ? debtor.name : ''} жильцу ${q.name}.`);
+    this.notify([q], { title: 'Расписка', text: `Вам передали расписку (от ${p.name}): долг ${debtor ? debtor.name : '?'} — ${this.bundleText(iou.bundle)} до дня ${iou.dueDay}.`, style: 'info' });
+    if (debtor) this.notify([debtor], { title: 'Ваш долг перепродан', text: `Теперь долг нужно вернуть жильцу ${q.name}: ${this.bundleText(iou.bundle)}.`, style: 'warn' });
+    this.log(`${p.name} передал расписку (${debtor ? debtor.name : '?'}) жильцу ${q.name}`, 'trade', p.id);
+    this.dirty([p.id, q.id]);
+    return { ok: true, message: 'Расписка передана.' };
+  }
+
+  forgiveIou(p, id) {
+    const iou = this.state.ious.find((x) => x.id === id && x.status === 'open');
+    if (!iou || iou.holderId !== p.id) return { ok: false, error: 'Такой расписки у вас нет.' };
+    iou.status = 'forgiven';
+    iou.closedAt = this.now();
+    const debtor = this.getPlayer(iou.debtorId);
+    if (debtor) this.notify([debtor], { title: 'Долг прощён', text: `${p.name} простил вам долг: ${this.bundleText(iou.bundle)}.`, style: 'good' });
+    this.markDeed(p, 'gift');
+    this.log(`${p.name} простил долг ${debtor ? debtor.name : '?'}`, 'trade', p.id);
+    return { ok: true, message: 'Долг прощён.' };
+  }
+
+  /** Погибшие: их расписки закрываются (долги мёртвых не взыскивают, долги перед мёртвыми — тоже). */
+  closeIousOf(p) {
+    for (const iou of this.state.ious) {
+      if (iou.status !== 'open' || (iou.debtorId !== p.id && iou.holderId !== p.id)) continue;
+      iou.status = 'void';
+      iou.closedAt = this.now();
+    }
   }
 
   /** Стена памяти в столовой: кого уже нет. */
@@ -2218,7 +2434,26 @@ class Game extends EventEmitter {
     // разнарядки этого этажа и разнарядки, которые касаются квартиры читающего
     const list = this.state.assignments.filter((a) => (p.location.floor >= a.from && p.location.floor <= a.to) || (p.apartment.floor >= a.from && p.apartment.floor <= a.to));
     const assignments = list.slice(-6).reverse().map((a) => ({ ...this.assignmentView(a, p), closed: !!a.closed }));
-    return { ok: true, notes, pinned, assignments };
+    const floor = p.location.floor;
+    const petitions = this.state.petitions.filter((x) => x.floor === floor).slice(-6).reverse().map((x) => this.petitionView(x, p));
+    // старший и голосование — только у доски своего этажа
+    const own = floor === p.apartment.floor;
+    const elder = this.elderOf(floor);
+    const votes = (this.state.elders[floor] || {}).votes || {};
+    const tally = {};
+    for (const c of Object.values(votes)) tally[c] = (tally[c] || 0) + 1;
+    const elderInfo = {
+      name: elder ? `${elder.name} (кв. ${elder.apartment.number})` : null,
+      canVote: own,
+      myVote: votes[p.id] || null,
+      candidates: own ? this.floorResidents(floor).map((q) => ({ id: q.id, name: q.name, apt: q.apartment.number, votes: tally[q.id] || 0 })) : [],
+      need: Math.max(1, Math.ceil(this.floorResidents(floor).length / 2)),
+    };
+    // книга должников этажа: просроченные расписки жильцов этого этажа
+    const debtors = this.state.ious
+      .filter((x) => this.iouOverdue(x) && (this.getPlayer(x.debtorId) || {}).apartment?.floor === floor)
+      .map((x) => this.iouView(x));
+    return { ok: true, notes, pinned, assignments, petitions, elder: elderInfo, debtors };
   }
 
   /** Кто сейчас стучит к хозяину (если стучали недавно и гость всё ещё у двери). */
@@ -2666,7 +2901,7 @@ class Game extends EventEmitter {
     return parts.join(', ') || 'ничего';
   }
 
-  tradeOffer(p, toId, rawGive, rawWant) {
+  tradeOffer(p, toId, rawGive, rawWant, credit = 0) {
     if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
     const q = this.getPlayer(toId);
     if (!q || !q.alive || q.id === p.id) return { ok: false, error: 'Некому предлагать.' };
@@ -2689,11 +2924,14 @@ class Game extends EventEmitter {
 
     const mine = Object.values(this.state.trades).filter((t) => t.from === p.id);
     if (mine.length >= 5) return { ok: false, error: 'Слишком много открытых предложений.' };
-    const t = { id: newId('t'), from: p.id, to: q.id, give, want, createdAt: this.now() };
+    // «в долг до дня N»: своё отдаю сейчас, ваше — по расписке
+    const days = Math.max(0, Math.min(B.iouMaxDays, toInt(credit, 0)));
+    if (days && this.bundleEmpty(give)) return { ok: false, error: 'В долг — это когда вы даёте сейчас, а вам отдают потом.' };
+    const t = { id: newId('t'), from: p.id, to: q.id, give, want, createdAt: this.now(), credit: days || null };
     this.state.trades[t.id] = t;
     this.notify([q], {
       title: 'Предложение обмена',
-      text: `${p.name} предлагает: ${this.bundleText(give)} — в обмен на: ${this.bundleText(want)}.`,
+      text: `${p.name} предлагает: ${this.bundleText(give)} — в обмен на: ${this.bundleText(want)}${days ? ` (в долг: отдать до дня ${this.gameDay() + days})` : ''}.`,
       style: 'trade',
       journal: false,
     });
@@ -2718,6 +2956,20 @@ class Game extends EventEmitter {
     }
     if (this.distance(a, b) > 3) return { ok: false, error: `Подойдите ближе к ${a.name}.` };
     if (!this.hasBundle(a, t.give)) return { ok: false, error: `У ${a.name} уже нет обещанного.` };
+    if (t.credit) {
+      // в долг: вещи переходят сейчас, а за b остаётся расписка
+      this.moveBundle(a, b, t.give);
+      delete this.state.trades[t.id];
+      const iou = { id: newId('i'), debtorId: b.id, holderId: a.id, bundle: t.want, dueDay: this.gameDay() + t.credit, createdAt: this.now(), status: 'open' };
+      this.state.ious.push(iou);
+      const what = this.bundleText(t.want);
+      this.journal(a, `В долг жильцу ${b.name}: ${this.bundleText(t.give)}. Расписка: вернуть ${what} до дня ${iou.dueDay}.`, 'good');
+      this.journal(b, `Вы взяли в долг у ${a.name}: ${this.bundleText(t.give)}. Вернуть ${what} до дня ${iou.dueDay}.`, 'warn');
+      this.notify([a], { title: 'Расписка', text: `Согласие от ${b.name}: долг вам — ${what} до дня ${iou.dueDay}.`, style: 'good', journal: false });
+      this.log(`Расписка: ${b.name} должен ${a.name} ${what} до дня ${iou.dueDay} (взял ${this.bundleText(t.give)})`, 'trade', a.id);
+      this.dirty([a.id, b.id]);
+      return { ok: true };
+    }
     if (!this.hasBundle(b, t.want)) return { ok: false, error: 'У вас нет того, что просят.' };
     this.moveBundle(a, b, t.give);
     this.moveBundle(b, a, t.want);
@@ -2765,6 +3017,7 @@ class Game extends EventEmitter {
       if (p.lastSaid && this.now() - p.lastSaid.ts < 6 * 3600 * 1000) this.scar(key, 'lastword', p.pos.x + 0.6, p.pos.y + 0.2, { text: p.lastSaid.text, by: p.name });
     }
     this.returnDrops(p.apartment.number, p.name);
+    this.closeIousOf(p);
     this.evictAllGuests(p.apartment.number, p.apartment.floor);
     this.dirty([p.id, ...this.othersAt(p).map((q) => q.id)]);
   }
@@ -2810,6 +3063,17 @@ class Game extends EventEmitter {
         if (!a) return [];
         const inRange = alive.filter((p) => p.apartment.floor >= a.from && p.apartment.floor <= a.to);
         return inRange.filter((p) => !!a.done[p.apartment.number] === (target.type === 'assignmentDone'));
+      }
+      case 'debtors': {
+        const ids = new Set(this.state.ious.filter((x) => this.iouOverdue(x)).map((x) => x.debtorId));
+        return alive.filter((p) => ids.has(p.id));
+      }
+      case 'elders':
+        return Object.keys(this.state.elders).map((f) => this.elderOf(Number(f))).filter(Boolean);
+      case 'petitionSigners': {
+        const pet = this.state.petitions.find((x) => x.id === target.id);
+        const ids = new Set(pet ? pet.signers.map((x) => x.id) : []);
+        return alive.filter((p) => ids.has(p.id));
       }
       case 'generous':
       case 'stingy': {
@@ -3379,6 +3643,27 @@ const ADMIN_COMMANDS = {
     return { ok: true, message: this.isOwnHome(p) ? 'Записка у жильца' : 'Записка ждёт под дверью' };
   },
 
+  /** Ответ ЖЭК на коллективное заявление: выполнить, оставить без ответа или наказать подписавших. */
+  petitionResolve({ id, verdict, reply }) {
+    const pet = this.state.petitions.find((x) => x.id === id);
+    if (!pet || !['open', 'sent'].includes(pet.status)) throw new Error('Такого заявления нет или по нему уже решили');
+    if (!['done', 'ignored', 'punished'].includes(verdict)) throw new Error('Решение — выполнить, игнорировать или наказать');
+    pet.status = verdict;
+    pet.resolvedAt = this.now();
+    pet.reply = sanitizeText(reply, 200) || null;
+    const signers = pet.signers.map((x) => this.getPlayer(x.id)).filter((q) => q && q.alive);
+    if (verdict === 'done') {
+      this.notify(signers, { title: 'Ответ ЖЭК', text: `По заявлению «${pet.text}»: меры приняты.${pet.reply ? ` ${pet.reply}` : ''}`, style: 'good' });
+    } else if (verdict === 'punished') {
+      for (const q of signers) {
+        this.notify([q], { title: 'Ответ ЖЭК', text: `По заявлению «${pet.text}»: кляузы не поощряются.${pet.reply ? ` ${pet.reply}` : ''}`, style: 'danger' });
+        this.applyEffect(q, { sanity: -10, money: -2 }, 'Наказание ЖЭК');
+      }
+    }
+    this.log(`Заявление «${pet.text}»: ${verdict === 'done' ? 'выполнено' : verdict === 'punished' ? 'подписавшие наказаны' : 'без ответа'}`, 'admin');
+    return { ok: true, message: 'Решение принято' };
+  },
+
   /**
    * Разнарядка на этажи (по этажу квартиры): сдать предмет, талоны или отработать смены до срока.
    * kind: 'item' | 'money' | 'shifts'.
@@ -3764,7 +4049,15 @@ Game.prototype.playerView = function playerView(p) {
       })(),
       give: this.bundleText(t.give),
       want: this.bundleText(t.want),
+      creditDay: t.credit ? this.gameDay() + t.credit : null,
     }));
+  // расписки: мои долги и долги мне
+  you.ious = {
+    owe: this.state.ious.filter((x) => x.status === 'open' && x.debtorId === p.id).map((x) => this.iouView(x)),
+    held: this.state.ious.filter((x) => x.status === 'open' && x.holderId === p.id).map((x) => this.iouView(x)),
+  };
+  you.elderOf = this.elderOf(p.apartment.floor)?.id === p.id ? p.apartment.floor : null;
+  you.day = this.gameDay();
 
   return {
     building: C.BUILDING.name,
@@ -3831,12 +4124,13 @@ Game.prototype.describePlace = function describePlace(p) {
       else here.text = `Коридор ${l.floor} этажа. Лампы дневного света гудят и мигают. Пахнет сыростью и чужим ужином.`;
       here.floorKind = kind;
       const residents = [];
+      const elderHere = this.elderOf(l.floor);
       for (let i = 1; i <= C.BUILDING.apartmentsPerFloor; i++) {
         const number = `${l.floor}${String(i).padStart(2, '0')}`;
         const r = this.alivePlayers().find((q) => q.apartment.number === number);
         // недавно погибший: на двери «†», пока квартиру не займут
         const dead = r ? null : this.players().find((q) => !q.alive && q.apartment.number === number && q.diedAt && this.now() - q.diedAt < B.tombstoneMin * 60000);
-        residents.push({ number, name: r ? r.name : dead ? `† ${dead.name}` : null, online: r ? this.isOnline(r.id) : false, you: r?.id === p.id, dead: !!dead, rumor: r ? this.rumor(r) : [] });
+        residents.push({ number, name: r ? r.name : dead ? `† ${dead.name}` : null, online: r ? this.isOnline(r.id) : false, you: r?.id === p.id, dead: !!dead, rumor: r ? this.rumor(r) : [], elder: !!(r && elderHere && elderHere.id === r.id) });
       }
       if (kind === 'residential') here.residents = residents;
       here.lampsOut = this.world.lampsOut[l.floor] || [];
@@ -3912,6 +4206,7 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
     archived: this.state.archive.length,
     director: this.director(),
     assignments: this.state.assignments.map((a) => ({ ...this.assignmentView(a, null), closed: !!a.closed, failed: a.failed || [] })),
+    petitions: this.state.petitions.filter((x) => x.status !== 'expired').map((x) => ({ ...this.petitionView(x, null), floor: x.floor })),
     hazards: Object.entries(this.world.hazards).flatMap(([key, list]) => list.map((hz) => ({ ...hz, scene: key, title: this.sceneTitle(key), name: C.HAZARDS[hz.kind].name }))),
     schedule: this.state.schedule
       .slice()
@@ -3957,6 +4252,8 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       harmsHour: (p.harmLog || []).filter((t) => now - t < 3600 * 1000).length,
       rumor: this.rumor(p),
       deeds: p.deedTotals || {},
+      elder: this.elderOf(p.apartment.floor)?.id === p.id,
+      debts: this.state.ious.filter((x) => x.debtorId === p.id && this.iouOverdue(x)).length,
       goodness: Math.round(this.goodness(p) * 10) / 10,
       ranks: Object.fromEntries(Object.keys(MG.GAMES).map((g) => [g, this.rankOf(p, g)])),
       newbie: this.isNewbie(p),

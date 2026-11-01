@@ -170,3 +170,4 @@ textarea { width: 100%; resize: vertical; min-height: 60px; }
   .event-card .grid4 { grid-template-columns: repeat(2, 1fr); }
 }
 table.players tbody tr.down td { background: rgba(221,90,79,0.14); }
+.admin-log .petition { border-color: #b28a1d; color: #f0d9a0; }

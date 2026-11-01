@@ -451,3 +451,15 @@ body.sanity-critical .place h1 { animation: flicker 2s infinite; }
 .board-notes.assignments b { display: block; color: #8a1d1d; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
 .board-notes.assignments p { margin: 4px 0; }
 .board-notes .tag-ok { color: #2c6b2c; font-weight: 700; font-size: 12px; }
+
+/* Расписки, заявления, старший */
+.ious { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; font-size: 13px; }
+.ious li { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding: 6px; background: var(--panel-2); border-radius: var(--radius); }
+.ious li span { flex: 1 1 100%; }
+.ious li.overdue { border-left: 3px solid var(--red); }
+.trade-modal .credit, .credit { margin-top: 10px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.board-notes li.petition.sent { border-left: 4px solid #b28a1d; }
+.board-notes li.petition.done { border-left: 4px solid #3a7a3a; }
+.board-notes li.petition.punished { border-left: 4px solid #b22; }
+.board-notes li.petition p { margin: 0 0 4px; }
+.elder .actions { flex-wrap: wrap; }

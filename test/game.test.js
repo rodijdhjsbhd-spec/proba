@@ -1746,3 +1746,82 @@ test('разнарядка: сдать у доски за свою кварти�
   assert.ok(game.resolveTargets({ type: 'homeFloors', from: 101, to: 101 }).some((p) => p.id === b.id));
   assert.ok(sid);
 });
+
+test('коллективная жалоба: подписи у доски, уходит в ЖЭК, наказать подписавших', () => {
+  const { game, clock } = makeWorld();
+  const [a, b, c] = ['Иван', 'Мария', 'Пётр'].map((n) => join(game, n));
+  for (const p of [a, b, c]) {
+    game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+    walkTo(game, p, type('board'));
+  }
+  assert.equal(game.createPetition(a, 'мало').ok, false);
+  assert.equal(game.createPetition(a, 'Почините лифт, третий день стоит').ok, true);
+  const pet = game.state.petitions[0];
+  assert.equal(game.signPetition(a, pet.id).ok, false, 'автор уже подписал');
+  game.signPetition(b, pet.id);
+  assert.equal(pet.status, 'open');
+  game.signPetition(c, pet.id);
+  assert.equal(pet.status, 'sent');
+  assert.ok(game.director().hints.some((h) => h.id === `petition:${pet.id}`));
+  assert.equal(game.resolveTargets({ type: 'petitionSigners', id: pet.id }).length, 3);
+  c.money = 5;
+  assert.equal(game.admin('petitionResolve', { id: pet.id, verdict: 'punished', reply: 'Лифт исправен.' }).ok, true);
+  assert.equal(c.money, 3);
+  assert.equal(game.readBoard(a).petitions[0].status, 'punished');
+  assert.equal(game.admin('petitionResolve', { id: pet.id, verdict: 'done' }).ok, false, 'уже решено');
+  clock.t += 1000;
+});
+
+test('старший по этажу: выборы у доски своего этажа и звонок о тумане из расписания', () => {
+  const { game, advance } = makeWorld();
+  const [a, b, c] = ['Иван', 'Мария', 'Пётр'].map((n) => join(game, n));
+  for (const p of [a, b, c]) {
+    game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+    walkTo(game, p, type('board'));
+  }
+  game.voteElder(a, b.id);
+  assert.equal(game.elderOf(101), null, 'нужно не меньше половины (2 из 3)');
+  game.voteElder(c, b.id);
+  assert.equal(game.elderOf(101).id, b.id);
+  assert.equal(game.playerView(b).you.elderOf, 101);
+  assert.ok(game.readBoard(a).elder.name.startsWith('Мария'));
+  const notes = [];
+  game.on('notify', (n) => notes.push(n));
+  game.admin('schedule', { cmd: 'fog', args: { from: 101, to: 102, warnSec: 30, durationMin: 2 }, mode: 'in', value: 5 });
+  advance(60 * 1000);
+  assert.equal(notes.filter((n) => n.title === 'Звонок из ЖЭК').length, 0, 'ещё рано');
+  advance(2 * 60 * 1000 + 1000);
+  const call = notes.filter((n) => n.title === 'Звонок из ЖЭК');
+  assert.equal(call.length, 1);
+  assert.deepEqual(call[0].to, [b.id]);
+  assert.equal(notes.filter((n) => n.title === 'СИРЕНА').length, 0, 'сирены ещё нет');
+});
+
+test('долговая расписка: в долг до дня N, вернуть, передать, просрочка на доске и цель «должники»', () => {
+  const { game, advance } = makeWorld();
+  const [a, b, c] = ['Иван', 'Мария', 'Пётр'].map((n) => join(game, n));
+  for (const p of [a, b, c]) game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  b.pos = { ...a.pos };
+  c.pos = { ...a.pos };
+  game.admin('give', { id: a.id, item: 'stew', count: 1, silent: true });
+  const r = game.tradeOffer(a, b.id, { money: 0, items: { stew: 1 } }, { money: 5, items: {} }, 1);
+  assert.equal(r.ok, true, r.error);
+  assert.equal(game.tradeRespond(b, r.trade, true).ok, true, 'талонов у Марии нет — но в долг можно');
+  assert.equal(b.inventory.stew, 1);
+  const iou = game.state.ious[0];
+  assert.equal(iou.dueDay, game.gameDay() + 1);
+  assert.equal(game.playerView(b).you.ious.owe.length, 1);
+  // Иван перепродаёт расписку Петру
+  assert.equal(game.transferIou(a, iou.id, c.id).ok, true);
+  assert.equal(game.playerView(c).you.ious.held.length, 1);
+  // срок прошёл — должник на доске и в цели (переводим игровые часы, чтобы никто не умер с голоду)
+  game.world.gameMinutes += 2 * 1440;
+  advance(1000);
+  walkTo(game, c, type('board'));
+  assert.equal(game.readBoard(c).debtors.length, 1);
+  assert.deepEqual(game.resolveTargets({ type: 'debtors' }).map((p) => p.id), [b.id]);
+  b.money = 5;
+  assert.equal(game.repayIou(b, iou.id).ok, true);
+  assert.equal(c.money, 5, 'долг ушёл тому, у кого расписка');
+  assert.equal(game.resolveTargets({ type: 'debtors' }).length, 0);
+});

@@ -1010,7 +1010,8 @@
         } else if (o.type === 'apt' && s.residents) {
           const r = s.residents[o.number];
           if (r && r.name) {
-            const label = r.you ? 'ВЫ' : r.name.length > 9 ? `${r.name.slice(0, 8)}…` : r.name;
+            const base = r.you ? 'ВЫ' : r.name.length > 9 ? `${r.name.slice(0, 8)}…` : r.name;
+            const label = r.elder ? `★ ${base}` : base;
             b.rrect(o.x - 0.12, o.y - 1.02, 1.24, 0.28, 0.06, 'rgba(20,20,18,0.8)');
             b.text(label, o.x + 0.5, o.y - 0.875, 0.19, r.you ? '#e3a13b' : r.dead ? '#d79a92' : r.online ? '#cfe9c8' : '#a8a597');
             if (r.dead) {

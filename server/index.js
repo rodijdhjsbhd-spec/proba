@@ -353,6 +353,12 @@ const PLAYER_ACTIONS = {
   search: (p) => game.searchChute(p),
   memorial: (p) => game.memorial(p),
   assignment_submit: (p, a) => game.submitAssignment(p, String(a.id || '')),
+  petition_create: (p, a) => game.createPetition(p, a.text),
+  petition_sign: (p, a) => game.signPetition(p, String(a.id || '')),
+  vote_elder: (p, a) => game.voteElder(p, String(a.candidate || '')),
+  iou_repay: (p, a) => game.repayIou(p, String(a.id || '')),
+  iou_transfer: (p, a) => game.transferIou(p, String(a.id || ''), String(a.to || '')),
+  iou_forgive: (p, a) => game.forgiveIou(p, String(a.id || '')),
   radio_listen: (p) => game.listenRadio(p),
   board: (p) => game.readBoard(p),
   open_door: (p, a) => game.openDoor(p, a.guest),
@@ -382,7 +388,7 @@ const PLAYER_ACTIONS = {
   claim_account: (p, a) => game.claimAccount(p, a.login, a.password),
   report: (p, a) => game.report(p, String(a.id || '')),
   chat: (p, a) => game.chat(p, a.channel === 'global' ? 'global' : 'local', a.text),
-  trade_offer: (p, a) => game.tradeOffer(p, a.to, a.give, a.want),
+  trade_offer: (p, a) => game.tradeOffer(p, a.to, a.give, a.want, a.credit),
   trade_respond: (p, a) => game.tradeRespond(p, a.trade, !!a.accept),
 };
 

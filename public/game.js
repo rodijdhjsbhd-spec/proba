@@ -891,8 +891,58 @@
           : null,
       ),
     );
+    // коллективные заявления
+    const petText = h('textarea', { maxlength: '300', rows: '2', placeholder: 'Требуем починить лифт: третий день стоит…', 'aria-label': 'Текст заявления' });
+    const statusText = { open: 'собирает подписи', sent: 'ушло в ЖЭК, ждём ответа', done: 'ЖЭК: меры приняты', ignored: 'ЖЭК не ответил', punished: 'ЖЭК наказал подписавших', expired: 'не набрало подписей' };
+    const petitions = h(
+      'div',
+      { class: 'petitions' },
+      h('h4', { class: 'board-h', text: 'Коллективные заявления в ЖЭК' }),
+      (res.petitions || []).length
+        ? h(
+            'ul',
+            { class: 'board-notes' },
+            res.petitions.map((x) =>
+              h(
+                'li',
+                { class: `petition ${x.status}` },
+                h('p', { text: `«${x.text}»` }),
+                h('small', { text: `${statusText[x.status] || x.status} · подписи ${x.count}/${x.needed}: ${x.signers.join(', ')}${x.reply ? ` · ответ: ${x.reply}` : ''}` }),
+                x.status === 'open' && !x.signed ? h('button', { class: 'btn small', type: 'button', text: 'Подписать', onclick: async () => { const r = await act('petition_sign', { id: x.id }); if (r.ok) { say(r.message); openBoard(obj); } } }) : null,
+              ),
+            ),
+          )
+        : h('p', { class: 'note', text: 'Заявлений нет.' }),
+      h(
+        'form',
+        { class: 'pin-form', onsubmit: async (e) => { e.preventDefault(); const r = await act('petition_create', { text: petText.value }); if (r.ok) { say(r.message); openBoard(obj); } } },
+        petText,
+        h('div', { class: 'actions' }, h('button', { class: 'btn small', type: 'submit', text: 'Вывесить заявление' })),
+      ),
+    );
+    // старший по этажу
+    const el = res.elder || {};
+    const elder = h(
+      'div',
+      { class: 'elder' },
+      h('h4', { class: 'board-h', text: 'Старший по этажу' }),
+      h('p', { class: 'note', text: el.name ? `Старший: ${el.name}. Старшему первым звонят из ЖЭК.` : `Старшего нет. Нужно голосов: ${el.need || 1}.` }),
+      el.canVote && (el.candidates || []).length
+        ? h(
+            'div',
+            { class: 'actions' },
+            el.candidates.map((c) => h('button', { class: `btn small${el.myVote === c.id ? ' primary' : ''}`, type: 'button', text: `${c.name} (${c.apt})${c.votes ? ` · ${c.votes}` : ''}`, onclick: async () => { const r = await act('vote_elder', { candidate: c.id }); if (r.ok) { say(r.message); openBoard(obj); } } })),
+          )
+        : el.canVote
+          ? null
+          : h('p', { class: 'note', text: 'Голосовать можно у доски своего этажа.' }),
+    );
+    const debtors = (res.debtors || []).length
+      ? h('div', { class: 'debtors' }, h('h4', { class: 'board-h', text: 'Книга должников этажа' }), h('ul', { class: 'board-notes' }, res.debtors.map((d) => h('li', null, `Должник: ${d.debtor}. Кому: ${d.holder}. Долг: ${d.what} — срок вышел (день ${d.dueDay})`))))
+      : null;
     body.replaceChildren(
       ...(assignments.length ? [h('ul', { class: 'board-notes assignments' }, assignments)] : []),
+      ...(debtors ? [debtors] : []),
       h('h4', { class: 'board-h', text: 'Листки жильцов' }),
       res.pinned.length
         ? h('ul', { class: 'board-notes pinned' }, res.pinned.map((n) => h('li', { class: n.mine ? 'mine' : '' }, h('small', { text: `${n.name}, кв. ${n.apt} · ${new Date(n.ts).toLocaleString('ru-RU')}` }), n.text)))
@@ -919,6 +969,8 @@
         ),
         h('p', { class: 'note', text: 'У жильца один листок на весь дом. Через 12 часов его снимают.' }),
       ),
+      petitions,
+      elder,
       h('h4', { class: 'board-h', text: 'Объявления ЖЭК' }),
       res.notes.length
         ? h('ul', { class: 'board-notes' }, res.notes.map((n) => h('li', null, h('small', { text: `${n.from} · ${new Date(n.ts).toLocaleString('ru-RU')}` }), n.text)))
@@ -1151,6 +1203,8 @@
     radioSignals(v);
     memo('stats', [you.stats, you.conditions.map((c) => [c.id, c.remainingSec == null ? null : Math.ceil(c.remainingSec / 10)])], () => renderStats(you));
     memo('inv', [you.inventory, you.gasmaskCharge, you.flashCharge], () => renderInventory(you));
+    renderIous(v);
+    $('#who-apt').textContent = `кв. ${you.apartment.number}${you.elderOf ? ' · ★ старший' : ''}`;
     memo('skills', you.skills, () => {
       $('#skills').replaceChildren(
         ...you.skills.map((k) =>
@@ -1266,6 +1320,36 @@
     );
   }
 
+  /** Расписки: мои долги и долги мне. Панель видна, только если они есть. */
+  function renderIous(v) {
+    const you = v.you;
+    const owe = (you.ious && you.ious.owe) || [];
+    const held = (you.ious && you.ious.held) || [];
+    $('#iou-panel').hidden = !owe.length && !held.length;
+    const people = v.here.people.filter((q) => !q.away);
+    memo('ious', [owe, held, people.map((q) => q.id)], () => {
+      $('#ious').replaceChildren(
+        ...owe.map((x) =>
+          h(
+            'li',
+            { class: x.overdue ? 'overdue' : '' },
+            h('span', { text: `Вы должны ${x.holder}: ${x.what} — до дня ${x.dueDay}${x.overdue ? ' · ПРОСРОЧЕНО' : ''}` }),
+            h('button', { class: 'btn small primary', text: 'Вернуть', onclick: async () => { const r = await act('iou_repay', { id: x.id }); if (r.ok) say(r.message); } }),
+          ),
+        ),
+        ...held.map((x) =>
+          h(
+            'li',
+            { class: x.overdue ? 'overdue' : '' },
+            h('span', { text: `Долг вам от ${x.debtor}: ${x.what} — до дня ${x.dueDay}${x.overdue ? ' · просрочено' : ''}` }),
+            h('button', { class: 'btn small', text: 'Простить', onclick: async () => { if (confirm('Простить долг?')) { const r = await act('iou_forgive', { id: x.id }); if (r.ok) say(r.message); } } }),
+            ...people.filter((q) => q.id !== x.debtorId).map((q) => h('button', { class: 'btn small', text: `Передать: ${q.name}`, onclick: async () => { const r = await act('iou_transfer', { id: x.id, to: q.id }); if (r.ok) say(r.message); } })),
+          ),
+        ),
+      );
+    });
+  }
+
   function renderInventory(you) {
     const inv = $('#inventory');
     if (!you.inventory.length) {
@@ -1326,8 +1410,8 @@
           'div',
           { class: 'trade' },
           t.incoming
-            ? `${t.other ? t.other.name : '?'} предлагает: ${t.give} — в обмен на: ${t.want}`
-            : `Вы предложили ${t.other ? t.other.name : '?'}: ${t.give} — за: ${t.want}`,
+            ? `${t.other ? t.other.name : '?'} предлагает: ${t.give} — в обмен на: ${t.want}${t.creditDay ? ` (в долг, отдать до дня ${t.creditDay})` : ''}`
+            : `Вы предложили ${t.other ? t.other.name : '?'}: ${t.give} — за: ${t.want}${t.creditDay ? ` (в долг до дня ${t.creditDay})` : ''}`,
           h(
             'div',
             { class: 'actions' },
@@ -1673,6 +1757,9 @@
     const giveItems = you.inventory.map((it) => [it.id, num(it.count), it]);
     const wantMoney = num(999);
     const wantItems = Object.entries(S.catalog).map(([id, name]) => [id, num(99), { name }]);
+    // «в долг»: своё отдаю сейчас, взамен — расписка
+    const credit = h('input', { type: 'checkbox' });
+    const creditDays = h('select', null, [1, 2, 3, 5, 7].map((d) => h('option', { value: String(d), text: String((you.day || 1) + d) })));
 
     const body = h(
       'div',
@@ -1690,6 +1777,7 @@
         ),
         h('div', null, h('h4', { text: 'Прошу взамен' }), h('label', null, 'Талоны', wantMoney), wantItems.map(([, input, it]) => h('label', null, it.name, input))),
       ),
+      h('label', { class: 'check credit' }, credit, ' в долг: пусть отдаст до дня ', creditDays, h('small', { text: ` (сегодня день ${you.day || '?'})` })),
     );
     const collect = (money, items) => ({
       money: parseInt(money.value, 10) || 0,
@@ -1711,7 +1799,7 @@
           label: 'Предложить обмен',
           primary: true,
           onClick: async () => {
-            const res = await act('trade_offer', { to: person.id, give: collect(giveMoney, giveItems), want: collect(wantMoney, wantItems) });
+            const res = await act('trade_offer', { to: person.id, give: collect(giveMoney, giveItems), want: collect(wantMoney, wantItems), credit: credit.checked ? Number(creditDays.value) : 0 });
             if (res.ok && !res.gift) toast({ title: 'Предложение отправлено', text: `Ждём ответа от ${person.name}.`, style: 'trade' });
             return res.ok;
           },
