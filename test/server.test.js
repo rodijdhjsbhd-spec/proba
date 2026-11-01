@@ -10,19 +10,33 @@ const path = require('node:path');
 const http = require('node:http');
 const WebSocket = require('ws');
 
-const PORT = 3900 + Math.floor(Math.random() * 90);
-const BASE = `http://127.0.0.1:${PORT}`;
+let PORT;
+let BASE;
 let proc;
 let dir;
 
+/** Свободный порт: спросить у системы, а не угадывать (рядом могут работать другие серверы). */
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = require('node:net').createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
 test.before(async () => {
+  PORT = await freePort();
+  BASE = `http://127.0.0.1:${PORT}`;
   dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gh-'));
   proc = spawn(process.execPath, [path.join(__dirname, '..', 'server', 'index.js')], {
     env: { ...process.env, PORT: String(PORT), HOST: '127.0.0.1', ADMIN_PASSWORD: 'pw-test', DATA_FILE: path.join(dir, 'world.json'), REGISTER_LIMIT: '0' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   await new Promise((resolve, reject) => {
-    const t = setTimeout(() => reject(new Error('сервер не запустился')), 8000);
+    const t = setTimeout(() => reject(new Error('сервер не запустился')), 15000);
     proc.stdout.on('data', (d) => {
       if (String(d).includes('запущена')) {
         clearTimeout(t);
@@ -116,4 +130,34 @@ test('Пульт: снимок изменениями и id ответа не з
   assert.equal(res.ok, true);
   pl.close();
   ad.close();
+});
+
+test('PWA и пуши: манифест, service worker, ключ в приветствии, подписка только на пуш-службы', async () => {
+  const man = await get('/manifest.webmanifest');
+  assert.equal(man.status, 200);
+  assert.match(man.headers['content-type'], /manifest\+json/);
+  assert.equal(JSON.parse(man.body).start_url, '/');
+  const sw = await get('/sw.js');
+  assert.equal(sw.status, 200);
+  assert.match(sw.body, /addEventListener\('push'/);
+  assert.equal((await get('/offline.html')).status, 200);
+  assert.equal((await get('/icons/icon-192.png')).status, 200);
+  // ключ VAPID создан рядом с миром и пришёл жильцу
+  assert.ok(fs.existsSync(path.join(dir, 'vapid.json')));
+  const pl = await open('/ws');
+  pl.send(JSON.stringify({ t: 'hello' }));
+  pl.send(JSON.stringify({ t: 'register', name: 'Пушкин', login: 'pushkin', password: 'secret12' }));
+  const welcome = await pl.next((m) => m.t === 'welcome');
+  assert.equal(Buffer.from(welcome.push, 'base64url').length, 65);
+  const keys = { p256dh: Buffer.concat([Buffer.from([4]), Buffer.alloc(64, 7)]).toString('base64url'), auth: Buffer.alloc(16, 1).toString('base64url') };
+  pl.send(JSON.stringify({ t: 'act', id: 1, action: 'push_subscribe', args: { sub: { endpoint: 'https://127.0.0.1:9/steal', keys } } }));
+  const bad = await pl.next((m) => m.t === 'res' && m.id === 1);
+  assert.equal(bad.ok, false);
+  pl.send(JSON.stringify({ t: 'act', id: 2, action: 'push_subscribe', args: { sub: { endpoint: 'https://fcm.googleapis.com/fcm/send/test', keys } } }));
+  assert.equal((await pl.next((m) => m.t === 'res' && m.id === 2)).ok, true);
+  const view = await pl.next((m) => m.t === 'view' && m.view.you.push && m.view.you.push.length === 1);
+  assert.equal(view.view.you.push[0], 'https://fcm.googleapis.com/fcm/send/test');
+  pl.send(JSON.stringify({ t: 'act', id: 3, action: 'push_unsubscribe', args: { endpoint: 'https://fcm.googleapis.com/fcm/send/test' } }));
+  assert.equal((await pl.next((m) => m.t === 'res' && m.id === 3)).ok, true);
+  pl.close();
 });

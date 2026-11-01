@@ -19,6 +19,11 @@ const World = require('../public/shared/world.js');
 
 const B = C.BALANCE;
 const STAT_KEYS = ['health', 'hunger', 'energy', 'sanity'];
+// какие уведомления дублировать пушем тем, кто не в сети; 'urgent' — срочные (телефон звонит громче)
+const PUSH_STYLES = { siren: 'urgent', fog: 'urgent', danger: 'urgent', death: 'urgent', knock: 'normal', whisper: 'normal', announce: 'normal' };
+const PUSH_TAG_GAP_MS = 10 * 60000;
+const PUSH_URGENT_GAP_MS = 30000;
+const PUSH_PER_HOUR = 12;
 const STAT_NAMES = { health: 'Здоровье', hunger: 'Сытость', energy: 'Силы', sanity: 'Рассудок' };
 const MOVE_PLACES = ['home', 'corridor', 'canteen', 'medpost', 'factory'];
 
@@ -166,6 +171,7 @@ class Game extends EventEmitter {
     if (this.world.lastDay == null) this.world.lastDay = Math.floor(this.world.gameMinutes / 1440); // первая полночь — впереди
     this.lastKnock = new Map();
     this.knocks = new Map(); // хозяин → кто стучит { guestId, ts }
+    this.pushLimits = new Map(); // жилец → { tag: ts, hour: [ts…] } — чтобы не завалить телефон
     this.groupSince = new Map(); // сцена → с какого момента там собралось 3+ жильцов (для режиссёра)
     this.refusals = new Map(); // гость → кто не открыл ему в туман или выставил { apt, owner, ts, kind }
     this.unsealedBy = new Map(); // кв. → гость, который открыл чужую гермодверь
@@ -553,12 +559,56 @@ class Game extends EventEmitter {
     if (p.journal.length > 40) p.journal.splice(0, p.journal.length - 40);
   }
 
-  /** Уведомление (всплывашка) + запись в личный журнал. */
-  notify(players, { title, text, style = 'info', journal = true, action = null, ask = null }) {
+  /** Уведомление (всплывашка) + запись в личный журнал. Важное уходит пушем тем, кто не в сети. */
+  notify(players, { title, text, style = 'info', journal = true, action = null, ask = null, push = true }) {
     const list = players.filter(Boolean);
     for (const p of list) if (journal) this.journal(p, title ? `${title}. ${text}` : text, style);
     this.emit('notify', { to: list.map((p) => p.id), title, text, style, action, ask });
+    if (push && PUSH_STYLES[style]) for (const p of list) this.pushOffline(p, { title: title || 'ЖЭК', body: ask ? ask.question : text, tag: style, urgent: PUSH_STYLES[style] === 'urgent' });
     this.dirty(list.map((p) => p.id));
+  }
+
+  // =========================================================================
+  // Пуш-уведомления: телефон жильца, который сейчас не в игре
+  // =========================================================================
+  /** Подписка браузера (уже проверенная сервером): не больше трёх устройств на жильца. */
+  pushSubscribe(p, sub) {
+    if (!sub || !sub.endpoint) return { ok: false, error: 'Пустая подписка.' };
+    // одно устройство — один жилец: если в браузере сменился жилец, старому пуши больше не идут
+    for (const q of Object.values(this.state.players)) if (q.push && q.id !== p.id) q.push = q.push.filter((s) => s.endpoint !== sub.endpoint);
+    p.push = [...(p.push || []).filter((s) => s.endpoint !== sub.endpoint), { endpoint: sub.endpoint, keys: sub.keys, at: this.now() }].slice(-3);
+    this.dirty([p.id]);
+    return { ok: true, message: 'Телефон привязан: ЖЭК сообщит о важном, когда вас нет в игре.' };
+  }
+
+  pushUnsubscribe(p, endpoint) {
+    const before = (p.push || []).length;
+    p.push = (p.push || []).filter((s) => s.endpoint !== String(endpoint || ''));
+    if (p.push.length !== before) this.dirty([p.id]);
+    return { ok: true, message: 'Уведомления на это устройство отключены.' };
+  }
+
+  /** Подписка умерла (служба ответила 404/410) — забыть её у всех. */
+  pushGone(endpoint) {
+    for (const q of Object.values(this.state.players)) if (q.push && q.push.some((s) => s.endpoint === endpoint)) q.push = q.push.filter((s) => s.endpoint !== endpoint);
+  }
+
+  /**
+   * Пуш жильцу, которого нет в игре. Лимиты: один пуш на тему за PUSH_TAG_GAP (срочные — чаще),
+   * не больше PUSH_PER_HOUR в час. Сама отправка — в server/index.js (событие 'push').
+   */
+  pushOffline(p, { title, body, tag = 'zhek', urgent = false }) {
+    if (!p || !p.push || !p.push.length || this.isOnline(p.id)) return false;
+    const now = this.now();
+    const lim = this.pushLimits.get(p.id) || { tags: {}, hour: [] };
+    lim.hour = lim.hour.filter((t) => now - t < 3600000);
+    const gap = urgent ? PUSH_URGENT_GAP_MS : PUSH_TAG_GAP_MS;
+    if (now - (lim.tags[tag] || 0) < gap || lim.hour.length >= PUSH_PER_HOUR) return false;
+    lim.tags[tag] = now;
+    lim.hour.push(now);
+    this.pushLimits.set(p.id, lim);
+    this.emit('push', { to: p.id, title: String(title).slice(0, 80), body: String(body || '').slice(0, 240), tag, urgent: !!urgent });
+    return true;
   }
 
   systemChat(text) {
@@ -1039,6 +1089,10 @@ class Game extends EventEmitter {
     this.byToken.set(token, id);
     if (account) this.linkAccount(p, account);
     if (heirOf) this.inherit(p, heirOf);
+    if (heirOf && heirOf.push && heirOf.push.length) {
+      p.push = heirOf.push;
+      heirOf.push = [];
+    }
     this.journal(p, `Ордер на заселение получен. Ваша квартира — №${apartment.number}, ${apartment.floor} этаж. Голые стены, кровать и радиоточка.`);
     this.journal(p, `Еда стоит талонов. Талоны дают за смену в цеху (${C.FACILITIES.factory.floor} этаж). Столовая — на ${C.FACILITIES.canteen.floor} этаже.`);
     this.log(`Заселился новый жилец: ${name}, кв. ${apartment.number}`, 'join', id, { public: `заселился ${name} в кв. ${apartment.number}` });
@@ -3260,6 +3314,7 @@ class Game extends EventEmitter {
     if (owner && !this.isOnline(owner.id) && owner.absence) {
       owner.absence.knocks.push({ name: p.name, apt: p.apartment.number, ts: now });
       if (owner.absence.knocks.length > 20) owner.absence.knocks.shift();
+      this.pushOffline(owner, { title: 'Стук в дверь', body: `В вашу дверь стучит ${p.name} из кв. ${p.apartment.number}.`, tag: 'knock' });
     }
     return { ok: true, message: owner ? 'Тишина. Похоже, хозяина нет дома.' : 'Тишина. Квартира пустует.' };
   }
@@ -3465,6 +3520,7 @@ class Game extends EventEmitter {
     this.state.doorDrops[door.number].push({ id: newId('d'), ts: now, fromId: p.id, fromName: p.name, fromApt: p.apartment.number, ...drop });
     const owner = this.alivePlayers().find((q) => q.apartment.number === door.number);
     if (owner && this.isOnline(owner.id) && this.isOwnHome(owner)) this.collectDrops(owner);
+    else if (owner) this.pushOffline(owner, { title: 'Под дверью', body: drop.kind === 'note' ? `Кто-то подсунул записку под дверь кв. ${door.number}.` : `Под дверью кв. ${door.number} оставили свёрток.`, tag: 'door' });
   }
 
   /** Подсунуть записку под чужую дверь. anon — без подписи (ЖЭК всё равно видит автора). */
@@ -3874,6 +3930,7 @@ class Game extends EventEmitter {
     for (const t of Object.values(this.state.trades)) if (t.from === p.id || t.to === p.id) delete this.state.trades[t.id];
     this.journal(p, `Вы погибли. ${cause}.`, 'death');
     this.emit('notify', { to: [p.id], title: 'Вы погибли', text: cause, style: 'death' });
+    this.pushOffline(p, { title: 'Вы погибли', body: `${p.name}: ${cause}. Квартира ${p.apartment.number} опечатана.`, tag: 'death', urgent: true });
     this.log(`☠ ${p.name} (кв. ${p.apartment.number}): ${cause}`, 'death', p.id, { public: `умер ${p.name} из кв. ${p.apartment.number}` });
     this.systemChat(`Квартира ${p.apartment.number} опечатана. Жилец ${p.name} больше не выйдет на смену.`);
     const refusal = this.refusals.get(p.id);
@@ -4168,7 +4225,24 @@ class Game extends EventEmitter {
       title: 'СИРЕНА',
       text: `Туман идёт на этажи ${f.from}–${f.to}! До прихода ${Math.round(warnSec)} с. Домой, задраить гермодверь!`,
       style: 'siren',
+      push: false,
     });
+    // кто не в игре — получает пуш о своей двери: зайти и задраить можно успеть
+    for (const p of onFloors) {
+      const home = p.location.place === 'home' && this.currentApt(p) === p.apartment.number;
+      const sealed = home && this.doorSealed(p.apartment.number);
+      const inSec = Math.round(warnSec);
+      this.pushOffline(p, {
+        title: 'СИРЕНА',
+        body: sealed
+          ? `Туман идёт на ваш ${p.location.floor} этаж${inSec ? ` через ${inSec} с` : ''}. Гермодверь задраена.`
+          : home
+            ? `На ваш ${p.location.floor} этаж идёт туман${inSec ? ` через ${inSec} с` : ''}, а дверь квартиры открыта!`
+            : `Туман идёт на ${p.location.floor} этаж, а вы не дома${inSec ? `: до прихода ${inSec} с` : ''}.`,
+        tag: 'fog',
+        urgent: !sealed,
+      });
+    }
     this.notify(elsewhere, { title: 'Сирена', text: `Где-то воет сирена: туман на этажах ${f.from}–${f.to}.`, style: 'warn' });
     this.systemChat(`ВНИМАНИЕ! Туман на этажах ${f.from}–${f.to}. Жильцам немедленно укрыться в квартирах.`);
     this.log(`Объявлен туман: этажи ${f.from}–${f.to}, сила ${f.intensity}, ${durationMin} мин`, 'event', null, { public: `туман на этажах ${f.from}–${f.to}` });
@@ -4642,6 +4716,7 @@ const ADMIN_COMMANDS = {
     if (!this.state.doorDrops[apt]) this.state.doorDrops[apt] = [];
     this.state.doorDrops[apt].push({ id: newId('d'), ts: this.now(), fromId: null, fromName: sign || '', fromApt: '—', kind: 'note', text: clean, anon: !sign, byZhek: true });
     if (this.isOnline(p.id) && this.isOwnHome(p)) this.collectDrops(p);
+    else this.pushOffline(p, { title: 'Под дверью', body: `Кто-то подсунул записку под дверь кв. ${apt}.`, tag: 'door' });
     this.log(`Записка под дверь ${p.name}${sign ? ` от «${sign}»` : ' без подписи'}: «${clean}»`, 'admin', p.id);
     return { ok: true, message: this.isOwnHome(p) ? 'Записка у жильца' : 'Записка ждёт под дверью' };
   },
@@ -5390,6 +5465,7 @@ Game.prototype.playerView = function playerView(p) {
     sealed: this.doorSealed(this.currentApt(p) || p.apartment.number),
     sleeping: p.sleeping,
     account: p.account ? (this.state.accounts[p.account] || {}).login || p.account : null,
+    push: (p.push || []).map((s) => s.endpoint),
     mutedMin: this.mutedFor(p),
     obituary: p.alive ? null : this.obituary(p),
     rebirthInSec: p.alive ? 0 : this.rebirthWait(p),
@@ -5671,6 +5747,7 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       rentDebt: p.rentDebt || 0,
       techVisit: (p.techVisits || []).length ? p.techVisits[p.techVisits.length - 1] : null,
       furniture: Object.keys(p.furniture || {}).map((id) => C.ITEMS[id]?.name || id),
+      push: (p.push || []).length,
       suspicious: (p.sameIpGifts || 0) >= 2,
       debts: this.state.ious.filter((x) => x.debtorId === p.id && this.iouOverdue(x)).length,
       goodness: Math.round(this.goodness(p) * 10) / 10,

@@ -2405,3 +2405,96 @@ test('аномалии: лишний этаж, дверь не туда, пет�
   game.admin('anomaly', { kind: 'stairLoop', off: true });
   assert.equal(game.world.anomalies.stairLoop, null);
 });
+
+test('пуши: только тем, кто не в игре и привязал телефон; лимиты; одно устройство — один жилец', () => {
+  const { game, clock } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  const pushes = [];
+  game.on('push', (m) => pushes.push(m));
+  const sub = { endpoint: 'https://fcm.googleapis.com/fcm/send/a1', keys: { p256dh: 'x', auth: 'y' } };
+  assert.equal(game.pushSubscribe(a, sub).ok, true);
+  assert.deepEqual(game.playerView(a).you.push, [sub.endpoint]);
+  // в игре — пушей нет
+  game.admin('whisper', { id: a.id, text: 'Кто-то дышит за стеной' });
+  assert.equal(pushes.length, 0);
+  game.setOnline(a.id, false);
+  game.admin('whisper', { id: a.id, text: 'Кто-то дышит за стеной' });
+  assert.equal(pushes.length, 1);
+  assert.equal(pushes[0].to, a.id);
+  // та же тема чаще раза в 10 минут — молчим; через 10 минут — снова
+  game.admin('whisper', { id: a.id, text: 'Ещё раз' });
+  assert.equal(pushes.length, 1);
+  clock.t += 10 * 60000 + 1000;
+  game.admin('whisper', { id: a.id, text: 'Ещё раз' });
+  assert.equal(pushes.length, 2);
+  // без телефона — ничего
+  game.setOnline(b.id, false);
+  game.admin('whisper', { id: b.id, text: 'тс-с' });
+  assert.equal(pushes.filter((m) => m.to === b.id).length, 0);
+  // телефон перешёл к другому жильцу (вошёл другой паспорт на том же устройстве)
+  game.pushSubscribe(b, sub);
+  assert.deepEqual(a.push, []);
+  assert.equal(b.push.length, 1);
+  game.pushGone(sub.endpoint);
+  assert.deepEqual(b.push, []);
+  // больше трёх устройств не держим
+  for (let i = 0; i < 5; i++) game.pushSubscribe(a, { endpoint: `https://fcm.googleapis.com/fcm/send/d${i}`, keys: {} });
+  assert.deepEqual(a.push.map((s) => s.endpoint.slice(-2)), ['d2', 'd3', 'd4']);
+  assert.equal(game.pushUnsubscribe(a, a.push[0].endpoint).ok, true);
+  assert.equal(a.push.length, 2);
+});
+
+test('пуши: сирена про открытую дверь, стук, записка под дверью, смерть, наследник', () => {
+  const { game, clock } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  const pushes = [];
+  game.on('push', (m) => pushes.push(m));
+  game.pushSubscribe(a, { endpoint: 'https://fcm.googleapis.com/fcm/send/a1', keys: {} });
+  game.setOnline(a.id, false);
+  // туман на этаже Ивана: дверь открыта
+  game.admin('fog', { from: 101, to: 101, warnSec: 30, durationMin: 3 });
+  const siren = pushes.find((m) => m.tag === 'fog');
+  assert.ok(siren && siren.urgent);
+  assert.match(siren.body, /дверь квартиры открыта/);
+  game.admin('fogClear');
+  // стук и записка, пока хозяина нет
+  clock.t += 60000;
+  game.admin('teleport', { id: b.id, place: 'corridor', floor: 101 });
+  walkTo(game, b, (o) => o.type === 'apt' && o.number === a.apartment.number);
+  game.knock(b, a.apartment.number);
+  assert.ok(pushes.some((m) => m.tag === 'knock' && /Мария/.test(m.body)));
+  game.slipNote(b, a.apartment.number, 'Зайди вечером', true);
+  const note = pushes.find((m) => m.tag === 'door');
+  assert.ok(note);
+  assert.doesNotMatch(note.body, /Мария/, 'анонимку не подписываем');
+  // смерть — срочный пуш; телефон переходит к наследнику
+  game.kill(a, 'Погиб в тумане');
+  assert.ok(pushes.some((m) => m.tag === 'death' && m.urgent));
+  clock.t += (C.BALANCE.rebirthDelayMin + 1) * 60000;
+  const heir = game.register('Иван Второй', { predecessor: a }).player;
+  assert.equal(heir.push.length, 1);
+  assert.deepEqual(a.push, []);
+});
+
+test('пуши: задраенная дверь — сирена не срочная; в тумане без дома — предупреждение', () => {
+  const { game } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  const pushes = [];
+  game.on('push', (m) => pushes.push(m));
+  for (const p of [a, b]) {
+    game.pushSubscribe(p, { endpoint: `https://fcm.googleapis.com/fcm/send/${p.id}`, keys: {} });
+    game.setOnline(p.id, false);
+  }
+  game.setDoorSealed(a.apartment.number, true);
+  game.admin('teleport', { id: b.id, place: 'corridor', floor: 101 });
+  game.admin('fog', { from: 101, to: 101, warnSec: 20, durationMin: 3 });
+  const pa = pushes.find((m) => m.to === a.id && m.tag === 'fog');
+  const pb = pushes.find((m) => m.to === b.id && m.tag === 'fog');
+  assert.match(pa.body, /задраена/);
+  assert.equal(pa.urgent, false);
+  assert.match(pb.body, /не дома/);
+  assert.equal(pb.urgent, true);
+});

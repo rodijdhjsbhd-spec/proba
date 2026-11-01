@@ -471,3 +471,86 @@ body.sanity-critical .place h1 { animation: flicker 2s infinite; }
 .honor p { margin: 4px 0; }
 
 .dest-grid .btn.ghost-floor { border-style: dashed; color: #cdbbe6; }
+
+/* =====================================================================
+   Карманный режим: телефон. Параметры — поверх сцены, разделы — шторками снизу.
+   ===================================================================== */
+.hud, .pocket-nav, .pocket-close { display: none; }
+.icon-btn.active { filter: drop-shadow(0 0 4px rgba(227,161,59,.6)); }
+.push-info ul { margin: 6px 0 10px 18px; padding: 0; }
+.push-info .note { margin: 4px 0; }
+
+@media (max-width: 760px) {
+  body { padding-bottom: calc(58px + env(safe-area-inset-bottom)); }
+  .topbar { position: sticky; top: 0; z-index: 20; padding: 6px 12px; padding-top: max(6px, env(safe-area-inset-top)); gap: 2px 10px; }
+  .brand, #online { display: none; }
+  .clock { font-size: 13px; }
+  .money { font-size: 15px; }
+  .layout { display: block; padding: 8px 12px 10px; }
+  .stage-head { gap: 0 10px; }
+  .stage-head h1 { font-size: 18px; }
+  .stage-head .place-text {
+    font-size: 13px; flex-basis: 100%;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .stage { height: max(280px, calc(100dvh - 270px)); margin-top: 6px; }
+  .prompt .btn { min-height: 40px; }
+
+  /* параметры поверх сцены */
+  .hud {
+    display: grid; gap: 3px; position: absolute; top: 8px; left: 8px; z-index: 3; min-width: 118px;
+    padding: 6px 8px; background: rgba(10,11,11,.74); border: 1px solid var(--line); border-radius: var(--radius);
+    font: 11px/1.2 var(--mono); color: var(--text); text-align: left; cursor: pointer;
+  }
+  .hud-row { display: grid; grid-template-columns: 14px 1fr 22px; align-items: center; gap: 5px; }
+  .hud-row .bar { height: 5px; border-width: 0; }
+  .hud-row b { font-weight: 400; text-align: right; }
+  .hud-row.low b { color: var(--red); }
+  .hud-row.low .bar { animation: lowpulse 1.2s infinite; }
+  .hud-cond { color: #ffb3ab; font-size: 11px; }
+
+  /* разделы — шторкой над нижним меню */
+  .col-left, .col-right { display: none; }
+  body[data-pocket="me"] .col-left, body[data-pocket="inv"] .col-left,
+  body[data-pocket="chat"] .col-right, body[data-pocket="log"] .col-right {
+    display: grid; position: fixed; left: 0; right: 0; z-index: 25;
+    bottom: calc(58px + env(safe-area-inset-bottom)); max-height: min(72dvh, calc(100dvh - 120px)); overflow-y: auto;
+    padding: 26px 12px 12px; gap: 10px; background: var(--concrete); border-top: 3px solid var(--amber);
+    border-radius: 10px 10px 0 0; box-shadow: 0 -18px 50px rgba(0,0,0,.6); animation: pocketup .18s ease-out;
+    overscroll-behavior: contain;
+  }
+  body[data-pocket="me"] .col-left > .panel:not([data-pocket~="me"]),
+  body[data-pocket="inv"] .col-left > .panel:not([data-pocket~="inv"]),
+  body[data-pocket="chat"] .col-right > .panel:not([data-pocket~="chat"]),
+  body[data-pocket="log"] .col-right > .panel:not([data-pocket~="log"]) { display: none; }
+  body[data-pocket] .pocket-close {
+    display: block; position: absolute; top: 2px; right: 6px; background: none; border: 0; color: var(--muted);
+    font-size: 18px; padding: 4px 10px; cursor: pointer;
+  }
+  body[data-pocket] .col::before {
+    content: ''; position: absolute; top: 9px; left: 50%; width: 44px; height: 4px; margin-left: -22px;
+    border-radius: 2px; background: var(--line);
+  }
+  body[data-pocket="chat"] .chat-log { height: min(46dvh, 360px); }
+
+  .pocket-nav {
+    display: grid; grid-template-columns: repeat(4, 1fr); position: fixed; left: 0; right: 0; bottom: 0; z-index: 26;
+    background: #121413; border-top: 1px solid var(--line); padding-bottom: env(safe-area-inset-bottom);
+  }
+  .pocket-nav button {
+    position: relative; display: flex; flex-direction: column; align-items: center; gap: 2px; min-height: 56px;
+    padding: 6px 0 8px; background: none; border: 0; color: var(--muted); font-size: 11px; cursor: pointer;
+  }
+  .pocket-nav .ic { font-size: 20px; line-height: 1; filter: grayscale(.6); }
+  .pocket-nav button[aria-pressed="true"] { color: var(--amber); }
+  .pocket-nav button[aria-pressed="true"] .ic { filter: none; }
+  .pocket-nav .dot { position: absolute; top: 6px; left: calc(50% + 10px); width: 8px; height: 8px; border-radius: 50%; background: var(--red); }
+
+  /* панели сцены (лифт, раздача, доска) — снизу во всю ширину */
+  .sheet, .sheet.work { left: 0; right: 0; bottom: 0; transform: none; width: 100%; max-height: 88%; border-radius: 10px 10px 0 0; }
+  .toasts { top: calc(52px + env(safe-area-inset-top)); bottom: auto; left: 12px; right: 12px; width: auto; }
+  .modal { align-items: end; padding: 0; }
+  .modal-card { width: 100%; max-height: 88dvh; border-radius: 10px 10px 0 0; padding: 18px 16px calc(18px + env(safe-area-inset-bottom)); }
+  .modal-actions .btn { min-height: 42px; }
+}
+@keyframes pocketup { from { transform: translateY(24px); opacity: .4; } to { transform: none; opacity: 1; } }

@@ -19,6 +19,10 @@
  *   ADMIN_TRUSTED_IPS — адреса, которые не запирает общая блокировка входа в Пульт
  *   ALLOWED_ORIGINS — через запятую, с каких адресов можно открыть игру (по умолчанию — только с того же
  *                     адреса, что и сервер). Пример: 'https://dom.example.ru,https://www.dom.example.ru'
+ *   PUSH            — off, чтобы выключить пуш-уведомления на телефоны
+ *   VAPID_SUBJECT   — контакт для пуш-служб: mailto:вы@почта или https-адрес сайта
+ *   VAPID_FILE      — где хранить ключ пушей (по умолчанию data/vapid.json рядом с миром)
+ *   PUSH_HOSTS      — через запятую, дополнительные адреса пуш-служб (кроме Google, Mozilla, Apple, Microsoft)
  */
 
 const http = require('http');
@@ -28,6 +32,7 @@ const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 const { Game, WORLD_CONFIG, ROLE_NAMES } = require('./game');
 const storage = require('./storage');
+const Push = require('./push');
 const { BALANCE, ITEMS } = require('./content');
 
 let ITEM_CATALOG = Object.fromEntries(Object.entries(ITEMS).map(([id, it]) => [id, it.name]));
@@ -43,6 +48,8 @@ const HOST = process.env.HOST || undefined; // за прокси — 127.0.0.1, 
 const ADMIN_PASSWORD = resolveAdminPassword();
 // сколько ждать переподключения, прежде чем считать игрока ушедшим
 const OFFLINE_GRACE_MS = Number(process.env.OFFLINE_GRACE_MS) || 20000;
+// пуш-уведомления: ключ VAPID создаётся сам и лежит рядом с миром
+const VAPID = process.env.PUSH === 'off' ? null : Push.loadVapid(process.env.VAPID_FILE || path.join(path.dirname(DATA_FILE), 'vapid.json'), process.env.VAPID_SUBJECT || 'mailto:zhek@localhost');
 
 function resolveAdminPassword() {
   if (process.env.ADMIN_PASSWORD) return process.env.ADMIN_PASSWORD;
@@ -127,6 +134,7 @@ const MIME = {
   '.png': 'image/png',
   '.ico': 'image/x-icon',
   '.json': 'application/json; charset=utf-8',
+  '.webmanifest': 'application/manifest+json; charset=utf-8',
 };
 
 const CSP = [
@@ -245,7 +253,7 @@ function bind(ws, player) {
   socketsByPlayer.get(player.id).add(ws);
   clearTimeout(offlineTimers.get(player.id));
   offlineTimers.delete(player.id);
-  send(ws, { t: 'welcome', id: player.id, token: player.token, catalog: ITEM_CATALOG, world: game.worldConfig(), config: { touchReach: BALANCE.touchReach } });
+  send(ws, { t: 'welcome', id: player.id, token: player.token, catalog: ITEM_CATALOG, world: game.worldConfig(), config: { touchReach: BALANCE.touchReach }, push: VAPID ? VAPID.publicKey : null });
   lastActors.delete(player.id);
   send(ws, { t: 'chat_history', ...game.chatHistory(player) });
   game.setOnline(player.id, true); // после приветствия: квитанция «Пока вас не было» придёт уже в игру
@@ -303,6 +311,22 @@ game.on('dirty', (ids) => {
 game.on('notify', ({ to, title, text, style, action, ask }) => {
   for (const id of to) sendToPlayer(id, { t: 'notify', title, text, style, action, ask });
 });
+
+// ---- пуш на телефон: только тем, у кого сейчас нет открытой игры ----
+async function deliverPush(p, message, { urgent = false, tag = null } = {}) {
+  if (!VAPID) return;
+  for (const sub of [...(p.push || [])]) {
+    const r = await Push.send(VAPID, sub, message, { ttl: urgent ? 900 : 6 * 3600, urgency: urgent ? 'high' : 'normal', topic: tag });
+    if (r === 'gone') game.pushGone(sub.endpoint); // мир сохранится сам по таймеру
+    else if (r === 'error') console.warn('[push] служба не приняла уведомление:', new URL(sub.endpoint).host);
+  }
+}
+game.on('push', ({ to, title, body, tag, urgent }) => {
+  const p = game.getPlayer(to);
+  if (!p || socketsByPlayer.has(to)) return;
+  deliverPush(p, { title, body, tag, url: '/' }, { urgent, tag }).catch((err) => console.error('[push]', err));
+});
+const pushTests = new Map(); // жилец → когда проверял связь
 
 game.on('chat', (msg) => {
   for (const ws of admins) send(ws, { t: 'chat', msg });
@@ -455,6 +479,20 @@ const PLAYER_ACTIONS = {
   work_submit: (p, a) => game.workSubmit(p, a.job, a.answers),
   work_cancel: (p) => game.workCancel(p),
   claim_account: (p, a) => game.claimAccount(p, a.login, a.password),
+  push_subscribe: (p, a) => {
+    if (!VAPID) return { ok: false, error: 'Уведомления на этом сервере выключены.' };
+    const sub = Push.cleanSubscription(a.sub);
+    if (!sub) return { ok: false, error: 'Этот браузер шлёт уведомления через неизвестную службу.' };
+    return game.pushSubscribe(p, sub);
+  },
+  push_unsubscribe: (p, a) => game.pushUnsubscribe(p, a.endpoint),
+  push_test: (p) => {
+    if (!VAPID || !(p.push || []).length) return { ok: false, error: 'Уведомления не включены.' };
+    if (Date.now() - (pushTests.get(p.id) || 0) < 60000) return { ok: false, error: 'Не чаще раза в минуту.' };
+    pushTests.set(p.id, Date.now());
+    deliverPush(p, { title: 'ЖЭК на проводе', body: 'Проверка связи. Так придёт весть о тумане, стуке в дверь и записках, когда вас нет в игре.', tag: 'test', url: '/' }).catch((err) => console.error('[push]', err));
+    return { ok: true, message: 'Проверочное уведомление отправлено.' };
+  },
   report: (p, a) => game.report(p, String(a.id || '')),
   chat: (p, a) => game.chat(p, a.channel === 'global' ? 'global' : 'local', a.text),
   trade_offer: (p, a) => game.tradeOffer(p, a.to, a.give, a.want, a.credit),
@@ -700,7 +738,7 @@ function handleRest(ws, msg) {
     let res;
     try {
       if (!handler) res = { ok: false, error: 'Неизвестное действие' };
-      else if (p.down) res = { ok: false, error: 'Вы без сознания.' };
+      else if (p.down && !msg.action.startsWith('push_')) res = { ok: false, error: 'Вы без сознания.' };
       else res = handler(p, args);
     } catch (err) {
       console.error('[action]', msg.action, err);

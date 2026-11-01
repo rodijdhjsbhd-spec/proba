@@ -177,6 +177,8 @@
         S.config = msg.config || {};
         S.map = World.create(msg.world);
         S.sceneKey = null;
+        S.pushKey = msg.push || null;
+        S.pushSynced = false;
         store.set('gh_token', msg.token);
         $('#register').hidden = true;
         break;
@@ -289,6 +291,10 @@
   }
 
   document.addEventListener('keydown', (e) => {
+    if (e.code === 'Escape' && S.pocket && !isTyping()) {
+      setPocket(null);
+      return;
+    }
     if (e.code === 'Escape' && S.sheet && S.sheet.kind !== 'work') {
       closeSheet();
       return;
@@ -1317,6 +1323,7 @@
     for (const a of you.asks || []) openAsk(a);
     radioSignals(v);
     memo('stats', [you.stats, you.conditions.map((c) => [c.id, c.remainingSec == null ? null : Math.ceil(c.remainingSec / 10)])], () => renderStats(you));
+    memo('push', [you.push, S.pushKey], () => syncPush());
     memo('inv', [you.inventory, you.gasmaskCharge, you.flashCharge, you.furniture, v.here.ownHome], () => renderInventory(you, v));
     renderIous(v);
     $('#who-apt').textContent = `кв. ${you.apartment.number}${you.elderOf ? ' · ★ старший' : ''}`;
@@ -1335,6 +1342,8 @@
     memo('nearby', [v.here.people, v.trades, v.here.ownHome], () => renderNearby(v));
     memo('journal', you.journal.length && you.journal[you.journal.length - 1].ts, () => {
       $('#journal').replaceChildren(...you.journal.slice().reverse().map(journalItem));
+      if (S.journalSeen && S.pocket !== 'log') pocketDot('log', true);
+      S.journalSeen = true;
     });
     renderCaption(v);
     renderSheet();
@@ -1416,7 +1425,28 @@
 
   const STAT_LABELS = { health: 'Здоровье', hunger: 'Сытость', energy: 'Силы', sanity: 'Рассудок' };
 
+  const HUD_ICONS = { health: '❤', hunger: '🍞', energy: '⚡', sanity: '🧠' };
+
+  /** Карманный режим: те же параметры мелко поверх сцены (виден только на телефоне). */
+  function renderHud(you) {
+    const sick = you.conditions;
+    $('#hud').replaceChildren(
+      ...Object.keys(STAT_LABELS).map((k) => {
+        const val = Math.round(you.stats[k]);
+        return h(
+          'span',
+          { class: `hud-row${val <= 20 ? ' low' : ''}`, title: STAT_LABELS[k] },
+          h('span', { text: HUD_ICONS[k] }),
+          h('span', { class: `bar ${k}` }, h('i', { style: `width:${val}%` })),
+          h('b', { text: val }),
+        );
+      }),
+      ...(sick.length ? [h('span', { class: 'hud-cond', text: sick.map((c) => c.name).join(', ') })] : []),
+    );
+  }
+
   function renderStats(you) {
+    renderHud(you);
     $('#stats').replaceChildren(
       ...Object.entries(STAT_LABELS).map(([k, label]) => {
         const val = you.stats[k];
@@ -1649,6 +1679,7 @@
     S.chat[ch].push(msg);
     if (S.chat[ch].length > 120) S.chat[ch].shift();
     if (ch !== S.tab && !(msg.from && msg.from.id && S.ignored.has(msg.from.id))) S.unread[ch]++;
+    if (S.pocket !== 'chat' && !(msg.from && msg.from.id && S.ignored.has(msg.from.id)) && !(S.view && msg.from && msg.from.id === S.view.you.id)) pocketDot('chat', true);
     if (ch === 'local' && msg.from && msg.from.id && !msg.hallucination && !S.ignored.has(msg.from.id)) S.bubbles.set(msg.from.id, { text: msg.text, until: Date.now() + 6000, msgId: msg.id });
     renderChat();
   }
@@ -1785,6 +1816,7 @@
       playTone(80, 1.6, 'sawtooth', 0.12);
       return;
     }
+    vibrate(n.style);
     if (n.style === 'siren') playSiren();
     else if (n.style === 'whisper') playDrone();
     else if (n.style === 'danger' || n.style === 'fog') playTone(110, 0.5, 'square', 0.08);
@@ -2332,8 +2364,161 @@
     requestAnimationFrame(draw);
   }
 
+  // ---------------------------------------------------------------------------
+  // Карманный режим (телефон): шторки разделов, вибрация, PWA и пуш-уведомления
+  // ---------------------------------------------------------------------------
+  /** Открыть раздел шторкой снизу (повторное нажатие — свернуть). */
+  function setPocket(name) {
+    S.pocket = name && name !== S.pocket ? name : null;
+    if (S.pocket) document.body.dataset.pocket = S.pocket;
+    else delete document.body.dataset.pocket;
+    for (const b of document.querySelectorAll('#pocket-nav button')) b.setAttribute('aria-pressed', String(b.dataset.pocket === S.pocket));
+    if (S.pocket) pocketDot(S.pocket, false);
+    if (S.pocket === 'chat') {
+      // открыть ту вкладку, где есть непрочитанное
+      const other = S.tab === 'local' ? 'global' : 'local';
+      if (!S.unread[S.tab] && S.unread[other]) selectTab(other);
+      const log = $('#chat-log');
+      log.scrollTop = log.scrollHeight;
+    }
+  }
+  function pocketDot(name, on) {
+    const dot = document.querySelector(`#pocket-nav button[data-pocket="${name}"] .dot`);
+    if (dot) dot.hidden = !on;
+  }
+  for (const b of document.querySelectorAll('#pocket-nav button')) b.addEventListener('click', () => setPocket(b.dataset.pocket));
+  for (const b of document.querySelectorAll('[data-pocket-close]')) b.addEventListener('click', () => setPocket(null));
+  $('#hud').addEventListener('click', () => setPocket('me'));
+  // тап по сцене сворачивает шторку: ходить важнее
+  $('#view').addEventListener('pointerdown', () => S.pocket && setPocket(null), true);
+
+  const VIBRATION = { siren: [500, 200, 500, 200, 500], knock: [60, 90, 60, 90, 60], danger: [250], fog: [250, 100, 250], death: [800] };
+  function vibrate(style) {
+    if (!VIBRATION[style] || !navigator.vibrate) return;
+    try {
+      navigator.vibrate(VIBRATION[style]);
+    } catch {
+      /* телефон без вибромотора или запрет браузера */
+    }
+  }
+
+  // --- PWA и пуш-уведомления ---
+  const isIos = () => /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const isStandalone = () => window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+  const pushSupported = () => window.isSecureContext && 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+  let swReady = null;
+  if (window.isSecureContext && 'serviceWorker' in navigator) {
+    swReady = navigator.serviceWorker.register('sw.js').catch(() => null);
+    swReady.then(() => syncPush());
+  }
+
+  function keyBytes(b64u) {
+    const s = atob((b64u + '='.repeat((4 - (b64u.length % 4)) % 4)).replace(/-/g, '+').replace(/_/g, '/'));
+    return Uint8Array.from(s, (c) => c.charCodeAt(0));
+  }
+  const sameKey = (buf, b64u) => {
+    if (!buf) return false;
+    const a = new Uint8Array(buf);
+    const b = keyBytes(b64u);
+    return a.length === b.length && a.every((x, i) => x === b[i]);
+  };
+
+  async function deviceSubscription() {
+    if (!swReady || !pushSupported()) return null;
+    const reg = await swReady;
+    if (!reg || !reg.pushManager) return null;
+    try {
+      return await reg.pushManager.getSubscription();
+    } catch {
+      return null;
+    }
+  }
+
+  /** Состояние колокольчика; если браузер уже разрешил уведомления, а сервер не знает это устройство — напомнить ему. */
+  async function syncPush() {
+    const btn = $('#push-toggle');
+    btn.hidden = !S.pushKey;
+    if (!S.pushKey || !S.view) return;
+    const sub = await deviceSubscription();
+    const known = !!(sub && (S.view.you.push || []).includes(sub.endpoint));
+    if (sub && !known && !S.pushSynced && Notification.permission === 'granted' && sameKey(sub.options && sub.options.applicationServerKey, S.pushKey)) {
+      S.pushSynced = true; // один раз за вход: например, на этом телефоне теперь живёт другой жилец
+      act('push_subscribe', { sub: sub.toJSON() }, { quiet: true });
+    }
+    S.pushOn = known;
+    btn.textContent = known ? '🔔' : '🔕';
+    btn.classList.toggle('active', known);
+    btn.title = known ? 'Уведомления на телефон включены' : 'Уведомления на телефон';
+  }
+
+  async function enablePush() {
+    if (!pushSupported()) {
+      return {
+        ok: false,
+        error: isIos() && !isStandalone()
+          ? 'На iPhone уведомления приходят, только если добавить игру на экран «Домой» (Поделиться → На экран «Домой») и открыть её оттуда.'
+          : window.isSecureContext ? 'Этот браузер не умеет пуш-уведомления.' : 'Уведомления работают только по защищённому адресу (https).',
+      };
+    }
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') return { ok: false, error: 'Браузер запретил уведомления. Разрешите их в настройках сайта.' };
+    const reg = (await swReady) || (await navigator.serviceWorker.ready);
+    let sub = await reg.pushManager.getSubscription();
+    // подписка под другой ключ сервера (мир переносили) — оформить заново
+    if (sub && !sameKey(sub.options && sub.options.applicationServerKey, S.pushKey)) {
+      await sub.unsubscribe().catch(() => {});
+      sub = null;
+    }
+    try {
+      if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes(S.pushKey) });
+    } catch {
+      return { ok: false, error: 'Не удалось подписаться: браузер не связался со службой уведомлений.' };
+    }
+    return act('push_subscribe', { sub: sub.toJSON() }, { quiet: true });
+  }
+
+  async function disablePush() {
+    const sub = await deviceSubscription();
+    if (!sub) return { ok: true, message: 'Уведомления выключены.' };
+    const res = await act('push_unsubscribe', { endpoint: sub.endpoint }, { quiet: true });
+    await sub.unsubscribe().catch(() => {});
+    return res;
+  }
+
+  $('#push-toggle').addEventListener('click', () => {
+    const on = !!S.pushOn;
+    const lines = [
+      'Когда вас нет в игре, ЖЭК пришлёт на этот телефон или компьютер:',
+      h('ul', null,
+        h('li', { text: 'сирену и туман на вашем этаже — особенно если дверь квартиры открыта;' }),
+        h('li', { text: 'стук в дверь, записки и свёртки под дверью;' }),
+        h('li', { text: 'шёпот, объявления и вопросы ЖЭК, беду с вами.' }),
+      ),
+      h('p', { class: 'note', text: 'Не чаще раза в 10 минут на одну тему, срочное — сразу. Пока игра открыта, уведомлений нет.' }),
+    ];
+    if (isIos() && !isStandalone()) lines.push(h('p', { class: 'note', text: 'На iPhone: Поделиться → На экран «Домой», затем откройте игру со значка.' }));
+    if (!window.isSecureContext) lines.push(h('p', { class: 'note bad', text: 'Сейчас игра открыта не по https — браузер уведомления не разрешит.' }));
+    const done = (res) => {
+      if (res.ok) toast({ text: res.message || 'Готово.', style: 'good' });
+      else toast({ title: 'Не получилось', text: res.error, style: 'error' });
+      syncPush();
+    };
+    openModal({
+      title: on ? 'Уведомления включены' : 'Уведомления на телефон',
+      body: h('div', { class: 'push-info' }, ...lines),
+      style: 'announce',
+      actions: [
+        ...(on ? [{ label: 'Проверить', onClick: async () => done(await act('push_test', {}, { quiet: true })) }] : []),
+        on
+          ? { label: 'Выключить', onClick: async () => done(await disablePush()) }
+          : { label: 'Включить', primary: true, onClick: async () => done(await enablePush()) },
+        { label: 'Закрыть' },
+      ],
+    });
+  });
+
   // Для автотестов и отладки из консоли (сервер всё равно проверяет каждое действие).
-  window.ghDebug = { S, renderer, walkTo, objectInfo };
+  window.ghDebug = { S, renderer, walkTo, objectInfo, setPocket };
 
   // ---------------------------------------------------------------------------
   connect();

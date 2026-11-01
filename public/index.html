@@ -2,9 +2,17 @@
 <html lang="ru">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>Гигахрущёвка</title>
   <meta name="description" content="Выживание в бесконечном доме">
+  <meta name="theme-color" content="#161817">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Хрущёвка">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=PT+Mono&family=PT+Sans:wght@400;700&family=PT+Sans+Narrow:wght@700&display=swap" rel="stylesheet">
@@ -92,6 +100,7 @@
       </div>
       <div class="top-tools">
         <span class="online" id="online" title="Жильцов в сети"></span>
+        <button class="icon-btn" id="push-toggle" title="Уведомления на телефон" aria-label="Уведомления на телефон" hidden>🔕</button>
         <button class="icon-btn" id="sound-toggle" title="Звук" aria-label="Звук">🔊</button>
       </div>
     </header>
@@ -100,29 +109,30 @@
 
     <main class="layout">
       <aside class="col col-left">
-        <section class="panel tutorial" id="tutorial-panel" hidden>
+        <button class="pocket-close" type="button" data-pocket-close aria-label="Свернуть">✕</button>
+        <section class="panel tutorial" id="tutorial-panel" data-pocket="me" hidden>
           <h2>Памятка новосёла</h2>
           <ol id="tutorial" class="tutorial-list"></ol>
           <button class="btn small" type="button" id="tutorial-hide">Скрыть</button>
         </section>
-        <section class="panel">
+        <section class="panel" data-pocket="me">
           <h2>Самочувствие</h2>
           <div id="stats"></div>
           <ul id="conditions" class="conditions"></ul>
         </section>
-        <section class="panel">
+        <section class="panel" data-pocket="me">
           <h2>Трудовая книжка</h2>
           <ul id="skills" class="skills"></ul>
         </section>
-        <section class="panel">
+        <section class="panel" data-pocket="inv">
           <h2>Карманы</h2>
           <ul id="inventory" class="inventory"></ul>
         </section>
-        <section class="panel" id="iou-panel" hidden>
+        <section class="panel" id="iou-panel" data-pocket="inv" hidden>
           <h2>Расписки</h2>
           <ul id="ious" class="ious"></ul>
         </section>
-        <section class="panel passport" id="passport-panel" hidden>
+        <section class="panel passport" id="passport-panel" data-pocket="me" hidden>
           <h2>Паспорт жильца</h2>
           <p class="note">У вас нет паспорта: если сменить браузер, жилец потеряется. Задайте логин и пароль.</p>
           <form id="claim-form" autocomplete="on">
@@ -140,6 +150,7 @@
         </div>
         <div class="stage" id="stage">
           <canvas id="view" aria-label="Вид сверху на помещение"></canvas>
+          <button class="hud" id="hud" type="button" aria-label="Самочувствие"></button>
           <div class="caption" id="caption" hidden></div>
           <section class="sheet" id="sheet" hidden>
             <div class="sheet-head">
@@ -155,7 +166,8 @@
       </section>
 
       <aside class="col col-right">
-        <section class="panel chat">
+        <button class="pocket-close" type="button" data-pocket-close aria-label="Свернуть">✕</button>
+        <section class="panel chat" data-pocket="chat">
           <div class="tabs" role="tablist">
             <button class="tab active" data-tab="local" role="tab">Здесь</button>
             <button class="tab" data-tab="global" role="tab">Весь дом</button>
@@ -166,12 +178,20 @@
             <button class="btn" type="submit">⏎</button>
           </form>
         </section>
-        <section class="panel">
+        <section class="panel" data-pocket="log">
           <h2>Журнал</h2>
           <ul id="journal" class="journal"></ul>
         </section>
       </aside>
     </main>
+
+    <!-- Карманный режим: разделы на телефоне открываются шторками снизу -->
+    <nav class="pocket-nav" id="pocket-nav" aria-label="Разделы">
+      <button type="button" data-pocket="me" aria-pressed="false"><span class="ic" aria-hidden="true">❤</span>Я</button>
+      <button type="button" data-pocket="inv" aria-pressed="false"><span class="ic" aria-hidden="true">🎒</span>Карманы</button>
+      <button type="button" data-pocket="chat" aria-pressed="false"><span class="ic" aria-hidden="true">💬</span>Чат<i class="dot" hidden></i></button>
+      <button type="button" data-pocket="log" aria-pressed="false"><span class="ic" aria-hidden="true">📓</span>Журнал<i class="dot" hidden></i></button>
+    </nav>
   </div>
 
   <!-- Уведомления -->
