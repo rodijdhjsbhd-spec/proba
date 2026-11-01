@@ -1591,6 +1591,7 @@
         ),
       );
     }
+    if (v.here.crowd) kids.push(h('span', { class: 'chip-person crowd', text: `и ещё ${v.here.crowd} — подальше` }));
     for (const t of v.trades) {
       kids.push(
         h(
@@ -1608,7 +1609,6 @@
         ),
       );
     }
-    if (v.here.crowd) kids.push(h('span', { class: 'chip-person crowd', text: `и ещё ${v.here.crowd} — подальше` }));
     $('#nearby').replaceChildren(...kids);
   }
 
@@ -1849,6 +1849,7 @@
       return;
     }
     if (n.style === 'death') {
+      vibrate('death');
       playTone(80, 1.6, 'sawtooth', 0.12);
       return;
     }
@@ -2480,7 +2481,18 @@
     const btn = $('#push-toggle');
     btn.hidden = !S.pushKey;
     if (!S.pushKey || !S.view) return;
-    const sub = await deviceSubscription();
+    let sub = await deviceSubscription();
+    // ключ сервера сменился (переезд, потеря файла) — старая подписка мертва: оформим заново
+    if (sub && !sameKey(sub.options && sub.options.applicationServerKey, S.pushKey)) {
+      if (Notification.permission === 'granted' && !S.pushRenewing) {
+        S.pushRenewing = true;
+        await act('push_unsubscribe', { endpoint: sub.endpoint }, { quiet: true });
+        await sub.unsubscribe().catch(() => {});
+        await enablePush().catch(() => null);
+        S.pushRenewing = false;
+        sub = await deviceSubscription();
+      } else sub = null;
+    }
     const known = !!(sub && (S.view.you.push || []).includes(sub.endpoint));
     if (sub && !known && !S.pushSynced && Notification.permission === 'granted' && sameKey(sub.options && sub.options.applicationServerKey, S.pushKey)) {
       S.pushSynced = true; // один раз за вход: например, на этом телефоне теперь живёт другой жилец
@@ -2496,9 +2508,11 @@
     if (!pushSupported()) {
       return {
         ok: false,
-        error: isIos() && !isStandalone()
-          ? 'На iPhone уведомления приходят, только если добавить игру на экран «Домой» (Поделиться → На экран «Домой») и открыть её оттуда.'
-          : window.isSecureContext ? 'Этот браузер не умеет пуш-уведомления.' : 'Уведомления работают только по защищённому адресу (https).',
+        error: !window.isSecureContext
+          ? 'Уведомления работают только по защищённому адресу (https).'
+          : isIos() && !isStandalone()
+            ? 'На iPhone уведомления приходят, только если добавить игру на экран «Домой» (Поделиться → На экран «Домой») и открыть её оттуда.'
+            : 'Этот браузер не умеет пуш-уведомления.',
       };
     }
     const perm = await Notification.requestPermission();
@@ -2537,7 +2551,7 @@
       ),
       h('p', { class: 'note', text: 'Не чаще раза в 10 минут на одну тему, срочное — сразу. Пока игра открыта, уведомлений нет.' }),
     ];
-    if (isIos() && !isStandalone()) lines.push(h('p', { class: 'note', text: 'На iPhone: Поделиться → На экран «Домой», затем откройте игру со значка.' }));
+    if (window.isSecureContext && isIos() && !isStandalone()) lines.push(h('p', { class: 'note', text: 'На iPhone: Поделиться → На экран «Домой», затем откройте игру со значка.' }));
     if (!window.isSecureContext) lines.push(h('p', { class: 'note bad', text: 'Сейчас игра открыта не по https — браузер уведомления не разрешит.' }));
     const done = (res) => {
       if (res.ok) toast({ text: res.message || 'Готово.', style: 'good' });

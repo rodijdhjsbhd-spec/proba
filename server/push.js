@@ -26,12 +26,22 @@ const fromB64u = (s) => Buffer.from(String(s || ''), 'base64url');
 /** Ключи VAPID: из файла, иначе создать и сохранить (только владельцу). */
 function loadVapid(file, subject) {
   let jwk = null;
+  let text = null;
   try {
-    jwk = JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    /* нет файла — создадим */
+    text = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
   }
-  if (!jwk || jwk.kty !== 'EC' || !jwk.d) {
+  if (text != null) {
+    // битый ключ не заменяем молча: все телефоны жильцов подписаны на этот ключ
+    try {
+      jwk = JSON.parse(text);
+    } catch {
+      throw new Error(`Файл ключа пушей ${file} повреждён. Восстановите его из копии или удалите — тогда жильцам придётся заново включить уведомления.`);
+    }
+    if (!jwk || jwk.kty !== 'EC' || !jwk.d) throw new Error(`В ${file} не ключ пушей.`);
+  }
+  if (!jwk) {
     const { privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
     jwk = privateKey.export({ format: 'jwk' });
     fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -46,9 +56,18 @@ function vapidFromJwk(jwk, subject = 'mailto:zhek@localhost') {
   return { privateKey, publicKey, subject };
 }
 
-/** Подпись VAPID для конкретной пуш-службы (aud — её origin). */
+/** Подпись VAPID для конкретной пуш-службы (aud — её origin). Подпись живёт 12 ч — берём из кеша час. */
+const authCache = new Map(); // aud → { header, until }
 function vapidAuth(vapid, endpoint, nowSec = Math.floor(Date.now() / 1000)) {
   const aud = new URL(endpoint).origin;
+  const cached = authCache.get(aud);
+  if (cached && cached.vapid === vapid && cached.until > nowSec) return cached.header;
+  const header = signVapid(vapid, aud, nowSec);
+  authCache.set(aud, { vapid, header, until: nowSec + 3600 });
+  return header;
+}
+
+function signVapid(vapid, aud, nowSec) {
   const header = b64u(JSON.stringify({ typ: 'JWT', alg: 'ES256' }));
   const claims = b64u(JSON.stringify({ aud, exp: nowSec + 12 * 3600, sub: vapid.subject }));
   const data = `${header}.${claims}`;
@@ -104,6 +123,11 @@ function cleanSubscription(sub, hosts = allowedHosts()) {
   const p256dh = fromB64u(keys.p256dh);
   const auth = fromB64u(keys.auth);
   if (p256dh.length !== 65 || p256dh[0] !== 4 || auth.length !== 16) return null;
+  try {
+    crypto.ECDH.convertKey(p256dh, 'prime256v1'); // точка действительно на кривой P-256
+  } catch {
+    return null;
+  }
   return { endpoint: url.href, keys: { p256dh: b64u(p256dh), auth: b64u(auth) } };
 }
 
@@ -112,9 +136,16 @@ function cleanSubscription(sub, hosts = allowedHosts()) {
  * fetchImpl подменяется в тестах.
  */
 async function send(vapid, sub, message, { ttl = 3600, urgency = 'normal', topic = null, fetchImpl = globalThis.fetch } = {}) {
-  const body = encrypt(JSON.stringify(message), sub.keys);
+  let body;
+  let authorization;
+  try {
+    body = encrypt(JSON.stringify(message), sub.keys);
+    authorization = vapidAuth(vapid, sub.endpoint);
+  } catch {
+    return 'gone'; // негодные ключи подписки — она мертва навсегда
+  }
   const headers = {
-    Authorization: vapidAuth(vapid, sub.endpoint),
+    Authorization: authorization,
     'Content-Encoding': 'aes128gcm',
     'Content-Type': 'application/octet-stream',
     TTL: String(Math.max(0, Math.round(ttl))),

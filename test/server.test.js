@@ -154,7 +154,9 @@ test('PWA и пуши: манифест, service worker, ключ в приве�
   pl.send(JSON.stringify({ t: 'register', name: 'Пушкин', login: 'pushkin', password: 'secret12' }));
   const welcome = await pl.next((m) => m.t === 'welcome');
   assert.equal(Buffer.from(welcome.push, 'base64url').length, 65);
-  const keys = { p256dh: Buffer.concat([Buffer.from([4]), Buffer.alloc(64, 7)]).toString('base64url'), auth: Buffer.alloc(16, 1).toString('base64url') };
+  const ecdh = require('node:crypto').createECDH('prime256v1');
+  ecdh.generateKeys();
+  const keys = { p256dh: ecdh.getPublicKey().toString('base64url'), auth: Buffer.alloc(16, 1).toString('base64url') };
   pl.send(JSON.stringify({ t: 'act', id: 1, action: 'push_subscribe', args: { sub: { endpoint: 'https://127.0.0.1:9/steal', keys } } }));
   const bad = await pl.next((m) => m.t === 'res' && m.id === 1);
   assert.equal(bad.ok, false);

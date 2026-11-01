@@ -51,7 +51,16 @@ const ADMIN_PASSWORD = resolveAdminPassword();
 // сколько ждать переподключения, прежде чем считать игрока ушедшим
 const OFFLINE_GRACE_MS = Number(process.env.OFFLINE_GRACE_MS) || 20000;
 // пуш-уведомления: ключ VAPID создаётся сам и лежит рядом с миром
-const VAPID = process.env.PUSH === 'off' ? null : Push.loadVapid(process.env.VAPID_FILE || path.join(path.dirname(DATA_FILE), 'vapid.json'), process.env.VAPID_SUBJECT || 'mailto:zhek@localhost');
+const VAPID = (() => {
+  if (process.env.PUSH === 'off') return null;
+  try {
+    return Push.loadVapid(process.env.VAPID_FILE || path.join(path.dirname(DATA_FILE), 'vapid.json'), process.env.VAPID_SUBJECT || 'mailto:zhek@localhost');
+  } catch (err) {
+    // дом работает и без пушей; старый ключ не затираем
+    console.error(`[push] ${err.message} Пуш-уведомления выключены до исправления.`);
+    return null;
+  }
+})();
 
 function resolveAdminPassword() {
   if (process.env.ADMIN_PASSWORD) return process.env.ADMIN_PASSWORD;
@@ -398,20 +407,40 @@ game.on('notify', ({ to, title, text, style, action, ask }) => {
 });
 
 // ---- пуш на телефон: только тем, у кого сейчас нет открытой игры ----
+/** Отправить на все устройства жильца. Возвращает, сколько служб приняли уведомление. */
 async function deliverPush(p, message, { urgent = false, tag = null } = {}) {
-  if (!VAPID) return;
-  for (const sub of [...(p.push || [])]) {
-    const r = await Push.send(VAPID, sub, message, { ttl: urgent ? 900 : 6 * 3600, urgency: urgent ? 'high' : 'normal', topic: tag });
-    if (r === 'gone') game.pushGone(sub.endpoint); // мир сохранится сам по таймеру
-    else if (r === 'error') console.warn('[push] служба не приняла уведомление:', new URL(sub.endpoint).host);
-  }
+  if (!VAPID) return 0;
+  const subs = [...(p.push || [])];
+  const results = await Promise.all(subs.map((sub) => Push.send(VAPID, sub, message, { ttl: urgent ? 900 : 6 * 3600, urgency: urgent ? 'high' : 'normal', topic: tag })));
+  results.forEach((r, i) => {
+    if (r === 'gone') game.pushGone(subs[i].endpoint); // мир сохранится сам по таймеру
+    else if (r === 'error') console.warn('[push] служба не приняла уведомление:', new URL(subs[i].endpoint).host);
+  });
+  return results.filter((r) => r === 'ok').length;
+}
+
+// Очередь: шифрование и подпись — работа процессора; рассылка всем (объявление ЖЭК) не должна
+// останавливать дом — разбираем порциями между тиками
+const pushQueue = [];
+let pushDraining = false;
+function drainPushes() {
+  if (pushDraining) return;
+  pushDraining = true;
+  setImmediate(function step() {
+    for (const job of pushQueue.splice(0, 20)) {
+      const p = game.getPlayer(job.to);
+      if (p && !game.inGame(job.to)) deliverPush(p, job.message, job.opts).catch((err) => console.error('[push]', err));
+    }
+    if (pushQueue.length) setImmediate(step);
+    else pushDraining = false;
+  });
 }
 // «в игре» — есть соединение с видимой вкладкой; свёрнутая игра на телефоне получает пуши
 game.inGame = (id) => [...(socketsByPlayer.get(id) || [])].some((ws) => ws.readyState === ws.OPEN && !ws.hidden);
 game.on('push', ({ to, title, body, tag, urgent }) => {
-  const p = game.getPlayer(to);
-  if (!p || game.inGame(to)) return;
-  deliverPush(p, { title, body, tag, url: '/' }, { urgent, tag }).catch((err) => console.error('[push]', err));
+  if (game.inGame(to) || pushQueue.length > 5000) return;
+  pushQueue.push({ to, message: { title, body, tag, url: '/', urgent: !!urgent }, opts: { urgent, tag } });
+  drainPushes();
 });
 const pushTests = new Map(); // жилец → когда проверял связь
 
@@ -590,8 +619,10 @@ const PLAYER_ACTIONS = {
     if (!VAPID || !(p.push || []).length) return { ok: false, error: 'Уведомления не включены.' };
     if (Date.now() - (pushTests.get(p.id) || 0) < 60000) return { ok: false, error: 'Не чаще раза в минуту.' };
     pushTests.set(p.id, Date.now());
-    deliverPush(p, { title: 'ЖЭК на проводе', body: 'Проверка связи. Так придёт весть о тумане, стуке в дверь и записках, когда вас нет в игре.', tag: 'test', url: '/' }).catch((err) => console.error('[push]', err));
-    return { ok: true, message: 'Проверочное уведомление отправлено.' };
+    // ответ — после того, как пуш-службы ответили (обработчик сокета ждёт промис)
+    return deliverPush(p, { title: 'ЖЭК на проводе', body: 'Проверка связи. Так придёт весть о тумане, стуке в дверь и записках, когда вас нет в игре.', tag: 'test', url: '/' })
+      .then((n) => (n ? { ok: true, message: 'Проверочное уведомление отправлено.' } : { ok: false, error: 'Служба уведомлений не приняла. Выключите и снова включите уведомления.' }))
+      .catch(() => ({ ok: false, error: 'Не удалось связаться со службой уведомлений.' }));
   },
   report: (p, a) => game.report(p, String(a.id || '')),
   chat: (p, a) => game.chat(p, a.channel === 'global' ? 'global' : 'local', a.text),
@@ -859,9 +890,14 @@ function handleRest(ws, msg) {
       console.error('[action]', msg.action, err);
       res = { ok: false, error: 'Что-то пошло не так.' };
     }
-    send(ws, { t: 'res', ...res, id: msg.id }); // id запроса важнее: в res может быть свой id (созданной записи)
-    pushView(p.id);
-    syncLocation(p.id);
+    const reply = (r) => {
+      send(ws, { t: 'res', ...r, id: msg.id }); // id запроса важнее: в res может быть свой id (созданной записи)
+      pushView(p.id);
+      syncLocation(p.id);
+    };
+    // действие может ответить не сразу (проверка пушей ждёт ответа служб)
+    if (res && typeof res.then === 'function') res.then(reply, () => reply({ ok: false, error: 'Что-то пошло не так.' }));
+    else reply(res);
   }
 }
 
@@ -1073,7 +1109,10 @@ function broadcastActors() {
   const byScene = new Map();
   for (const [id] of socketsByPlayer) {
     const p = game.getPlayer(id);
-    if (!p || !p.alive) continue;
+    if (!p || !p.alive) {
+      lastActors.delete(id); // воскресят — соседи придут целиком (версии сцен начинаются заново)
+      continue;
+    }
     const key = game.locationKey(p);
     if (!byScene.has(key)) byScene.set(key, []);
     byScene.get(key).push(id);

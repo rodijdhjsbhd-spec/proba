@@ -20,7 +20,7 @@ const World = require('../public/shared/world.js');
 const B = C.BALANCE;
 const STAT_KEYS = ['health', 'hunger', 'energy', 'sanity'];
 // какие уведомления дублировать пушем тем, кто не в сети; 'urgent' — срочные (телефон звонит громче)
-const PUSH_STYLES = { siren: 'urgent', fog: 'urgent', danger: 'urgent', death: 'urgent', knock: 'normal', whisper: 'normal', announce: 'normal' };
+const PUSH_STYLES = { siren: 'urgent', fog: 'urgent', danger: 'urgent', death: 'urgent', knock: 'normal', whisper: 'normal', announce: 'normal', ask: 'normal' };
 const PUSH_TAG_GAP_MS = 10 * 60000;
 const PUSH_URGENT_GAP_MS = 30000;
 const PUSH_PER_HOUR = 12;
@@ -4513,7 +4513,13 @@ class Game extends EventEmitter {
       title: 'ТУМАН',
       text: 'Туман пришёл на ваш этаж. Если вы не за закрытой гермодверью — бегите.',
       style: 'fog',
+      push: false,
     });
+    // пуш: тем, кто за задраенной дверью, тревога не нужна
+    for (const p of victims) {
+      const sealedHome = p.location.place === 'home' && this.currentApt(p) === p.apartment.number && this.doorSealed(p.apartment.number);
+      if (!sealedHome) this.pushOffline(p, { title: 'ТУМАН', body: 'Туман пришёл на ваш этаж. Если вы не за закрытой гермодверью — бегите.', tag: 'fog', urgent: true });
+    }
     this.log(`Туман накрыл этажи ${f.from}–${f.to}`, 'event');
   }
 
@@ -5092,9 +5098,12 @@ const ADMIN_COMMANDS = {
     this.takeSnapshot('перед откатом дома', ctx.who);
     const now = this.now();
     const wasPaused = !!this.world.paused;
+    // подписки на пуши принадлежат телефонам, а не миру: после отката — те же, что сейчас
+    const pushNow = new Map(Object.values(this.state.players).map((p) => [p.id, p.push || []]));
     const data = JSON.parse(snap.data);
     const fresh = Game.normalize({ ...this.state, ...data });
     Object.assign(this.state, fresh);
+    for (const p of Object.values(this.state.players)) p.push = pushNow.get(p.id) || [];
     this.invalidatePlayers();
     // таймеры снимка (туман, поломки, «без сознания», расписание…) продолжаются с того места, где
     // были в снимке, а не догоняют прошедшее с тех пор время; пауза — та, что сейчас
@@ -5131,7 +5140,7 @@ const ADMIN_COMMANDS = {
     if (old.alive && !cur.alive && this.alivePlayers().some((q) => q.id !== id && q.apartment.number === old.apartment.number)) throw new Error('Его квартиру уже заняли — сначала освободите');
     this.takeSnapshot(`перед откатом жильца ${cur.name}`, ctx.who);
     // наследство уже забрали — второй раз его не взять (иначе вещь удвоится)
-    const keep = { token: cur.token, account: cur.account, journal: cur.journal, inheritedBy: cur.inheritedBy || old.inheritedBy };
+    const keep = { token: cur.token, account: cur.account, journal: cur.journal, inheritedBy: cur.inheritedBy || old.inheritedBy, push: cur.push || [] };
     this.state.players[id] = Object.assign(old, keep);
     this.invalidatePlayers();
     const p = this.state.players[id];
