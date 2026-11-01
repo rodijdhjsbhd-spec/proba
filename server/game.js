@@ -110,6 +110,9 @@ function freshState() {
       puppets: {}, // марионетки ЖЭК { id: { id, name, preset, lookId, scene, x, y, d, path } }
       pried: {}, // вскрытые служебные двери: id двери → { by, at }
       climate: [], // микроклимат этажей { id, from, to, kind, until, harm }
+      overlays: {}, // перепланировка: сцена → [{ id, kind: wall|rubble|closet, tiles: [[x,y]] }]
+      closets: {}, // кладовки: «сцена:x:y» → { items, text, taken: [id] }
+      anomalies: { extraFloor: null, wrongDoor: null, stairLoop: null },
     },
     players: {},
     trades: {},
@@ -150,7 +153,7 @@ class Game extends EventEmitter {
     this.lastChatAt = new Map();
     this.localChat = new Map(); // key → последние сообщения (только в памяти)
     this.byToken = new Map();
-    this.map = World.create(WORLD_CONFIG);
+    this.map = World.create(this.worldConfig());
     this.state.palette = this.state.palette || { conditions: {}, accidents: {}, items: {} };
     this.applyPalette();
     if (!this.state.stock) this.state.stock = this.fullStock(1);
@@ -194,6 +197,9 @@ class Game extends EventEmitter {
     s.world.barygaClients = s.world.barygaClients || {};
     s.world.pried = s.world.pried || {};
     s.world.climate = Array.isArray(s.world.climate) ? s.world.climate : [];
+    s.world.overlays = s.world.overlays && typeof s.world.overlays === 'object' ? s.world.overlays : {};
+    s.world.closets = s.world.closets || {};
+    s.world.anomalies = { extraFloor: null, wrongDoor: null, stairLoop: null, ...(s.world.anomalies || {}) };
     s.world.puppets = s.world.puppets && typeof s.world.puppets === 'object' ? s.world.puppets : {};
     s.assignments = Array.isArray(s.assignments) ? s.assignments : [];
     s.petitions = Array.isArray(s.petitions) ? s.petitions : [];
@@ -2138,6 +2144,61 @@ class Game extends EventEmitter {
   }
 
   // =========================================================================
+  // Перепланировка и аномалии
+  // =========================================================================
+  /** Конфиг мира с перепланировкой — тот же у сервера, жильцов и Пульта. */
+  worldConfig() {
+    return { ...WORLD_CONFIG, overlays: this.world.overlays };
+  }
+
+  /** Схемы поменялись: пересобрать карту, вытолкнуть тех, кто оказался в стене, разослать всем. */
+  rebuildMap(keys = []) {
+    this.map = World.create(this.worldConfig());
+    for (const p of this.alivePlayers()) {
+      if (!keys.includes(this.locationKey(p))) continue;
+      const sc = this.sceneOf(p);
+      if (!World.canStand(sc, p.pos.x, p.pos.y)) {
+        p.pos = { ...this.map.spawn(sc.key), d: 'down' };
+        p.posSeq = (p.posSeq || 0) + 1;
+      }
+    }
+    this.emit('world_changed');
+  }
+
+  /** Кладовка рядом (новая дверь в стене от ЖЭК). */
+  closetSearch(p) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    const o = this.nearTo(p, (x) => x.type === 'closet');
+    if (!o) return { ok: false, error: 'Подойдите к кладовке.' };
+    const key = `${this.locationKey(p)}:${Math.floor(o.x)}:${Math.floor(o.y)}`;
+    const c = this.world.closets[key] || { items: {}, text: '', taken: [] };
+    if (c.taken.includes(p.id)) return { ok: false, error: 'Вы здесь уже всё осмотрели.' };
+    c.taken.push(p.id);
+    this.world.closets[key] = c;
+    // вещи забирает первый заглянувший — остальным достаётся пустая полка
+    const got = Object.entries(c.items || {}).filter(([id]) => C.ITEMS[id]);
+    c.items = {};
+    for (const [id, n] of got) this.addItem(p, id, n);
+    const what = got.map(([id, n]) => `${C.ITEMS[id].name}${n > 1 ? ` ×${n}` : ''}`).join(', ');
+    this.log(`Кладовка (${this.placeTitle(p)}) — заглядывает ${p.name}${what ? `, забирает: ${what}` : ', там пусто'}`, 'social', p.id);
+    const text = `${c.text || 'Кладовка, которой вчера здесь не было. Пахнет свежей штукатуркой.'}${what ? ` Внутри: ${what}.` : ' Внутри пусто.'}`;
+    this.journal(p, text, what ? 'good' : 'info');
+    return { ok: true, message: text };
+  }
+
+  /** «Лишний этаж» на табло: лифт везёт туда, где ничего нет, и возвращает обратно. */
+  anomalyFloor(p) {
+    const a = this.world.anomalies.extraFloor;
+    if (!a) return { ok: false, error: 'Такого этажа нет.' };
+    if (!this.nearTo(p, (o) => o.type === 'lift')) return { ok: false, error: 'Подойдите к лифту.' };
+    if (this.world.breakdowns.lift) return { ok: false, error: 'Лифт не работает.' };
+    if (a.harm) this.applyStats(p, { sanity: -8 });
+    this.journal(p, `Лифт ехал долго. Двери открылись в бетонную стену, на ней мелом: «${a.label}». Двери закрылись — вы снова на ${p.location.floor} этаже.`, 'whisper');
+    this.log(`${p.name} съездил на этаж «${a.label}»`, 'social', p.id);
+    return { ok: true, message: `Этаж «${a.label}». Бетон. Вы вернулись.` };
+  }
+
+  // =========================================================================
   // Коллективная жалоба в ЖЭК
   // =========================================================================
   petitionsNeeded() {
@@ -2807,6 +2868,14 @@ class Game extends EventEmitter {
       if (!this.nearTo(p, (o) => o.type === 'facility' && o.facility === place)) return fail('Подойдите к двери.');
       target = { place, floor: fac.floor };
       entry = 'default';
+      // аномалия «дверь не туда»: дверь учреждения ведёт в другое
+      const wd = this.world.anomalies.wrongDoor;
+      if (wd && wd.facility === place && C.FACILITIES[wd.to] && wd.to !== place) {
+        target = { place: wd.to, floor: C.FACILITIES[wd.to].floor };
+        if (wd.harm) this.applyStats(p, { sanity: -5 });
+        this.journal(p, `Вы вошли в дверь «${fac.name}»… и оказались в «${C.FACILITIES[wd.to].name}». Табличка на двери та же.`, 'whisper');
+        this.log(`${p.name}: дверь не туда (${place} → ${wd.to})`, 'social', p.id);
+      }
     }
 
     const witnesses = this.leaveScene(p);
@@ -2841,6 +2910,9 @@ class Game extends EventEmitter {
     const sec = via === 'lift' ? B.liftBaseSec + diff * B.liftSecPerFloor : diff * B.stairsSecPerFloor;
     const now = this.timerNow(); // на паузе поездка начнётся, когда время пойдёт
     p.travel = { via, toPlace: 'corridor', toFloor: floor, fromFloor: from, startedAt: now, arriveAt: now + sec * 1000 };
+    // аномалия «петля на лестнице»: путь через петлю приводит туда же, откуда вышли
+    const loop = this.world.anomalies.stairLoop;
+    if (via === 'stairs' && loop && Math.min(from, floor) <= loop.to && Math.max(from, floor) >= loop.from) p.travel.loop = true;
     this.relocate(p, { place: via, floor: from });
     this.dirty([...witnesses, ...this.othersAt(p)].map((q) => q.id));
     return { ok: true };
@@ -2873,6 +2945,14 @@ class Game extends EventEmitter {
     const t = p.travel;
     p.travel = null;
     const witnesses = this.othersAt(p);
+    if (t.loop && this.world.anomalies.stairLoop) {
+      if (this.world.anomalies.stairLoop.harm) this.applyStats(p, { sanity: -6 });
+      this.journal(p, `Вы шли и шли по лестнице… и вышли на ${t.fromFloor} этаж — туда же, откуда начали. Силы потрачены.`, 'whisper');
+      this.log(`${p.name}: петля на лестнице (${t.fromFloor} → ${t.toFloor})`, 'social', p.id);
+      this.relocate(p, { place: 'corridor', floor: t.fromFloor }, 'stairs');
+      this.dirty([p.id, ...witnesses.map((q) => q.id), ...this.othersAt(p).map((q) => q.id)]);
+      return;
+    }
     this.relocate(p, { place: t.toPlace, floor: t.toFloor }, t.via);
     this.dirty([p.id, ...witnesses.map((q) => q.id), ...this.othersAt(p).map((q) => q.id)]);
   }
@@ -4688,6 +4768,7 @@ const ADMIN_COMMANDS = {
     const fresh = Game.normalize({ ...this.state, ...data });
     Object.assign(this.state, fresh);
     this.applyPalette();
+    this.rebuildMap(); // перепланировка тоже откатилась
     this.byToken = new Map(Object.values(this.state.players).map((p) => [p.token, p.id]));
     for (const p of Object.values(this.state.players)) {
       const scene = this.sceneOf(p);
@@ -4808,6 +4889,94 @@ const ADMIN_COMMANDS = {
     this.state.scenarioRuns = this.state.scenarioRuns.filter((r) => r.id !== id);
     if (before === this.state.scenarioRuns.length) throw new Error('Такого идущего сценария нет');
     return { ok: true, message: 'Сценарий остановлен' };
+  },
+
+  /**
+   * Перепланировка сцены: wall — замуровать объект (дверь, мусоропровод, доску) под клеткой x,y;
+   * rubble — завал на клетке пола (только если все двери, лифт и лестница остаются достижимы);
+   * closet — кладовка в стене над полом, с вещами items для каждого, кто заглянет.
+   */
+  replan({ scene, kind, x, y, items, text }) {
+    let sc;
+    try {
+      sc = this.map.scene(scene);
+    } catch {
+      throw new Error('Нет такого помещения');
+    }
+    const tx = Math.floor(Number(x)), ty = Math.floor(Number(y));
+    if (!Number.isFinite(tx) || !Number.isFinite(ty) || tx < 0 || ty < 0 || tx >= sc.w || ty >= sc.h) throw new Error('Клетка вне помещения');
+    const ov = { id: newId('o'), kind, tiles: [] };
+    if (kind === 'wall') {
+      const o = sc.objects.find((q) => tx >= q.x && tx < q.x + q.w && ty >= q.y - (q.wall && !q.bottom ? 1 : 0) && ty < q.y + q.h);
+      if (!o) throw new Error('Здесь нечего замуровывать — кликните по двери или предмету на стене');
+      if (['lift', 'stairs', 'exit', 'hermodoor'].includes(o.type)) throw new Error('Лифт, лестницу и выходы не замуровать: люди окажутся заперты');
+      for (let i = 0; i < o.w; i++) for (let j = 0; j < o.h; j++) ov.tiles.push([o.x + i, o.y + j]);
+      ov.label = o.label || o.type;
+    } else if (kind === 'rubble') {
+      if (World.isSolidTile(sc, tx, ty)) throw new Error('Завал — только на полу');
+      if (sc.objects.some((o) => o.spot && Math.floor(o.spot.x) === tx && Math.floor(o.spot.y) === ty)) throw new Error('Не загораживайте подход к двери или предмету');
+      ov.tiles.push([tx, ty]);
+    } else if (kind === 'closet') {
+      if (!World.isSolidTile(sc, tx, ty) || sc.objects.some((o) => tx >= o.x && tx < o.x + o.w && ty >= o.y && ty < o.y + o.h)) throw new Error('Кладовка — в пустой стене');
+      if (World.isSolidTile(sc, tx, ty + 1)) throw new Error('Под кладовкой должен быть пол');
+      ov.tiles.push([tx, ty]);
+      const clean = {};
+      for (const [id, n] of Object.entries(items || {})) if (Object.hasOwn(C.ITEMS, id) && toInt(n) > 0) clean[id] = Math.min(9, toInt(n));
+      this.world.closets[`${scene}:${tx}:${ty}`] = { items: clean, text: sanitizeText(text, 200), taken: [] };
+    } else {
+      throw new Error('Что сделать: замуровать, завал или кладовка');
+    }
+    const list = this.world.overlays[scene] || [];
+    this.world.overlays[scene] = [...list, ov];
+    this.map = World.create(this.worldConfig());
+    const after = this.map.scene(scene);
+    const lost = World.unreachableObjects(after, this.map.spawn(scene, 'default'));
+    if (kind === 'rubble' && lost.length) {
+      this.world.overlays[scene] = list;
+      this.map = World.create(this.worldConfig());
+      throw new Error(`Так завал отрежет: ${lost.map((o) => o.label || o.type).slice(0, 3).join(', ')}`);
+    }
+    if (!this.world.overlays[scene].length) delete this.world.overlays[scene];
+    this.rebuildMap([scene]);
+    this.log(`Перепланировка «${this.sceneTitle(scene)}»: ${kind === 'wall' ? `замуровано — ${ov.label}` : kind === 'rubble' ? 'завал' : 'новая кладовка'}`, 'event', null, { public: kind === 'wall' ? `в ${this.sceneTitle(scene).toLowerCase()} замуровали дверь` : null });
+    return { ok: true, message: kind === 'wall' ? `Замуровано: ${ov.label}` : kind === 'rubble' ? 'Завал' : 'Кладовка готова' };
+  },
+
+  /** Убрать накладку (или все в помещении). */
+  replanClear({ scene, id }) {
+    const keys = scene ? [scene] : Object.keys(this.world.overlays);
+    for (const k of keys) {
+      const left = id ? (this.world.overlays[k] || []).filter((o) => o.id !== id) : [];
+      if (left.length) this.world.overlays[k] = left;
+      else delete this.world.overlays[k];
+    }
+    this.rebuildMap(keys);
+    return { ok: true, message: 'Как было' };
+  },
+
+  /**
+   * Аномалии: extraFloor { label } — лишний этаж на табло лифта; wrongDoor { facility, to } — дверь
+   * учреждения ведёт в другое; stairLoop { from, to } — петля на лестнице. harm — тратить ли рассудок.
+   */
+  anomaly({ kind, label, facility, to, from, harm, off }) {
+    const a = this.world.anomalies;
+    if (!['extraFloor', 'wrongDoor', 'stairLoop'].includes(kind)) throw new Error('Нет такой аномалии');
+    if (off) {
+      a[kind] = null;
+      return { ok: true, message: 'Аномалия исчезла' };
+    }
+    if (kind === 'extraFloor') a.extraFloor = { label: sanitizeText(label, 12) || '100½', harm: !!harm };
+    if (kind === 'wrongDoor') {
+      if (!C.FACILITIES[facility] || !C.FACILITIES[to] || facility === to) throw new Error('Выберите два разных учреждения');
+      a.wrongDoor = { facility, to, harm: !!harm };
+    }
+    if (kind === 'stairLoop') {
+      const f1 = toInt(from, 101);
+      const f2 = toInt(to, f1);
+      a.stairLoop = { from: Math.min(f1, f2), to: Math.max(f1, f2), harm: !!harm };
+    }
+    this.log(`Аномалия: ${kind}`, 'admin');
+    return { ok: true, message: 'Аномалия в доме' };
   },
 
   /** Поставить барыгу на технический этаж. */
@@ -5295,6 +5464,7 @@ Game.prototype.playerView = function playerView(p) {
       power: w.power ? { from: w.power.from, to: w.power.to } : null,
       dark: this.isDark(p.location.floor),
       lift: { broken: !!w.breakdowns.lift, reason: w.breakdowns.lift?.reason || null },
+      extraFloor: w.anomalies.extraFloor ? w.anomalies.extraFloor.label : null,
       repairs: Object.fromEntries(Object.entries(w.breakdowns).filter(([, b]) => b && b.repairable && b.until).map(([k, b]) => [k, Math.max(0, Math.round((b.until - this.now()) / 60000))])),
       cutleryStolen: w.cutleryStolen,
       online: this.onlineSet.size,
@@ -5432,6 +5602,8 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       lampsOutFloors: Object.keys(w.lampsOut).length,
       rent: this.rentAmount(),
       baryga: w.baryga ? { floor: w.baryga.floor, purse: w.baryga.purse } : null,
+      overlays: Object.entries(w.overlays).flatMap(([scene, list]) => list.map((o) => ({ id: o.id, scene, title: this.sceneTitle(scene), kind: o.kind, label: o.label || null }))),
+      anomalies: w.anomalies,
       climate: w.climate.map((c) => ({ ...c, name: C.CLIMATES[c.kind].name, leftMin: c.until ? Math.max(0, Math.ceil((c.until - now) / 60000)) : null })),
       puppets: Object.values(w.puppets).map((pp) => ({ id: pp.id, name: pp.name, preset: pp.preset, scene: pp.scene, title: this.sceneTitle(pp.scene) })),
       plan: w.plan ? { done: w.plan.done, target: w.plan.target, week: w.plan.week + 1, participants: Object.keys(w.plan.participants).length } : null,
@@ -5531,7 +5703,7 @@ Game.prototype.adminContent = function adminContent() {
     scenarioCmds: SCENARIO_CMDS,
     shopNames: Object.fromEntries(Object.keys(C.SHOPS).flatMap((shop) => this.shopEntries(shop).map((e) => [e.key, e.name]))),
     palette: this.state.palette,
-    world: WORLD_CONFIG,
+    world: this.worldConfig(),
   };
 };
 

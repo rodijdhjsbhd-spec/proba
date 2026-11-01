@@ -137,6 +137,8 @@
             </div>
             <h2>Опасности на клетках</h2>
             <ul class="eye-hazards" id="eye-hazards"></ul>
+            <h2>Перепланировка</h2>
+            <ul class="eye-hazards" id="eye-overlays"></ul>
           </aside>
           <div class="panel eye-main">
             <div class="eye-head">
@@ -152,6 +154,7 @@
               <label class="f inline">на, мин <input id="eye-minutes" type="number" min="0" max="1440" value="0" title="0 — пока не уберут"></label>
               <button class="btn small" type="button" id="eye-clear">Убрать опасности здесь</button>
               <button class="btn small" type="button" id="eye-scars">Стереть следы здесь</button>
+              <span class="closet-opts" id="closet-opts" hidden>в кладовке: <select id="closet-item" aria-label="Что в кладовке"></select> <input id="closet-text" maxlength="200" placeholder="что увидят (необязательно)"></span>
             </div>
             <div class="eye-stage" id="eye-stage"><canvas id="eye-view" aria-label="Глазок: помещение сверху"></canvas></div>
             <p class="hint">Клик по жильцу — открыть его карточку. 0 минут — опасность стоит, пока её не уберут.</p>

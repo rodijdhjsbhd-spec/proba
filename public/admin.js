@@ -141,6 +141,15 @@
       case 'watch':
         onWatch(msg.scene);
         break;
+      case 'world':
+        // перепланировка: новая схема помещений
+        A.content.world = msg.world;
+        E.map = World.create(msg.world);
+        if (E.key) {
+          E.renderer.scene = null;
+          E.renderer.setScene(E.map.scene(E.key));
+        }
+        break;
       case 'godlog':
         A.godLog.push(msg.entry);
         if (A.godLog.length > 300) A.godLog.shift();
@@ -764,6 +773,29 @@
     );
     withSchedule(grid.lastElementChild, { label: () => `Разнарядка: ${asgText.value.slice(0, 40)}`, cmd: 'assign', args: asgArgs });
 
+    // --- Аномалии ---
+    const anFloor = h('input', { maxlength: '12', value: '100½' });
+    const anFloorHarm = h('input', { type: 'checkbox' });
+    const facOpts = Object.entries(C.facilities).map(([k, f]) => [k, f.name]);
+    const anFrom = select(facOpts, 'canteen');
+    const anTo = select(facOpts, 'medpost');
+    const anDoorHarm = h('input', { type: 'checkbox' });
+    const anLoopFrom = num(firstFloor, { min: 1, max: 999 });
+    const anLoopTo = num(firstFloor + 2, { min: 1, max: 999 });
+    const anLoopHarm = h('input', { type: 'checkbox' });
+    A.anomalyInfo = h('p', { class: 'hint' });
+    grid.append(
+      card(
+        'Аномалии',
+        'Дом ведёт себя странно. Вред (рассудок) — только если отметить. Перепланировку помещений (замуровать дверь, завал, кладовка) делайте кликом во вкладке «Глазок».',
+        'whisper-card',
+        A.anomalyInfo,
+        h('div', { class: 'row' }, 'Лишний этаж на табло лифта:', anFloor, h('label', { class: 'check' }, anFloorHarm, 'с вредом'), button('Включить', () => cmd('anomaly', { kind: 'extraFloor', label: anFloor.value, harm: anFloorHarm.checked }), 'small'), button('Убрать', () => cmd('anomaly', { kind: 'extraFloor', off: true }), 'small')),
+        h('div', { class: 'row' }, 'Дверь не туда:', anFrom, '→', anTo, h('label', { class: 'check' }, anDoorHarm, 'с вредом'), button('Включить', () => cmd('anomaly', { kind: 'wrongDoor', facility: anFrom.value, to: anTo.value, harm: anDoorHarm.checked }), 'small'), button('Убрать', () => cmd('anomaly', { kind: 'wrongDoor', off: true }), 'small')),
+        h('div', { class: 'row' }, 'Петля на лестнице, этажи', anLoopFrom, anLoopTo, h('label', { class: 'check' }, anLoopHarm, 'с вредом'), button('Включить', () => cmd('anomaly', { kind: 'stairLoop', from: anLoopFrom.value, to: anLoopTo.value, harm: anLoopHarm.checked }), 'small'), button('Убрать', () => cmd('anomaly', { kind: 'stairLoop', off: true }), 'small')),
+      ),
+    );
+
     // --- Микроклимат ---
     const clFrom = num(firstFloor, { min: 1, max: 999 });
     const clTo = num(firstFloor + 4, { min: 1, max: 999 });
@@ -980,6 +1012,14 @@
     }
     renderSnapshots();
     renderScenarios();
+    if (A.anomalyInfo) {
+      const an = s.world.anomalies || {};
+      const parts = [];
+      if (an.extraFloor) parts.push(`лишний этаж «${an.extraFloor.label}»`);
+      if (an.wrongDoor) parts.push(`дверь не туда: ${A.content.facilities[an.wrongDoor.facility]?.name} → ${A.content.facilities[an.wrongDoor.to]?.name}`);
+      if (an.stairLoop) parts.push(`петля на лестнице ${an.stairLoop.from}–${an.stairLoop.to}`);
+      A.anomalyInfo.textContent = parts.length ? `Сейчас: ${parts.join('; ')}.` : 'Сейчас аномалий нет.';
+    }
     if (A.barygaInfo) {
       const b = s.world.baryga;
       const pl = s.world.plan;
@@ -1686,6 +1726,7 @@
     });
     canvas.addEventListener('mouseleave', () => (E.hover = null));
     $('#eye-clear').addEventListener('click', () => E.key && cmd('hazardClear', { scene: E.key }));
+    $('#eye-tool').addEventListener('change', () => ($('#closet-opts').hidden = $('#eye-tool').value !== 'replan:closet'));
     // марионетки
     const syncPreset = () => {
       $('#pp-player').hidden = $('#pp-preset').value !== 'double';
@@ -1714,8 +1755,16 @@
   function fillEyeTools() {
     const sel = $('#eye-tool');
     const keep = sel.value;
-    sel.replaceChildren(h('option', { value: '', text: 'ничего не ставит' }), ...Object.entries(A.content.hazards).map(([k, n]) => h('option', { value: k, text: `ставит: ${n}` })));
-    sel.value = A.content.hazards[keep] ? keep : '';
+    sel.replaceChildren(
+      h('option', { value: '', text: 'ничего не ставит' }),
+      ...Object.entries(A.content.hazards).map(([k, n]) => h('option', { value: k, text: `ставит: ${n}` })),
+      h('option', { value: 'replan:wall', text: 'замуровывает дверь или предмет' }),
+      h('option', { value: 'replan:rubble', text: 'насыпает завал' }),
+      h('option', { value: 'replan:closet', text: 'делает кладовку в стене' }),
+    );
+    sel.value = [...sel.options].some((o) => o.value === keep) ? keep : '';
+    $('#closet-item').replaceChildren(h('option', { value: '', text: '— пусто —' }), ...Object.entries(A.content.items).map(([k, v]) => h('option', { value: k, text: v.name })));
+    $('#closet-opts').hidden = sel.value !== 'replan:closet';
   }
 
   function watchScene(key) {
@@ -1835,6 +1884,12 @@
       return;
     }
     const kind = $('#eye-tool').value;
+    if (kind.startsWith('replan:')) {
+      const rk = kind.slice(7);
+      const item = $('#closet-item').value;
+      cmd('replan', { scene: E.key, kind: rk, x: pt.x, y: rk === 'closet' ? pt.y : pt.y, items: item ? { [item]: 1 } : {}, text: $('#closet-text').value });
+      return;
+    }
     if (kind) {
       cmd('hazard', { scene: E.key, kind, x: pt.x, y: pt.y, minutes: $('#eye-minutes').value });
       return;
@@ -1883,6 +1938,14 @@
   /** «Дом в разрезе»: где сейчас кто, этажи сверху вниз. */
   function renderEyeSide() {
     renderPuppets();
+    const ovs = A.snap.world.overlays || [];
+    memo('overlays', ovs.map((o) => o.id), () => {
+      $('#eye-overlays').replaceChildren(
+        ...(ovs.length
+          ? ovs.map((o) => h('li', null, h('span', { class: 'txt' }, h('b', { text: { wall: 'Замуровано', rubble: 'Завал', closet: 'Кладовка' }[o.kind] || o.kind }), ` — ${o.title}${o.label ? ` (${o.label})` : ''}`), button('Глазок', () => watchScene(o.scene), 'small'), button('Убрать', () => cmd('replanClear', { scene: o.scene, id: o.id }), 'small')))
+          : [h('li', { class: 'calm', text: 'Дом как на чертеже.' })]),
+      );
+    });
     const groups = new Map();
     const add = (k) => groups.get(k) || groups.set(k, []).get(k);
     for (const p of alivePlayers()) if (p.scene) add(p.scene).push(p);

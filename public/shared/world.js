@@ -221,7 +221,50 @@
     return h >>> 0;
   }
 
+  // Перепланировка ЖЭК: накладки на схемы (одни и те же на сервере и у жильцов)
+  const OVERLAY_LEGEND = {
+    Z: { type: 'rubble', label: 'Завал', decor: true },
+    K: { type: 'closet', label: 'Кладовка', wall: true },
+  };
+
+  /** Применить накладки к строкам схемы: 'wall' — замуровать, 'rubble' — завал, 'closet' — кладовка в стене. */
+  function applyOverlays(rows, list) {
+    if (!list || !list.length) return rows;
+    const grid = rows.map((r) => r.split(''));
+    for (const ov of list) {
+      const ch = ov.kind === 'wall' ? '#' : ov.kind === 'rubble' ? 'Z' : ov.kind === 'closet' ? 'K' : null;
+      if (!ch) continue;
+      for (const [x, y] of ov.tiles || []) if (grid[y] && grid[y][x] != null) grid[y][x] = ch;
+    }
+    return grid.map((r) => r.join(''));
+  }
+
+  /**
+   * Достижимость: какие объекты (с точкой подхода) недоступны от точки from. Нужна, чтобы завал
+   * не отрезал жильцов от дверей, лифта и лестницы.
+   */
+  function unreachableObjects(scene, from) {
+    const W = scene.w;
+    const seen = new Uint8Array(scene.w * scene.h);
+    const sx = Math.floor(from.x), sy = Math.floor(from.y);
+    if (isSolidTile(scene, sx, sy)) return scene.objects.filter((o) => o.spot && !o.decor);
+    const stack = [[sx, sy]];
+    seen[sy * W + sx] = 1;
+    while (stack.length) {
+      const [x, y] = stack.pop();
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nx = x + dx, ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= scene.w || ny >= scene.h || seen[ny * W + nx] || isSolidTile(scene, nx, ny)) continue;
+        seen[ny * W + nx] = 1;
+        stack.push([nx, ny]);
+      }
+    }
+    return scene.objects.filter((o) => o.spot && !o.decor && !seen[Math.floor(o.spot.y) * W + Math.floor(o.spot.x)]);
+  }
+
   function buildScene(key, kind, rows, legend, extra) {
+    legend = { ...OVERLAY_LEGEND, ...legend };
+    rows = applyOverlays(rows, extra && extra.overlays);
     const h = rows.length;
     const w = rows[0].length;
     const solid = new Uint8Array(w * h);
@@ -399,6 +442,7 @@
           .replace(/f/g, facility ? 'F' : '#'),
       );
       return buildScene(key, 'corridor', rows, t.legend, {
+        overlays: (config.overlays || {})[key],
         floor,
         lamps: t.lamps,
         style: kind === 'technical' ? { ...t.style, ...TECHNICAL_STYLE } : t.style,
@@ -417,10 +461,10 @@
       if (kind === 'corridor') s = corridor(key, Number(arg));
       else if (kind === 'home') {
         const t = TEMPLATES.home;
-        s = buildScene(key, 'home', t.rows, t.legend, { lamps: t.lamps, style: t.style, floor: Math.floor(Number(arg) / 100) });
+        s = buildScene(key, 'home', t.rows, t.legend, { overlays: (config.overlays || {})[key], lamps: t.lamps, style: t.style, floor: Math.floor(Number(arg) / 100) });
       } else if (TEMPLATES[kind]) {
         const t = TEMPLATES[kind];
-        s = buildScene(key, kind, t.rows, t.legend, { lamps: t.lamps, style: t.style, floor: config.facilities[kind] ?? null });
+        s = buildScene(key, kind, t.rows, t.legend, { overlays: (config.overlays || {})[key], lamps: t.lamps, style: t.style, floor: config.facilities[kind] ?? null });
       } else {
         throw new Error(`Нет сцены ${key}`);
       }
@@ -453,5 +497,5 @@
     return { scene, spawn, floorKind, facilityByFloor };
   }
 
-  return { SPEED, RADIUS, REACH, TEMPLATES, create, canStand, isSolidTile, distToObject, nearObject, findPath, hash };
+  return { SPEED, RADIUS, REACH, TEMPLATES, create, canStand, isSolidTile, distToObject, nearObject, findPath, hash, unreachableObjects };
 });

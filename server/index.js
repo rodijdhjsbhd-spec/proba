@@ -245,7 +245,7 @@ function bind(ws, player) {
   socketsByPlayer.get(player.id).add(ws);
   clearTimeout(offlineTimers.get(player.id));
   offlineTimers.delete(player.id);
-  send(ws, { t: 'welcome', id: player.id, token: player.token, catalog: ITEM_CATALOG, world: WORLD_CONFIG, config: { touchReach: BALANCE.touchReach } });
+  send(ws, { t: 'welcome', id: player.id, token: player.token, catalog: ITEM_CATALOG, world: game.worldConfig(), config: { touchReach: BALANCE.touchReach } });
   lastActors.delete(player.id);
   send(ws, { t: 'chat_history', ...game.chatHistory(player) });
   game.setOnline(player.id, true); // после приветствия: квитанция «Пока вас не было» придёт уже в игру
@@ -379,6 +379,13 @@ game.on('restored', () => {
 
 // Одержимые вещи: мусоропровод говорит с теми, кто рядом
 game.on('object_say', ({ to, object, text }) => sendToPlayer(to, { t: 'object_say', object, text }));
+// Перепланировка: новая схема помещений — всем жильцам и Пультам
+game.on('world_changed', () => {
+  const world = game.worldConfig();
+  for (const [pid] of socketsByPlayer) sendToPlayer(pid, { t: 'world', world });
+  for (const ws of admins) send(ws, { t: 'world', world });
+});
+
 // «Звук в доме» из Пульта
 game.on('sound', ({ to, kind, text }) => sendToPlayer(to, { t: 'sound', kind, text }));
 
@@ -411,6 +418,8 @@ const PLAYER_ACTIONS = {
   stash_put: (p, a) => game.stashMove(p, String(a.item || ''), a.count, true),
   stash_take: (p, a) => game.stashMove(p, String(a.item || ''), a.count, false),
   stash: (p) => game.searchStash(p),
+  closet: (p) => game.closetSearch(p),
+  anomaly_floor: (p) => game.anomalyFloor(p),
   repair_start: (p) => game.repairStart(p),
   window_put: (p, a) => game.windowPut(p, String(a.item || ''), a.count),
   window_take: (p, a) => game.windowTake(p, String(a.item || ''), a.count),

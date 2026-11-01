@@ -2331,3 +2331,77 @@ test('сценарий: остановиться, если никто не по�
   assert.equal(game.state.scenarioRuns.length, 0);
   assert.ok(C.CUSTOM_PRESETS.pipe, 'заготовки — в content.js');
 });
+
+test('перепланировка: замуровать дверь, завал с проверкой достижимости, кладовка с находкой', () => {
+  const { game } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  game.admin('teleport', { id: b.id, place: 'corridor', floor: 101 });
+  const sc = game.map.scene('corridor:101');
+  const doorB = sc.objects.find((o) => o.type === 'apt' && o.number === b.apartment.number);
+  const changed = [];
+  game.on('world_changed', () => changed.push(1));
+  // замуровать квартиру Марии: войти домой нельзя
+  assert.equal(game.admin('replan', { scene: 'corridor:101', kind: 'wall', x: doorB.x, y: doorB.y }).ok, true);
+  assert.equal(changed.length, 1, 'всем разослали новую схему');
+  b.pos = { ...doorB.spot, d: 'up' };
+  assert.equal(game.move(b, { place: 'home' }).ok, false);
+  // лифт не замуровать
+  const lift = sc.objects.find((o) => o.type === 'lift');
+  assert.equal(game.admin('replan', { scene: 'corridor:101', kind: 'wall', x: lift.x, y: lift.y }).ok, false);
+  // завал, который отрезал бы половину коридора — нельзя
+  const H = sc.h;
+  let cut = 0;
+  for (let y = 1; y < H - 1; y++) if (game.admin('replan', { scene: 'corridor:101', kind: 'rubble', x: 20, y }).ok) cut++;
+  assert.ok(cut < H - 2, 'последний камень, перекрывающий проход, не положить');
+  // кладовка в стене (над полом) с тушёнкой
+  const r = game.admin('replan', { scene: 'corridor:101', kind: 'closet', x: 7, y: 1, items: { stew: 1 }, text: 'Банки на полке.' });
+  assert.equal(r.ok, true, r.error);
+  const closet = game.map.scene('corridor:101').objects.find((o) => o.type === 'closet');
+  b.pos = { ...closet.spot, d: 'up' };
+  assert.equal(game.closetSearch(b).ok, true);
+  assert.equal(b.inventory.stew, 1);
+  assert.equal(game.closetSearch(b).ok, false, 'второй раз — пусто');
+  // другой жилец находит пустую полку: вещи не размножаются
+  const c2 = join(game, 'Пётр');
+  c2.location = { ...b.location };
+  c2.pos = { ...b.pos };
+  const r2 = game.closetSearch(c2);
+  assert.equal(r2.ok, true);
+  assert.match(r2.message, /пусто/);
+  assert.equal(c2.inventory.stew || 0, 0);
+  // убрать всё — дверь снова на месте
+  game.admin('replanClear', { scene: 'corridor:101' });
+  assert.ok(game.map.scene('corridor:101').objects.some((o) => o.type === 'apt' && o.number === b.apartment.number));
+  assert.ok(a);
+});
+
+test('аномалии: лишний этаж, дверь не туда, петля на лестнице; вред — только по выбору', () => {
+  const { game, clock } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('anomaly', { kind: 'extraFloor', label: '100½' });
+  assert.equal(game.playerView(p).world.extraFloor, '100½');
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  walkTo(game, p, type('lift'));
+  const san = p.stats.sanity;
+  assert.equal(game.anomalyFloor(p).ok, true);
+  assert.equal(p.stats.sanity, san, 'без вреда');
+  // дверь не туда
+  game.admin('anomaly', { kind: 'wrongDoor', facility: 'canteen', to: 'medpost' });
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 100 });
+  walkTo(game, p, (o) => o.type === 'facility');
+  assert.equal(game.move(p, { place: 'canteen' }).ok, true);
+  assert.equal(p.location.place, 'medpost');
+  // петля на лестнице
+  game.admin('anomaly', { kind: 'stairLoop', from: 101, to: 103, harm: true });
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  walkTo(game, p, type('stairs'));
+  assert.equal(game.startTravel(p, 104, 'stairs').ok, true);
+  clock.t = p.travel.arriveAt + 1;
+  const s2 = p.stats.sanity;
+  game.arrive(p);
+  assert.equal(p.location.floor, 101, 'вышли туда же');
+  assert.ok(p.stats.sanity < s2, 'с вредом — рассудок');
+  game.admin('anomaly', { kind: 'stairLoop', off: true });
+  assert.equal(game.world.anomalies.stairLoop, null);
+});

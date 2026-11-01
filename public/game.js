@@ -158,6 +158,13 @@
         for (const [pid, b] of S.bubbles) if (b.msgId === msg.id) S.bubbles.delete(pid);
         renderChat();
         break;
+      case 'world':
+        // ЖЭК перепланировал помещения: новая схема, сцену пересобираем
+        S.map = World.create(msg.world);
+        renderer.scene = null;
+        S.sceneKey = null;
+        syncScene();
+        break;
       case 'catalog':
         // ЖЭК добавил новый предмет — обновим справочник названий
         S.catalog = msg.catalog || {};
@@ -421,6 +428,7 @@
     cabinet: 'Шкаф с лекарствами. На замке.',
     couch: 'Холодная клеёнчатая кушетка.',
     wardrobe: 'В шкафу пусто. Пахнет нафталином.',
+    rubble: 'Завал: битый кирпич, арматура, куски перекрытия. Не пройти.',
     stove: 'Плитка на две конфорки. Одна не работает.',
     sink: 'Из крана капает ржавая вода.',
     table: 'На столе — кружка и крошки.',
@@ -484,6 +492,8 @@
       }
       case 'board':
         return { label: 'Доска объявлений', actions: [{ label: 'Читать', run: () => openBoard(o) }] };
+      case 'closet':
+        return { label: 'Кладовка', sub: 'вчера её здесь не было', actions: [{ label: 'Заглянуть', run: async () => { const r = await act('closet'); if (r.ok) showPaper('Кладовка', r.message); } }] };
       case 'wardrobe':
         if (v.here.ownHome && (you.furniture || []).includes('stash_box')) {
           return { label: 'Шкаф-тайник', sub: (you.stash || []).length ? `внутри: ${you.stash.map((x) => `${x.name} ×${x.count}`).join(', ')}` : 'пусто', actions: [{ label: 'Открыть тайник', run: () => openStash() }] };
@@ -908,6 +918,10 @@
         return;
       }
       const dests = [{ label: 'Домой', floor: you.apartment.floor }];
+      // «лишний этаж» на табло — только в лифте
+      const extra = via === 'lift' && v.world.extraFloor
+        ? h('button', { class: 'btn ghost-floor', onclick: async () => { const r = await act('anomaly_floor'); if (r.ok) { closeSheet(); say(r.message); } } }, h('span', { text: `Этаж ${v.world.extraFloor}` }), h('small', { text: 'кнопка, которой вчера не было' }))
+        : null;
       for (const [key, f] of Object.entries(v.facilities)) dests.push({ label: f.name, floor: f.floor, key });
       const cost = (floor) => {
         const diff = Math.abs(floor - here);
@@ -925,6 +939,7 @@
         h(
           'div',
           { class: 'dest-grid' },
+          extra,
           dests.map((d) =>
             h(
               'button',
