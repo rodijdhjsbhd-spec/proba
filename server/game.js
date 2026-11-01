@@ -95,6 +95,7 @@ function freshState() {
       lastSupplyDay: null,
       supplyNext: 1, // множитель следующего завоза (ЖЭК может устроить недовоз)
       lampsOut: {}, // этаж → номера погасших ламп в коридоре
+      hazards: {}, // сцена → опасности на клетках [{ id, kind, x, y, fenced, until }]
     },
     players: {},
     trades: {},
@@ -107,6 +108,7 @@ function freshState() {
     noteFeed: [], // лента записок и листков для Пульта
     schedule: [], // планировщик ЖЭК: отложенные и повторяющиеся команды
     accounts: {}, // логин (строчными) → паспорт жильца { login, salt, hash, playerIds, banned }
+    palette: { conditions: {}, accidents: {}, items: {} }, // беды и предметы, придуманные в Пульте
     stock: null, // запасы столовой и медпункта на сегодня: { canteen: { ключ: штук } } — заполняется при загрузке
     bannedIps: {}, // адрес → { until, reason }
   };
@@ -127,6 +129,8 @@ class Game extends EventEmitter {
     this.localChat = new Map(); // key → последние сообщения (только в памяти)
     this.byToken = new Map();
     this.map = World.create(WORLD_CONFIG);
+    this.state.palette = this.state.palette || { conditions: {}, accidents: {}, items: {} };
+    this.applyPalette();
     if (!this.state.stock) this.state.stock = this.fullStock(1);
     if (this.world.lastSupplyDay == null) {
       // сегодняшний завоз уже был, если сейчас позже часа завоза
@@ -136,6 +140,7 @@ class Game extends EventEmitter {
     }
     this.lastKnock = new Map();
     this.knocks = new Map(); // хозяин → кто стучит { guestId, ts }
+    this.groupSince = new Map(); // сцена → с какого момента там собралось 3+ жильцов (для режиссёра)
     this.refusals = new Map(); // гость → кто не открыл ему в туман или выставил { apt, owner, ts, kind }
     for (const p of Object.values(this.state.players)) {
       this.byToken.set(p.token, p.id);
@@ -155,6 +160,7 @@ class Game extends EventEmitter {
     const s = { ...fresh, ...state };
     s.world = { ...fresh.world, ...(state.world || {}) };
     s.world.lampsOut = s.world.lampsOut || {};
+    s.world.hazards = s.world.hazards || {};
     s.world.breakdowns = { ...fresh.world.breakdowns, ...((state.world || {}).breakdowns || {}) };
     for (const p of Object.values(s.players || {})) {
       p.inventory = p.inventory || {};
@@ -634,8 +640,45 @@ class Game extends EventEmitter {
     if (dist > 0.01) {
       p.movedAt = now;
       if (p.sleeping && dist > 0.1) p.sleeping = false;
+      this.checkHazards(p, now);
     }
     return true;
+  }
+
+  /** Наступил на опасность, которую поставил бог (если её не огородили). */
+  checkHazards(p, now) {
+    const list = this.world.hazards[this.locationKey(p)];
+    if (!list || !list.length) return;
+    for (const hz of list) {
+      if (hz.fenced || Math.hypot(p.pos.x - hz.x, p.pos.y - hz.y) > 0.45) continue;
+      p.hazardHits = p.hazardHits || {};
+      if (now - (p.hazardHits[hz.id] || 0) < 10000) continue;
+      p.hazardHits[hz.id] = now;
+      const def = C.HAZARDS[hz.kind];
+      const acc = C.ACCIDENTS[def.accident];
+      this.notify([p], { title: def.name, text: acc.text, style: 'danger' });
+      this.markHarm(p);
+      this.applyEffect(p, { ...acc.effect, condition: acc.condition }, acc.name);
+      this.log(`${p.name} наступил: ${def.name} (${this.placeTitle(p)})`, 'accident', p.id);
+    }
+  }
+
+  /** Огородить опасность рядом — табличка «Осторожно» убережёт тех, кто придёт позже. */
+  fenceHazard(p, hazardId) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    const list = this.world.hazards[this.locationKey(p)] || [];
+    const hz = list.find((x) => x.id === hazardId);
+    if (!hz) return { ok: false, error: 'Здесь такого нет.' };
+    if (hz.fenced) return { ok: false, error: 'Уже огорожено.' };
+    if (Math.hypot(p.pos.x - hz.x, p.pos.y - hz.y) > 1.6) return { ok: false, error: 'Подойдите ближе.' };
+    hz.fenced = true;
+    hz.fencedBy = p.name;
+    p.deeds = p.deeds || { helped: 0 };
+    p.deeds.helped++;
+    this.journal(p, `Вы огородили: ${C.HAZARDS[hz.kind].name}. Теперь никто не наступит.`, 'good');
+    this.log(`${p.name} огородил опасность: ${C.HAZARDS[hz.kind].name} (${this.placeTitle(p)})`, 'social', p.id);
+    this.dirty([p.id, ...this.othersAt(p).map((q) => q.id)]);
+    return { ok: true, message: 'Огорожено. Табличка «Осторожно» висит.' };
   }
 
   /** Кого видно в сцене: живые жильцы в сети. */
@@ -951,6 +994,101 @@ class Game extends EventEmitter {
       groups.get(key).push(p);
     }
     for (const p of alive) this.tickPlayer(p, now, dt, groups);
+    // режиссёр: где жильцы собрались вместе и как давно
+    for (const [key, list] of groups) {
+      const n = list.filter((p) => this.isOnline(p.id)).length;
+      if (n >= 3) {
+        if (!this.groupSince.has(key)) this.groupSince.set(key, now);
+      } else this.groupSince.delete(key);
+    }
+    for (const key of [...this.groupSince.keys()]) if (!groups.has(key)) this.groupSince.delete(key);
+  }
+
+  /** Всё, что нужно Глазку ЖЭК, чтобы нарисовать сцену так, как её видят жильцы. */
+  sceneSnapshot(key) {
+    let scene;
+    try {
+      scene = this.map.scene(key);
+    } catch {
+      return null;
+    }
+    const floor = scene.floor;
+    const fog = this.world.fog && this.fogPhase() === 'active' && floor != null && floor >= this.world.fog.from && floor <= this.world.fog.to;
+    const apt = key.startsWith('home:') ? key.slice(5) : null;
+    const residents = {};
+    if (scene.kind === 'corridor') {
+      for (const o of scene.objects.filter((x) => x.type === 'apt')) {
+        const r = this.ownerOf(o.number);
+        if (r) residents[o.number] = { number: o.number, name: r.name, online: this.isOnline(r.id) };
+      }
+    }
+    return {
+      key,
+      title: this.sceneTitle(key),
+      actors: this.sceneActors(key),
+      hazards: (this.world.hazards[key] || []).map((hz) => ({ id: hz.id, kind: hz.kind, x: hz.x, y: hz.y, fenced: !!hz.fenced })),
+      lampsOut: scene.kind === 'corridor' ? this.world.lampsOut[floor] || [] : [],
+      dark: floor != null && this.isDark(floor),
+      fog: fog ? (apt ? (this.doorSealed(apt) ? 'window' : 'leak') : 'outside') : null,
+      sealed: apt ? this.doorSealed(apt) : false,
+      liftBroken: !!this.world.breakdowns.lift,
+      residents,
+      gameMinutes: Math.floor(this.world.gameMinutes) % 1440,
+    };
+  }
+
+  /** Название сцены по ключу (для подсказок режиссёра). */
+  sceneTitle(key) {
+    const [kind, arg] = String(key).split(':');
+    if (kind === 'corridor') return `Коридор ${arg} этажа`;
+    if (kind === 'home') return `Кв. ${arg}`;
+    return C.PLACES[kind]?.name || kind;
+  }
+
+  /**
+   * Режиссёр-подсказчик для Пульта: что сейчас интересного в доме и шкала напряжения.
+   * Сам ничего не делает — только подсказывает богу.
+   */
+  director() {
+    const now = this.now();
+    const alive = this.alivePlayers();
+    const online = alive.filter((p) => this.isOnline(p.id));
+    const hints = [];
+    for (const [key, since] of this.groupSince) {
+      const min = Math.floor((now - since) / 60000);
+      if (min < 5) continue;
+      const n = online.filter((p) => this.locationKey(p) === key).length;
+      hints.push({ id: `group:${key}`, level: 'info', text: `${this.sceneTitle(key)}: ${n} жильцов вместе уже ${min} мин.`, scene: key });
+    }
+    for (const p of alive) {
+      if (p.down) {
+        hints.push({ id: `down:${p.id}`, level: 'danger', text: `${p.name} без сознания — ${Math.max(0, Math.ceil((p.down.until - now) / 1000))} с. Поможет ли кто-нибудь?`, playerId: p.id });
+        continue;
+      }
+      const harms = (p.harmLog || []).filter((t) => now - t < 3600 * 1000).length;
+      if (harms >= 3) hints.push({ id: `harm:${p.id}`, level: 'warn', text: `${p.name}: бед от ЖЭК за час — ${harms}. Не слишком ли часто одному?`, playerId: p.id });
+      if (this.isOnline(p.id) && p.stats.health < 25 && !this.othersAt(p).length) {
+        hints.push({ id: `low:${p.id}`, level: 'warn', text: `У ${p.name} ${Math.round(p.stats.health)} здоровья, рядом никого.`, playerId: p.id });
+      }
+      if (this.isOnline(p.id) && p.tutorial && !p.tutorial.rewarded && now - p.createdAt > 10 * 60000 && p.tutorial.done.length < 3) {
+        hints.push({ id: `newbie:${p.id}`, level: 'info', text: `Новосёл ${p.name} уже ${Math.floor((now - p.createdAt) / 60000)} мин не может освоиться (шагов памятки: ${p.tutorial.done.length}).`, playerId: p.id });
+      }
+    }
+    const empty = [];
+    for (const [shop, items] of Object.entries(this.state.stock || {})) {
+      for (const [key, n] of Object.entries(items)) if (n <= 0) empty.push(C.ITEMS[key]?.name || this.shopEntries(shop).find((e) => e.key === key)?.name || key);
+    }
+    if (empty.length) hints.push({ id: `stock:${empty.join(',')}`, level: 'info', text: `Кончилось: ${empty.join(', ')}. Завоз в 0${B.supplyHour}:00.` });
+    const events = this.state.log.filter((e) => ['event', 'accident', 'death', 'disease'].includes(e.kind));
+    const last = events[events.length - 1];
+    if (online.length && (!last || now - last.ts > 15 * 60000)) {
+      hints.push({ id: 'quiet', level: 'info', text: `В доме тихо${last ? `: последнее событие ${Math.floor((now - last.ts) / 60000)} мин назад` : ''}. Жильцов в сети: ${online.length}.` });
+    }
+    const recent = events.filter((e) => now - e.ts < 15 * 60000).length;
+    const deaths = this.state.log.filter((e) => e.kind === 'death' && now - e.ts < 30 * 60000).length;
+    const downs = alive.filter((p) => p.down).length;
+    const tension = Math.max(0, Math.min(100, recent * 12 + deaths * 20 + downs * 15 + (this.world.fog ? 30 : 0) + (this.world.power ? 10 : 0)));
+    return { tension, hints };
   }
 
   updateWorldTimers(now) {
@@ -982,6 +1120,11 @@ class Game extends EventEmitter {
     if (this.world.tick % 60 === 0) {
       this.archiveDead(now);
       this.expireBoardNotes(now);
+    }
+    for (const [key, list] of Object.entries(this.world.hazards)) {
+      const left = list.filter((hz) => !hz.until || hz.until > now);
+      if (left.length) this.world.hazards[key] = left;
+      else delete this.world.hazards[key];
     }
   }
 
@@ -1023,6 +1166,48 @@ class Game extends EventEmitter {
       w.shiftsToday = 0;
       w.supplyNext = 1;
     }
+  }
+
+  /** Подмешать беды и предметы из Пульта к стандартным (content.js). */
+  applyPalette() {
+    const pal = this.state.palette;
+    for (const [id, def] of Object.entries(pal.conditions || {})) C.CONDITIONS[id] = def;
+    for (const [id, def] of Object.entries(pal.accidents || {})) C.ACCIDENTS[id] = def;
+    for (const [id, def] of Object.entries(pal.items || {})) C.ITEMS[id] = def;
+  }
+
+  /** Проверить и привести к порядку описание из Пульта. Бросает ошибку с понятным текстом. */
+  cleanPaletteDef(type, raw = {}) {
+    const num = (v, lo, hi) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.max(lo, Math.min(hi, n)) : 0;
+    };
+    const name = sanitizeText(raw.name, 40);
+    if (!name) throw new Error('Нужно название');
+    const stats = (src, lo, hi) => Object.fromEntries(STAT_KEYS.map((k) => [k, num((src || {})[k], lo, hi)]).filter(([, v]) => v));
+    if (type === 'conditions') {
+      const dur = num(raw.durationMin, 0, 600);
+      return {
+        name,
+        kind: raw.kind === 'injury' ? 'injury' : 'disease',
+        durationMin: dur || null,
+        contagious: num(raw.contagious, 0, 1) || undefined,
+        perMin: stats(raw.perMin, -20, 20),
+        blocks: (Array.isArray(raw.blocks) ? raw.blocks : []).filter((b) => ['work', 'stairs'].includes(b)),
+        symptom: sanitizeText(raw.symptom, 40) || undefined,
+        custom: true,
+      };
+    }
+    if (type === 'accidents') {
+      const condition = raw.condition && C.CONDITIONS[raw.condition] ? raw.condition : undefined;
+      return { name, text: sanitizeText(raw.text, 300) || name, effect: { ...stats(raw.effect, -200, 200), ...(raw.kill ? { kill: true } : {}) }, condition, custom: true };
+    }
+    if (type === 'items') {
+      const cure = (Array.isArray(raw.cure) ? raw.cure : []).filter((c) => C.CONDITIONS[c]);
+      const use = { ...stats(raw.use, -100, 100), ...(cure.length ? { cure } : {}) };
+      return { name, desc: sanitizeText(raw.desc, 120) || '', ...(Object.keys(use).length ? { use } : {}), custom: true };
+    }
+    throw new Error('Нет такого раздела палитры');
   }
 
   /** Планировщик ЖЭК: выполнить команды, время которых пришло. */
@@ -2575,6 +2760,106 @@ const ADMIN_COMMANDS = {
     return { ok: true, message: `Спросили: ${victims.length}` };
   },
 
+  /** Своя палитра: новая болезнь/травма, несчастный случай или предмет — без правки кода и перезапуска. */
+  paletteAdd({ type, def }) {
+    const clean = this.cleanPaletteDef(type, def);
+    const pal = this.state.palette;
+    if (Object.keys(pal[type]).length >= 50) throw new Error('В этом разделе палитры уже 50 записей');
+    const id = `x${type[0]}_${crypto.randomBytes(3).toString('hex')}`;
+    pal[type][id] = clean;
+    this.applyPalette();
+    this.emit('content_changed');
+    this.log(`Палитра: добавлено «${clean.name}»`, 'admin');
+    return { ok: true, message: `Добавлено: ${clean.name}`, id };
+  },
+
+  paletteRemove({ type, id }) {
+    const pal = this.state.palette;
+    if (!pal[type] || !pal[type][id]) throw new Error('В палитре такого нет');
+    const name = pal[type][id].name;
+    delete pal[type][id];
+    if (type === 'conditions') {
+      delete C.CONDITIONS[id];
+      for (const p of this.players()) p.conditions = p.conditions.filter((c) => c.id !== id);
+    }
+    if (type === 'accidents') delete C.ACCIDENTS[id];
+    if (type === 'items') {
+      delete C.ITEMS[id];
+      for (const p of this.players()) delete p.inventory[id];
+      // вещь исчезает отовсюду: из обменов, передачек под дверью и рецептов лечения
+      for (const t of Object.values(this.state.trades)) if (t.give.items[id] || t.want.items[id]) delete this.state.trades[t.id];
+      for (const drops of Object.values(this.state.doorDrops)) for (const d of drops) if (d.bundle && d.bundle.items) delete d.bundle.items[id];
+    }
+    if (type === 'conditions') {
+      for (const it of Object.values(C.ITEMS)) if (it.use && it.use.cure) it.use.cure = it.use.cure.filter((c) => c !== id);
+      for (const a of Object.values(C.ACCIDENTS)) if (a.condition === id) delete a.condition;
+    }
+    this.emit('content_changed');
+    this.log(`Палитра: удалено «${name}»`, 'admin');
+    return { ok: true, message: `Удалено: ${name}` };
+  },
+
+  /**
+   * Опасность на клетке сцены. scene — ключ сцены ('corridor:101', 'canteen', 'home:10101') или
+   * playerId — тогда сцена жильца и клетка рядом с ним. Без x/y — случайная свободная клетка.
+   */
+  hazard({ scene, playerId, kind = 'steam', x, y, minutes = 0 }) {
+    if (!C.HAZARDS[kind]) throw new Error('Нет такой опасности');
+    let key = scene;
+    let near = null;
+    if (playerId) {
+      const p = this.requirePlayer(playerId);
+      key = this.locationKey(p);
+      near = p.pos;
+    }
+    if (!key) throw new Error('Где ставить? Укажите сцену или жильца');
+    let sc;
+    try {
+      sc = this.map.scene(key);
+    } catch {
+      throw new Error('Нет такой сцены');
+    }
+    let pos = null;
+    if (x != null && x !== '' && y != null && y !== '') {
+      // клик в Глазке: ровно в эту клетку, а не куда попало
+      const cx = Math.floor(Number(x)) + 0.5, cy = Math.floor(Number(y)) + 0.5;
+      if (!Number.isFinite(cx) || !Number.isFinite(cy) || World.isSolidTile(sc, Math.floor(cx), Math.floor(cy))) throw new Error('Туда не поставить: стена или мебель');
+      pos = { x: cx, y: cy };
+    }
+    if (!pos) {
+      const free = [];
+      for (let ty = 0; ty < sc.h; ty++) {
+        for (let tx = 0; tx < sc.w; tx++) {
+          if (World.isSolidTile(sc, tx, ty)) continue;
+          const c = { x: tx + 0.5, y: ty + 0.5 };
+          // не на подходах к дверям и предметам — чтобы не перекрыть проход
+          if (sc.objects.some((o) => o.spot && Math.hypot(o.spot.x - c.x, o.spot.y - c.y) < 0.9)) continue;
+          if (near && Math.hypot(near.x - c.x, near.y - c.y) > 3) continue;
+          if (near && Math.hypot(near.x - c.x, near.y - c.y) < 1) continue;
+          free.push(c);
+        }
+      }
+      if (!free.length) throw new Error('Некуда поставить');
+      pos = free[Math.floor(this.random() * free.length)];
+    }
+    const hz = { id: newId('h'), kind, x: pos.x, y: pos.y, fenced: false, until: Number(minutes) > 0 ? this.now() + Number(minutes) * 60000 : null };
+    this.world.hazards[key] = [...(this.world.hazards[key] || []), hz].slice(-20);
+    this.log(`Опасность «${C.HAZARDS[kind].name}» — ${key}`, 'event');
+    return { ok: true, message: `${C.HAZARDS[kind].name}: ${key}`, id: hz.id };
+  },
+
+  hazardClear({ scene, id }) {
+    let n = 0;
+    for (const [key, list] of Object.entries(this.world.hazards)) {
+      if (scene && key !== scene) continue;
+      const left = list.filter((hz) => id && hz.id !== id);
+      n += list.length - left.length;
+      if (left.length) this.world.hazards[key] = left;
+      else delete this.world.hazards[key];
+    }
+    return { ok: true, message: `Убрано опасностей: ${n}` };
+  },
+
   /** Снабжение: 'extra' — внеплановый завоз сейчас (+50% нормы), 'short' — недовоз в следующий раз, 'normal' — отменить недовоз. */
   supply({ mode }) {
     if (mode === 'extra') {
@@ -2896,6 +3181,7 @@ Game.prototype.describePlace = function describePlace(p) {
     rank: this.bestRank(q),
   }));
   const here = { key: this.locationKey(p), place: l.place, floor: l.floor, title: this.placeTitle(p), text: '', people, shop: null, residents: null, closed: null };
+  here.hazards = (this.world.hazards[here.key] || []).map((hz) => ({ id: hz.id, kind: hz.kind, name: C.HAZARDS[hz.kind].name, x: hz.x, y: hz.y, fenced: !!hz.fenced }));
 
   switch (l.place) {
     case 'home': {
@@ -2997,6 +3283,8 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
     },
     online: this.onlineSet.size,
     archived: this.state.archive.length,
+    director: this.director(),
+    hazards: Object.entries(this.world.hazards).flatMap(([key, list]) => list.map((hz) => ({ ...hz, scene: key, title: this.sceneTitle(key), name: C.HAZARDS[hz.kind].name }))),
     schedule: this.state.schedule
       .slice()
       .sort((a, b) => a.at - b.at)
@@ -3028,6 +3316,7 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       money: p.money,
       inventory: p.inventory,
       location: { ...p.location, title: this.placeTitle(p) },
+      scene: this.locationKey(p),
       travel: p.travel ? { via: p.travel.via, toFloor: p.travel.toFloor, stuck: !!p.travel.stuck } : null,
       sealed: this.doorSealed(p.apartment.number),
       guestAt: p.location.place === 'home' && this.currentApt(p) !== p.apartment.number ? this.currentApt(p) : null,
@@ -3058,6 +3347,9 @@ Game.prototype.adminContent = function adminContent() {
     accidents: Object.fromEntries(Object.entries(C.ACCIDENTS).map(([k, v]) => [k, { name: v.effect && v.effect.kill ? `${v.name} — смертельно` : v.name, text: v.text }])),
     breakdowns: pickNames(C.BREAKDOWNS),
     places: Object.fromEntries(MOVE_PLACES.map((k) => [k, C.PLACES[k].name])),
+    hazards: Object.fromEntries(Object.entries(C.HAZARDS).map(([k, v]) => [k, v.name])),
+    palette: this.state.palette,
+    world: WORLD_CONFIG,
   };
 };
 

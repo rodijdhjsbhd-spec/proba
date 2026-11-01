@@ -223,6 +223,14 @@ const ACCIDENTS = {
   liftShaft: { name: 'Падение в шахту лифта', text: 'Двери лифта открылись. Кабины за ними не было.', effect: { kill: true } },
 };
 
+// Опасности, которые бог ставит прямо на клетку помещения. Наступил — несчастный случай accident.
+const HAZARDS = {
+  steam: { name: 'Лужа кипятка', accident: 'burn' },
+  wire: { name: 'Оголённый провод', accident: 'shock' },
+  hole: { name: 'Провал в полу', accident: 'legBreak' },
+  rats: { name: 'Крысиная нора', accident: 'rat' },
+};
+
 // ---------------------------------------------------------------------------
 // Места, по которым ходит игрок
 // ---------------------------------------------------------------------------
@@ -298,5 +306,5 @@ const NOTES = {
 
 module.exports = {
   BUILDING, FACILITIES, BALANCE, ITEMS, SHOPS, CONDITIONS, ACCIDENTS, PLACES, BREAKDOWNS, HALLUCINATIONS,
-  HALLUCINATION_VOICES, RESERVED_NAMES, ARCHIVE_DEAD_AFTER_H, NOTES, RANKS, TUTORIAL, ECHO_PHRASES,
+  HALLUCINATION_VOICES, RESERVED_NAMES, ARCHIVE_DEAD_AFTER_H, NOTES, RANKS, TUTORIAL, ECHO_PHRASES, HAZARDS,
 };

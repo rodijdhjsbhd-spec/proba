@@ -352,6 +352,7 @@ body.sanity-critical .place h1 { animation: flicker 2s infinite; }
 .prompt { min-height: 42px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 0; }
 .prompt .label { font-weight: 700; margin-right: 4px; }
 .prompt .label small { font-weight: 400; color: var(--muted); }
+.prompt .label.danger { color: var(--red); }
 .prompt kbd, .controls-hint kbd {
   font-family: var(--mono); font-size: 11px; border: 1px solid var(--line); border-bottom-width: 2px;
   border-radius: 3px; padding: 0 5px; color: var(--muted); background: #151716;

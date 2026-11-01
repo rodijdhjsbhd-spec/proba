@@ -25,7 +25,7 @@ const { Game, WORLD_CONFIG } = require('./game');
 const storage = require('./storage');
 const { BALANCE, ITEMS } = require('./content');
 
-const ITEM_CATALOG = Object.fromEntries(Object.entries(ITEMS).map(([id, it]) => [id, it.name]));
+let ITEM_CATALOG = Object.fromEntries(Object.entries(ITEMS).map(([id, it]) => [id, it.name]));
 
 const ROOT = path.join(__dirname, '..');
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -267,6 +267,13 @@ game.on('kick', ({ ids, reason, until }) => {
   }
 });
 
+// Палитра бед изменилась: обновить справочники у админов и игроков
+game.on('content_changed', () => {
+  ITEM_CATALOG = Object.fromEntries(Object.entries(ITEMS).map(([id, it]) => [id, it.name]));
+  for (const ws of admins) send(ws, { t: 'admin_content', content: game.adminContent() });
+  for (const [pid] of socketsByPlayer) sendToPlayer(pid, { t: 'catalog', catalog: ITEM_CATALOG });
+});
+
 // Удалённое сообщение исчезает у всех
 game.on('chat_delete', ({ id }) => {
   for (const [pid] of socketsByPlayer) sendToPlayer(pid, { t: 'chat_delete', id });
@@ -288,6 +295,7 @@ const PLAYER_ACTIONS = {
   rob: (p, a) => game.rob(p, a.target),
   pickpocket: (p, a) => game.pickpocket(p, a.target),
   fix_lamp: (p, a) => game.fixLamp(p, a.index),
+  fence: (p, a) => game.fenceHazard(p, String(a.id || '')),
   echo: (p, a) => game.echo(p, a.phrase),
   tutorial_hide: (p) => {
     if (p.tutorial) p.tutorial.hidden = true;
@@ -481,7 +489,7 @@ function handlePlayerMessage(ws, raw) {
       console.error('[action]', msg.action, err);
       res = { ok: false, error: 'Что-то пошло не так.' };
     }
-    send(ws, { t: 'res', id: msg.id, ...res });
+    send(ws, { t: 'res', ...res, id: msg.id }); // id запроса важнее: в res может быть свой id (созданной записи)
     pushView(p.id);
     syncLocation(p.id);
   }
@@ -556,9 +564,16 @@ function handleAdminMessage(ws, ip, raw) {
     return;
   }
 
+  // Глазок ЖЭК: какую сцену показывать этому админу
+  if (msg.t === 'watch') {
+    ws.watchKey = msg.key ? String(msg.key).slice(0, 40) : null;
+    ws.watchSig = null;
+    return;
+  }
+
   if (msg.t === 'cmd') {
     const res = game.admin(String(msg.cmd), msg.args && typeof msg.args === 'object' ? msg.args : {});
-    send(ws, { t: 'res', id: msg.id, ...res });
+    send(ws, { t: 'res', ...res, id: msg.id }); // id запроса важнее: в res может быть свой id (созданной записи)
     send(ws, { t: 'snapshot', snapshot: game.adminSnapshot() });
     for (const [id] of socketsByPlayer) syncLocation(id);
   }
@@ -603,6 +618,15 @@ setInterval(() => {
 }, 100);
 
 function broadcastActors() {
+  // Глазок ЖЭК: админам — состояние выбранной сцены
+  for (const ws of admins) {
+    if (!ws.watchKey) continue;
+    const snap = game.sceneSnapshot(ws.watchKey);
+    const sig = JSON.stringify(snap);
+    if (sig === ws.watchSig) continue;
+    ws.watchSig = sig;
+    send(ws, { t: 'watch', scene: snap });
+  }
   const byScene = new Map();
   for (const [id] of socketsByPlayer) {
     const p = game.getPlayer(id);

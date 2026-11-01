@@ -323,7 +323,9 @@
   // ---------------------------------------------------------------------------
   // Поиск пути (A* по клеткам, 8 направлений без срезания углов)
   // ---------------------------------------------------------------------------
-  function findPath(scene, from, to) {
+  /** A*. opts.avoid(x, y) → доп. стоимость клетки (обходить опасности, если можно). */
+  function findPath(scene, from, to, opts) {
+    const avoid = opts && opts.avoid;
     const sx = Math.floor(from.x), sy = Math.floor(from.y);
     let tx = Math.floor(to.x), ty = Math.floor(to.y);
     if (isSolidTile(scene, tx, ty)) return null;
@@ -350,7 +352,8 @@
           const nx = cx + dx, ny = cy + dy;
           if (isSolidTile(scene, nx, ny) || closed[idx(nx, ny)]) continue;
           if (dx && dy && (isSolidTile(scene, cx + dx, cy) || isSolidTile(scene, cx, cy + dy))) continue;
-          const cost = g[idx(cx, cy)] + (dx && dy ? Math.SQRT2 : 1);
+          let cost = g[idx(cx, cy)] + (dx && dy ? Math.SQRT2 : 1);
+          if (avoid && !(nx === tx && ny === ty)) cost += avoid(nx, ny) || 0;
           if (cost < g[idx(nx, ny)]) {
             g[idx(nx, ny)] = cost;
             came[idx(nx, ny)] = idx(cx, cy);

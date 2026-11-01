@@ -108,6 +108,11 @@
         $('#login').hidden = true;
         $('#app').hidden = false;
         if (!A.built) build();
+        else {
+          // переподключились: палитра могла измениться, а Глазок — надо снова попросить
+          rebuildContent();
+          if (!$('#tab-eye').hidden) send({ t: 'watch', key: E.key });
+        }
         renderLog();
         renderChat();
         renderSnapshot();
@@ -115,6 +120,14 @@
       case 'snapshot':
         A.snap = msg.snapshot;
         renderSnapshot();
+        break;
+      case 'watch':
+        onWatch(msg.scene);
+        break;
+      case 'admin_content':
+        // палитра изменилась — пересобираем списки
+        A.content = msg.content;
+        if (A.built) rebuildContent();
         break;
       case 'log':
         A.log.push(msg.entry);
@@ -283,12 +296,7 @@
   // ---------------------------------------------------------------------------
   function build() {
     A.built = true;
-    for (const tab of document.querySelectorAll('.admin-tabs .tab')) {
-      tab.addEventListener('click', () => {
-        for (const t of document.querySelectorAll('.admin-tabs .tab')) t.classList.toggle('active', t === tab);
-        for (const page of document.querySelectorAll('.tab-page')) page.hidden = page.id !== `tab-${tab.dataset.tab}`;
-      });
-    }
+    for (const tab of document.querySelectorAll('.admin-tabs .tab')) tab.addEventListener('click', () => switchTab(tab.dataset.tab));
     $('#pause-btn').addEventListener('click', () => cmd('pause', { paused: !A.snap.world.paused }));
     $('#player-filter').addEventListener('input', renderPlayers);
     $('#show-dead').addEventListener('change', renderPlayers);
@@ -301,6 +309,26 @@
       if (res.ok) $('#admin-chat-text').value = '';
     });
     buildEvents();
+    buildPalette();
+    initEye();
+  }
+
+  function switchTab(name) {
+    for (const t of document.querySelectorAll('.admin-tabs .tab')) t.classList.toggle('active', t.dataset.tab === name);
+    for (const page of document.querySelectorAll('.tab-page')) page.hidden = page.id !== `tab-${name}`;
+    // Глазок шлёт кадры сцены только пока на него смотрят
+    send({ t: 'watch', key: name === 'eye' ? E.key : null });
+  }
+
+  /** Палитра добавила или убрала болезнь/случай/предмет — пересобрать всё, где есть списки. */
+  function rebuildContent() {
+    A.pickers = [];
+    $('#event-grid').replaceChildren();
+    buildEvents();
+    renderPalette();
+    fillEyeTools();
+    A.memo.cardShell = null;
+    renderSnapshot();
   }
 
   function buildEvents() {
@@ -524,6 +552,59 @@
     );
     withSchedule(grid.lastElementChild, { label: () => `Дилемма: ${askQ.value.slice(0, 40)}`, cmd: 'ask', args: askArgs });
 
+    // --- Опасность на клетке ---
+    const hzKind = select(opts(C.hazards), 'steam');
+    const hzWhere = select([['player', 'Под ногами у жильца'], ['corridor', 'В коридоре этажа'], ['canteen', 'В столовой'], ['medpost', 'В медпункте'], ['factory', 'В цеху']], 'player');
+    const hzPlayer = h('select', { 'aria-label': 'Жилец' });
+    const hzFloor = num(firstFloor, { min: 1, max: 999, 'aria-label': 'Этаж' });
+    const hzMin = num(0, { min: 0, max: 1440 });
+    const hzPickerRow = h('div', { class: 'row' }, hzPlayer);
+    const hzFloorRow = h('div', { class: 'row' }, 'этаж', hzFloor);
+    const syncHz = () => {
+      hzPickerRow.hidden = hzWhere.value !== 'player';
+      hzFloorRow.hidden = hzWhere.value !== 'corridor';
+    };
+    hzWhere.addEventListener('change', syncHz);
+    syncHz();
+    // список жильцов обновляется вместе с остальными выборами
+    const hzPicker = {
+      sig: '',
+      refresh() {
+        const list = alivePlayers();
+        const sig = list.map((p) => `${p.id}:${p.name}`).join('|');
+        if (sig === hzPicker.sig) return;
+        hzPicker.sig = sig;
+        const keep = hzPlayer.value;
+        hzPlayer.replaceChildren(...list.map((p) => h('option', { value: p.id, text: `${p.name} · кв. ${p.apartment.number}` })));
+        if (list.some((p) => p.id === keep)) hzPlayer.value = keep;
+      },
+    };
+    A.pickers.push(hzPicker);
+    hzPicker.refresh();
+    const hzArgs = () => {
+      const base = { kind: hzKind.value, minutes: hzMin.value };
+      if (hzWhere.value === 'player') return hzPlayer.value ? { ...base, playerId: hzPlayer.value } : (toast('Некого выбрать', 'error'), null);
+      return { ...base, scene: hzWhere.value === 'corridor' ? `corridor:${hzFloor.value}` : hzWhere.value };
+    };
+    A.hazardList = h('ul', { class: 'hazard-list' });
+    grid.append(
+      card(
+        'Опасность на клетке',
+        'Видимая беда на полу: кто наступит — обожжётся, получит удар током, провалится или будет укушен. Соседи могут её огородить. Точно в клетку — кликом во вкладке «Глазок».',
+        'danger-card',
+        h('div', { class: 'grid2' }, field('Что', hzKind), field('На сколько минут (0 — пока не уберут)', hzMin)),
+        field('Где', hzWhere),
+        hzPickerRow,
+        hzFloorRow,
+        actions(button('Поставить', () => {
+          const a = hzArgs();
+          if (a) cmd('hazard', a);
+        }, 'primary'), button('Убрать все', () => cmd('hazardClear', {}))),
+        A.hazardList,
+      ),
+    );
+    withSchedule(grid.lastElementChild, { label: () => `Опасность: ${C.hazards[hzKind.value]}`, cmd: 'hazard', args: hzArgs });
+
     // --- Произвольное событие ---
     grid.append(buildCustomEvent());
     withSchedule(grid.lastElementChild, { label: () => A.customEvent.label(), cmd: 'custom', args: () => A.customEvent.args() });
@@ -628,6 +709,9 @@
     }
     renderPlayers();
     renderCard();
+    renderDirector();
+    renderHazards();
+    renderEyeSide();
     for (const picker of A.pickers) picker.refresh();
     for (const [key, row] of Object.entries(A.breakdownRows || {})) {
       const b = s.world.breakdowns[key];
@@ -1086,6 +1170,434 @@
     log.append(chatItem(m));
     while (log.children.length > 300) log.firstChild.remove();
     if (nearBottom) log.scrollTop = log.scrollHeight;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Режиссёр: подсказки «куда смотреть» и шкала напряжения
+  // ---------------------------------------------------------------------------
+  A.hiddenHints = (() => {
+    try { return JSON.parse(session.get('gh_hidden_hints') || '{}'); } catch { return {}; }
+  })();
+
+  function sceneOfPlayer(id) {
+    return A.snap?.players.find((p) => p.id === id)?.scene || null;
+  }
+
+  function openPlayer(id) {
+    switchTab('players');
+    selectPlayer(id);
+  }
+
+  function renderDirector() {
+    const d = A.snap.director;
+    if (!d) return;
+    const bar = $('#tension-bar');
+    bar.style.width = `${d.tension}%`;
+    bar.className = d.tension >= 70 ? 'hot' : d.tension >= 35 ? 'warm' : '';
+    $('#tension-val').textContent = d.tension;
+    const now = Date.now();
+    for (const [id, until] of Object.entries(A.hiddenHints)) if (until < now) delete A.hiddenHints[id];
+    const hints = d.hints.filter((x) => !A.hiddenHints[x.id]);
+    memo('director', hints.map((x) => [x.id, x.text]), () => {
+      $('#director-hints').replaceChildren(
+        ...(hints.length
+          ? hints.map((x) => {
+              const scene = x.scene || (x.playerId ? sceneOfPlayer(x.playerId) : null);
+              return h(
+                'li',
+                { class: `hint-${x.level}` },
+                h('span', { class: 'txt', text: x.text }),
+                x.playerId ? button('Жилец', () => openPlayer(x.playerId), 'small') : null,
+                scene ? button('Глазок', () => watchScene(scene), 'small') : null,
+                button('Скрыть', () => {
+                  A.hiddenHints[x.id] = Date.now() + 10 * 60000;
+                  session.set('gh_hidden_hints', JSON.stringify(A.hiddenHints));
+                  A.memo.director = null;
+                  renderDirector();
+                }, 'small ghost'),
+              );
+            })
+          : [h('li', { class: 'calm', text: 'Режиссёру нечего подсказать.' })]),
+      );
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Опасности на клетках
+  // ---------------------------------------------------------------------------
+  function hazardRow(hz) {
+    return h(
+      'li',
+      { class: hz.fenced ? 'fenced' : '' },
+      h('span', { class: 'txt' }, h('b', { text: hz.name }), ` — ${hz.title}`, hz.fenced ? h('small', { text: ` · огорожено${hz.fencedBy ? ` (${hz.fencedBy})` : ''}` }) : null, hz.until ? h('small', { text: ' · временно' }) : null),
+      button('Глазок', () => watchScene(hz.scene), 'small'),
+      button('Убрать', () => cmd('hazardClear', { scene: hz.scene, id: hz.id }), 'small'),
+    );
+  }
+
+  function renderHazards() {
+    const list = A.snap.hazards || [];
+    memo('hazards', list.map((x) => [x.id, x.fenced]), () => {
+      const rows = list.length ? list.map(hazardRow) : [h('li', { class: 'calm', text: 'Опасностей нет.' })];
+      if (A.hazardList) A.hazardList.replaceChildren(...rows);
+      $('#eye-hazards').replaceChildren(...(list.length ? list.map(hazardRow) : [h('li', { class: 'calm', text: 'Опасностей нет.' })]));
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Глазок ЖЭК: любое помещение глазами жильцов
+  // ---------------------------------------------------------------------------
+  const E = { key: null, scene: null, renderer: null, map: null, actors: new Map(), hover: null, last: 0 };
+  const EXTRA_PLACES = { lift: 'Лифт', stairs: 'Лестница' };
+
+  function sceneTitle(key) {
+    const [kind, arg] = String(key).split(':');
+    if (kind === 'corridor') return `Коридор ${arg} этажа`;
+    if (kind === 'home') return `Кв. ${arg}`;
+    return A.content.places[kind] || EXTRA_PLACES[kind] || kind;
+  }
+
+  function sceneFloor(key) {
+    const [kind, arg] = String(key).split(':');
+    if (kind === 'corridor') return Number(arg);
+    if (kind === 'home') return Math.floor(Number(arg) / 100);
+    return A.content.facilities?.[kind]?.floor ?? -1;
+  }
+
+  function initEye() {
+    E.renderer = new Renderer($('#eye-view'), { fitAll: true });
+    new ResizeObserver(([entry]) => {
+      const r = entry.contentRect;
+      E.renderer.resize(Math.max(1, Math.round(r.width)), Math.max(1, Math.round(r.height)));
+    }).observe($('#eye-stage'));
+    E.map = World.create(A.content.world);
+    $('#eye-arg').value = String(A.content.building.firstResidentialFloor);
+    $('#eye-place').addEventListener('change', () => {
+      const pl = $('#eye-place').value;
+      $('#eye-arg').disabled = pl !== 'corridor' && pl !== 'home';
+      $('#eye-arg').placeholder = pl === 'home' ? '10101' : String(A.content.building.firstResidentialFloor);
+    });
+    $('#eye-go').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const place = $('#eye-place').value;
+      const arg = $('#eye-arg').value.trim();
+      if ((place === 'corridor' || place === 'home') && !/^\d+$/.test(arg)) {
+        toast(place === 'home' ? 'Укажите номер квартиры' : 'Укажите этаж', 'error');
+        return;
+      }
+      watchScene(place === 'corridor' || place === 'home' ? `${place}:${arg}` : place);
+    });
+    const canvas = $('#eye-view');
+    canvas.addEventListener('click', onEyeClick);
+    canvas.addEventListener('mousemove', (e) => {
+      const pt = E.renderer.toWorld(e.offsetX, e.offsetY);
+      E.hover = { x: Math.floor(pt.x), y: Math.floor(pt.y) };
+    });
+    canvas.addEventListener('mouseleave', () => (E.hover = null));
+    $('#eye-clear').addEventListener('click', () => E.key && cmd('hazardClear', { scene: E.key }));
+    fillEyeTools();
+    requestAnimationFrame(eyeFrame);
+  }
+
+  function fillEyeTools() {
+    const sel = $('#eye-tool');
+    const keep = sel.value;
+    sel.replaceChildren(h('option', { value: '', text: 'ничего не ставит' }), ...Object.entries(A.content.hazards).map(([k, n]) => h('option', { value: k, text: `ставит: ${n}` })));
+    sel.value = A.content.hazards[keep] ? keep : '';
+  }
+
+  function watchScene(key) {
+    let scene;
+    try {
+      scene = E.map.scene(key);
+    } catch {
+      toast('Нет такого помещения', 'error');
+      return;
+    }
+    E.key = key;
+    E.scene = null;
+    E.actors.clear();
+    E.renderer.setScene(scene);
+    $('#eye-title').textContent = sceneTitle(key);
+    $('#eye-meta').textContent = 'подключаемся…';
+    A.memo.eyeSide = null;
+    switchTab('eye');
+    renderEyeSide();
+  }
+
+  function onWatch(snap) {
+    if (!snap) {
+      $('#eye-meta').textContent = 'такого помещения нет';
+      E.scene = null;
+      return;
+    }
+    if (snap.key !== E.key) return;
+    E.scene = snap;
+    const seen = new Set();
+    for (const a of snap.actors) {
+      seen.add(a.id);
+      const cur = E.actors.get(a.id);
+      if (cur) Object.assign(cur, { ...a, x: cur.x, y: cur.y, tx: a.x, ty: a.y });
+      else E.actors.set(a.id, { ...a, tx: a.x, ty: a.y, look: lookFor(a.id), phase: Math.random() * 6 });
+    }
+    for (const id of [...E.actors.keys()]) if (!seen.has(id)) E.actors.delete(id);
+    const bits = [`жильцов: ${snap.actors.length}`];
+    if (snap.dark) bits.push('темно');
+    if (snap.lampsOut.length) bits.push(`погасло ламп: ${snap.lampsOut.length}`);
+    if (snap.fog) bits.push(snap.fog === 'window' ? 'туман за окном' : 'туман!');
+    if (snap.sealed) bits.push('гермодверь задраена');
+    if (snap.hazards.length) bits.push(`опасностей: ${snap.hazards.length}`);
+    $('#eye-meta').textContent = bits.join(' · ');
+  }
+
+  function eyeFrame(ts) {
+    requestAnimationFrame(eyeFrame);
+    if ($('#tab-eye').hidden || !E.renderer.scene) return;
+    const dt = Math.min(0.1, (ts - (E.last || ts)) / 1000);
+    E.last = ts;
+    for (const a of E.actors.values()) {
+      const k = Math.min(1, dt * 10);
+      a.x += (a.tx - a.x) * k;
+      a.y += (a.ty - a.y) * k;
+    }
+    const sc = E.scene;
+    const minutes = sc ? sc.gameMinutes : 12 * 60;
+    const hour = Math.floor(minutes / 60);
+    try {
+      E.renderer.draw({
+        you: null,
+        actors: [...E.actors.values()],
+        time: ts / 1000,
+        now: Date.now(),
+        god: true,
+        gameMinutes: minutes,
+        dark: !!(sc && sc.dark),
+        night: hour >= 22 || hour < 6,
+        lampsOut: sc ? sc.lampsOut : [],
+        hazards: sc ? sc.hazards : [],
+        fog: sc ? sc.fog : null,
+        fogOutside: !!(sc && sc.fog),
+        liftBroken: !!(sc && sc.liftBroken),
+        sealed: !!(sc && sc.sealed),
+        residents: sc ? sc.residents : {},
+        hover: null,
+      });
+      if (E.hover && $('#eye-tool').value) {
+        // рамка клетки, куда встанет опасность
+        const r = E.renderer;
+        const g = r.ctx;
+        const TD = r.T * r.dpr;
+        g.strokeStyle = 'rgba(224,90,79,0.9)';
+        g.lineWidth = Math.max(1, 2 * r.dpr);
+        g.strokeRect(E.hover.x * TD - r.cam.x, E.hover.y * TD - r.cam.y, TD, TD);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  }
+
+  function onEyeClick(e) {
+    if (!E.key) return;
+    const pt = E.renderer.toWorld(e.offsetX, e.offsetY);
+    // жилец под курсором — открыть его карточку
+    let best = null;
+    let bd = 0.6;
+    for (const a of E.actors.values()) {
+      const d = Math.hypot(a.x - pt.x, a.y - 0.4 - pt.y);
+      if (d < bd) {
+        bd = d;
+        best = a;
+      }
+    }
+    if (best) {
+      openPlayer(best.id);
+      return;
+    }
+    const kind = $('#eye-tool').value;
+    if (kind) {
+      cmd('hazard', { scene: E.key, kind, x: pt.x, y: pt.y, minutes: $('#eye-minutes').value });
+      return;
+    }
+    const hz = (E.scene?.hazards || []).find((z) => Math.hypot(z.x - pt.x, z.y - pt.y) < 0.6);
+    if (hz && confirm(`Убрать опасность «${A.content.hazards[hz.kind]}»?`)) cmd('hazardClear', { scene: E.key, id: hz.id });
+  }
+
+  /** «Дом в разрезе»: где сейчас кто, этажи сверху вниз. */
+  function renderEyeSide() {
+    const groups = new Map();
+    const add = (k) => groups.get(k) || groups.set(k, []).get(k);
+    for (const p of alivePlayers()) if (p.scene) add(p.scene).push(p);
+    for (const hz of A.snap.hazards || []) add(hz.scene);
+    for (const f of ['canteen', 'medpost', 'factory']) add(f);
+    if (E.key) add(E.key);
+    const hzCount = {};
+    for (const hz of A.snap.hazards || []) hzCount[hz.scene] = (hzCount[hz.scene] || 0) + 1;
+    const keys = [...groups.keys()].sort((a, b) => sceneFloor(b) - sceneFloor(a) || a.localeCompare(b));
+    const data = keys.map((k) => [k, groups.get(k).map((p) => [p.id, p.name, p.online, !!p.down]), hzCount[k] || 0]);
+    memo('eyeSide', [data, E.key], () => {
+      $('#eye-scenes').replaceChildren(
+        ...keys.map((k) => {
+          const ps = groups.get(k);
+          const online = ps.filter((p) => p.online).length;
+          return h(
+            'li',
+            { class: k === E.key ? 'active' : '' },
+            h(
+              'button',
+              { type: 'button', onclick: () => watchScene(k) },
+              h('span', { class: 'sc-title', text: sceneTitle(k) }),
+              h('span', { class: 'sc-count', text: ps.length ? `${online}/${ps.length}` : '' }),
+              hzCount[k] ? h('span', { class: 'sc-hz', title: 'Опасности', text: `⚠${hzCount[k]}` }) : null,
+              ps.length ? h('span', { class: 'sc-names', text: ps.map((p) => `${p.down ? '✚' : ''}${p.name}`).join(', ') }) : null,
+            ),
+          );
+        }),
+      );
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Палитра бед: свои болезни, несчастные случаи и предметы
+  // ---------------------------------------------------------------------------
+  const STAT_NAMES = { health: 'Здоровье', hunger: 'Сытость', energy: 'Силы', sanity: 'Рассудок' };
+
+  function statInputs(lo, hi) {
+    const inputs = Object.fromEntries(Object.keys(STAT_NAMES).map((k) => [k, num(0, { min: lo, max: hi })]));
+    return {
+      el: h('div', { class: 'grid4' }, Object.entries(inputs).map(([k, inp]) => field(STAT_NAMES[k], inp))),
+      get: () => Object.fromEntries(Object.entries(inputs).map(([k, inp]) => [k, Number(inp.value) || 0]).filter(([, v]) => v)),
+      reset: () => Object.values(inputs).forEach((inp) => (inp.value = '0')),
+    };
+  }
+
+  function buildPalette() {
+    const grid = $('#palette-grid');
+    grid.replaceChildren();
+
+    // болезнь или травма
+    const cName = h('input', { maxlength: '40', placeholder: 'Лифтовая икота' });
+    const cKind = select([['disease', 'Болезнь'], ['injury', 'Травма']], 'disease');
+    const cDur = num(30, { min: 0, max: 600 });
+    const cCont = num(0, { min: 0, max: 1, step: 0.05 });
+    const cStats = statInputs(-20, 20);
+    const cWork = h('input', { type: 'checkbox' });
+    const cStairs = h('input', { type: 'checkbox' });
+    const cSymptom = h('input', { maxlength: '40', placeholder: 'икает' });
+    grid.append(
+      card(
+        'Своя болезнь или травма',
+        'Изменения в минуту. Заразность — шанс в минуту передаться соседу рядом (0–1). 0 минут — пока не вылечат.',
+        'danger-card',
+        h('div', { class: 'grid2' }, field('Название', cName), field('Вид', cKind)),
+        h('div', { class: 'grid3' }, field('Длится, мин', cDur), field('Заразность', cCont), field('Симптом (в чате)', cSymptom)),
+        h('p', { class: 'sub-h', text: 'В минуту:' }),
+        cStats.el,
+        h('div', { class: 'row' }, h('label', { class: 'check' }, cWork, 'не может работать'), h('label', { class: 'check' }, cStairs, 'не может по лестнице')),
+        actions(
+          button('Добавить в палитру', async () => {
+            const res = await cmd('paletteAdd', {
+              type: 'conditions',
+              def: { name: cName.value, kind: cKind.value, durationMin: cDur.value, contagious: cCont.value, perMin: cStats.get(), blocks: [cWork.checked && 'work', cStairs.checked && 'stairs'].filter(Boolean), symptom: cSymptom.value },
+            });
+            if (res.ok) {
+              cName.value = '';
+              cSymptom.value = '';
+              cStats.reset();
+            }
+          }, 'primary'),
+        ),
+      ),
+    );
+
+    // несчастный случай
+    const aName = h('input', { maxlength: '40', placeholder: 'Упала люстра' });
+    const aText = h('textarea', { maxlength: '300', placeholder: 'С потолка с грохотом рушится люстра…' });
+    const aStats = statInputs(-200, 200);
+    const aCond = h('select', { 'aria-label': 'Состояние после' });
+    const aKill = h('input', { type: 'checkbox' });
+    A.paletteCondSelects = [aCond];
+    grid.append(
+      card(
+        'Свой несчастный случай',
+        'Появится в списках «Несчастный случай» и в карточке жильца.',
+        'danger-card',
+        field('Название', aName),
+        field('Что увидит жилец', aText),
+        h('p', { class: 'sub-h', text: 'Сразу:' }),
+        aStats.el,
+        h('div', { class: 'grid2' }, field('Состояние после', aCond), h('label', { class: 'check' }, aKill, 'смертельно')),
+        actions(
+          button('Добавить в палитру', async () => {
+            const res = await cmd('paletteAdd', { type: 'accidents', def: { name: aName.value, text: aText.value, effect: aStats.get(), condition: aCond.value || undefined, kill: aKill.checked } });
+            if (res.ok) {
+              aName.value = '';
+              aText.value = '';
+              aKill.checked = false;
+              aStats.reset();
+            }
+          }, 'primary'),
+        ),
+      ),
+    );
+
+    // предмет
+    const iName = h('input', { maxlength: '40', placeholder: 'Настойка боярышника' });
+    const iDesc = h('input', { maxlength: '120', placeholder: 'Горькая. Помогает от всего.' });
+    const iStats = statInputs(-100, 100);
+    const iCure = h('select', { multiple: true, size: '4', 'aria-label': 'Лечит' });
+    A.paletteCondSelects.push(iCure);
+    grid.append(
+      card(
+        'Свой предмет',
+        'Без эффекта — просто вещь (на обмен, в передачку). С эффектом — его можно употребить. Выдаётся через гуманитарку или карточку жильца.',
+        'good-card',
+        h('div', { class: 'grid2' }, field('Название', iName), field('Описание', iDesc)),
+        h('p', { class: 'sub-h', text: 'Если употребить:' }),
+        iStats.el,
+        field('Лечит (Ctrl — несколько)', iCure),
+        actions(
+          button('Добавить в палитру', async () => {
+            const res = await cmd('paletteAdd', { type: 'items', def: { name: iName.value, desc: iDesc.value, use: iStats.get(), cure: [...iCure.selectedOptions].map((o) => o.value) } });
+            if (res.ok) {
+              iName.value = '';
+              iDesc.value = '';
+              iStats.reset();
+            }
+          }, 'primary'),
+        ),
+      ),
+    );
+
+    A.paletteList = h('ul', { class: 'palette-list' });
+    grid.append(card('Что уже в палитре', 'Удалённое исчезнет из списков. У кого уже есть такая болезнь или предмет — пропадёт.', '', A.paletteList));
+    renderPalette();
+  }
+
+  function renderPalette() {
+    if (!A.paletteList) return;
+    const C = A.content;
+    for (const sel of A.paletteCondSelects || []) {
+      const keep = [...sel.selectedOptions].map((o) => o.value);
+      sel.replaceChildren(...(sel.multiple ? [] : [h('option', { value: '', text: '— нет —' })]), ...Object.entries(C.conditions).map(([k, v]) => h('option', { value: k, text: v.name })));
+      for (const o of sel.options) o.selected = keep.includes(o.value);
+    }
+    const TYPES = { conditions: 'Болезнь/травма', accidents: 'Случай', items: 'Предмет' };
+    const rows = [];
+    for (const [type, label] of Object.entries(TYPES)) {
+      for (const [id, def] of Object.entries((C.palette || {})[type] || {})) {
+        rows.push(
+          h(
+            'li',
+            null,
+            h('span', { class: 'tag', text: label }),
+            h('b', { text: def.name }),
+            h('small', { text: ` ${id}` }),
+            button('Удалить', () => confirm(`Удалить «${def.name}» из палитры?`) && cmd('paletteRemove', { type, id }), 'small'),
+          ),
+        );
+      }
+    }
+    A.paletteList.replaceChildren(...(rows.length ? rows : [h('li', { class: 'calm', text: 'Палитра пуста — пока только стандартные беды.' })]));
   }
 
   connect();

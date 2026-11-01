@@ -151,6 +151,10 @@
         for (const [pid, b] of S.bubbles) if (b.msgId === msg.id) S.bubbles.delete(pid);
         renderChat();
         break;
+      case 'catalog':
+        // ЖЭК добавил новый предмет — обновим справочник названий
+        S.catalog = msg.catalog || {};
+        break;
       case 'welcome':
         S.token = msg.token;
         S.catalog = msg.catalog || {};
@@ -260,6 +264,10 @@
       e.preventDefault();
     } else if (e.code === 'KeyE') {
       e.preventDefault();
+      if (S.hazardNear) {
+        fenceNear();
+        return;
+      }
       if (S.lampNear != null) {
         act('fix_lamp', { index: S.lampNear }).then((r) => r.ok && say(r.message));
         return;
@@ -276,7 +284,9 @@
 
   function walkTo(dest, onArrive) {
     if (!S.scene || !S.me) return false;
-    const path = World.findPath(S.scene, S.me, dest);
+    const hz = ((S.view && S.view.here.hazards) || []).filter((z) => !z.fenced);
+    const avoid = hz.length ? (x, y) => (hz.some((z) => Math.floor(z.x) === x && Math.floor(z.y) === y) ? 30 : 0) : null;
+    const path = World.findPath(S.scene, S.me, dest, { avoid });
     if (!path) return false;
     if (!path.length) {
       // уже стоим на месте
@@ -507,7 +517,44 @@
     return null;
   }
 
+  function fenceNear() {
+    if (!S.hazardNear) return;
+    act('fence', { id: S.hazardNear }).then((r) => r.ok && say(r.message));
+  }
+
+  /** Неогороженная опасность рядом. */
+  function nearestHazard() {
+    const v = S.view;
+    if (!v || !S.me) return null;
+    let best = null, bd = 1.6;
+    for (const z of v.here.hazards || []) {
+      if (z.fenced) continue;
+      const d = Math.hypot(S.me.x - z.x, S.me.y - z.y);
+      if (d <= bd) {
+        bd = d;
+        best = z;
+      }
+    }
+    return best;
+  }
+
   function renderPrompt() {
+    const busy = !S.view || S.view.you.travel || S.view.you.down;
+    const hz = busy ? null : nearestHazard();
+    if (hz) {
+      S.near = null;
+      S.lampNear = null;
+      S.hazardNear = hz.id;
+      const sig = `hz${hz.id}`;
+      if (S.memo.prompt === sig) return;
+      S.memo.prompt = sig;
+      $('#prompt').replaceChildren(
+        h('span', { class: 'label danger' }, hz.name, h('small', { text: ' · не наступайте! Можно огородить, чтобы уберечь соседей' })),
+        h('button', { class: 'btn small primary', onclick: () => fenceNear() }, h('kbd', { text: 'E' }), 'Огородить'),
+      );
+      return;
+    }
+    S.hazardNear = null;
     const lamp = S.view && !S.view.you.travel && !S.view.you.down ? nearestDeadLamp() : null;
     if (lamp != null) {
       S.near = null;
@@ -1258,6 +1305,7 @@
       dark: v.world.dark,
       night: isNight(v),
       lampsOut: v.here.lampsOut || [],
+      hazards: v.here.hazards || [],
       marker: tutorialMarker(v),
       flashlight: has('flashlight') && you.flashCharge > 0,
       fog,

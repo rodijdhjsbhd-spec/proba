@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { Game } = require('../server/game');
 const C = require('../server/content');
+const World = require('../public/shared/world');
 
 /** Мир с управляемым временем: clock.advance(ms) + тики. */
 function makeWorld({ random = () => 0.99 } = {}) {
@@ -1289,4 +1290,107 @@ test('отголосок: погибший шепчет фразу соседу 
   game.hallucinate(living);
   assert.equal(msgs[0].text, C.ECHO_PHRASES[0]);
   assert.equal(msgs[0].from.name, 'Иван †');
+});
+
+test('опасность на клетке: наступил — беда; огородил — безопасно; срок истекает', () => {
+  const { game, clock, advance } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  for (const p of [a, b]) game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  const res = game.admin('hazard', { playerId: a.id, kind: 'wire', minutes: 5 });
+  assert.equal(res.ok, true, res.error);
+  const hz = game.world.hazards['corridor:101'][0];
+  assert.equal(game.playerView(b).here.hazards[0].kind, 'wire');
+  // идём на провод маленькими шагами
+  const hp = a.stats.health;
+  a.pos = { x: hz.x - 0.4, y: hz.y, d: 'right' };
+  clock.t += 200;
+  assert.equal(game.setPos(a, hz.x, hz.y, 'right'), true);
+  assert.ok(a.stats.health < hp, 'ударило током');
+  // огородить может сосед, стоя рядом
+  b.pos = { x: hz.x + 1, y: hz.y, d: 'left' };
+  assert.equal(game.fenceHazard(b, hz.id).ok, true);
+  const hp2 = b.stats.health;
+  clock.t += 200;
+  game.setPos(b, hz.x + 0.6, hz.y, 'left');
+  clock.t += 200;
+  game.setPos(b, hz.x, hz.y, 'left');
+  assert.equal(b.stats.health, hp2, 'огорожено — не бьёт');
+  advance(6 * 60000);
+  assert.equal(game.world.hazards['corridor:101'], undefined, 'срок вышел');
+});
+
+test('палитра: своя болезнь, несчастный случай и предмет без перезапуска', () => {
+  const { game } = makeWorld();
+  const p = join(game, 'Иван');
+  const c = game.admin('paletteAdd', { type: 'conditions', def: { name: 'Лифтовая икота', kind: 'disease', durationMin: 5, contagious: 0.2, perMin: { sanity: -2 }, blocks: ['work'], symptom: 'икает' } });
+  assert.equal(c.ok, true, c.error);
+  assert.equal(game.admin('infect', { target: { type: 'player', id: p.id }, condition: c.id }).ok, true);
+  assert.ok(game.hasBlock(p, 'work'), 'блокирует работу');
+  const it = game.admin('paletteAdd', { type: 'items', def: { name: 'Настойка', desc: 'Горькая', use: { sanity: 5 }, cure: [c.id] } });
+  game.admin('give', { id: p.id, item: it.id, count: 1, silent: true });
+  assert.equal(game.useItem(p, it.id).ok, true);
+  assert.equal(game.hasCondition(p, c.id), false, 'вылечила');
+  const acc = game.admin('paletteAdd', { type: 'accidents', def: { name: 'Упала люстра', text: 'Бах!', effect: { health: -12 } } });
+  game.admin('accident', { id: p.id, accident: acc.id });
+  assert.equal(Math.round(p.stats.health), 88);
+  assert.ok(game.adminContent().conditions[c.id], 'видно в Пульте');
+  // сохранение и загрузка: палитра переживает перезапуск
+  const g2 = new (require('../server/game').Game)(JSON.parse(JSON.stringify(game.state)));
+  assert.ok(C.CONDITIONS[c.id]);
+  assert.equal(game.admin('paletteRemove', { type: 'items', id: it.id }).ok, true);
+  assert.equal(C.ITEMS[it.id], undefined);
+  assert.equal(game.admin('paletteAdd', { type: 'conditions', def: { name: '' } }).ok, false, 'без названия нельзя');
+  game.admin('paletteRemove', { type: 'conditions', id: c.id });
+  game.admin('paletteRemove', { type: 'accidents', id: acc.id });
+  assert.ok(g2);
+});
+
+test('режиссёр подсказывает: без сознания, частые беды, тишина; шкала напряжения', () => {
+  const { game, clock } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  game.admin('teleport', { id: a.id, place: 'corridor', floor: 101 });
+  game.admin('custom', { target: { type: 'player', id: a.id }, title: 'Обвал', effect: { health: -200 } });
+  for (let i = 0; i < 3; i++) game.admin('accident', { id: b.id, accident: 'slip' });
+  const d = game.director();
+  assert.ok(d.hints.some((h) => h.id === `down:${a.id}`));
+  assert.ok(d.hints.some((h) => h.id === `harm:${b.id}`));
+  assert.ok(d.tension > 0);
+  clock.t += 20 * 60000;
+  game.state.log = [];
+  assert.ok(game.director().hints.some((h) => h.id === 'quiet'));
+});
+
+test('Глазок ЖЭК: снимок сцены с жильцами и опасностями', () => {
+  const { game } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  game.admin('hazard', { scene: 'corridor:101', kind: 'hole' });
+  const snap = game.sceneSnapshot('corridor:101');
+  assert.equal(snap.actors[0].name, 'Иван');
+  assert.equal(snap.hazards[0].kind, 'hole');
+  assert.equal(snap.residents[p.apartment.number].name, 'Иван');
+  assert.equal(game.sceneSnapshot('nonsense:1'), null);
+});
+
+test('опасность кликом в Глазке: ровно в клетку, в стену нельзя; в снимке Пульта видна сцена жильца', () => {
+  const { game } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  const sc = game.map.scene('corridor:101');
+  let free = null;
+  let wall = null;
+  for (let y = 0; y < sc.h && (!free || !wall); y++) {
+    for (let x = 0; x < sc.w; x++) {
+      if (!free && !World.isSolidTile(sc, x, y)) free = { x, y };
+      if (!wall && World.isSolidTile(sc, x, y)) wall = { x, y };
+    }
+  }
+  const r = game.admin('hazard', { scene: 'corridor:101', kind: 'rats', x: free.x + 0.3, y: free.y + 0.7 });
+  assert.equal(r.ok, true, r.error);
+  const hz = game.world.hazards['corridor:101'][0];
+  assert.deepEqual([hz.x, hz.y], [free.x + 0.5, free.y + 0.5]);
+  assert.equal(game.admin('hazard', { scene: 'corridor:101', kind: 'rats', x: wall.x + 0.5, y: wall.y + 0.5 }).ok, false);
+  assert.equal(game.adminSnapshot().players.find((x) => x.id === p.id).scene, 'corridor:101');
 });

@@ -60,6 +60,97 @@
   }
 
   /** Кисть в клеточных координатах: всё рисуем в долях клетки. */
+  /** Опасность на клетке (её поставил ЖЭК): кипяток, провод, провал, крысы. Огороженная — с барьером. */
+  function drawHazard(b, hz, t) {
+    const x = hz.x, y = hz.y;
+    if (hz.kind === 'steam') {
+      b.g.save();
+      b.g.fillStyle = 'rgba(120,150,160,0.55)';
+      b.g.beginPath();
+      b.g.ellipse(x * b.T, (y + 0.1) * b.T, 0.42 * b.T, 0.26 * b.T, 0, 0, Math.PI * 2);
+      b.g.fill();
+      b.g.fillStyle = 'rgba(200,225,230,0.35)';
+      b.g.beginPath();
+      b.g.ellipse((x - 0.08) * b.T, (y + 0.05) * b.T, 0.22 * b.T, 0.12 * b.T, 0, 0, Math.PI * 2);
+      b.g.fill();
+      b.g.restore();
+      for (let k = 0; k < 3; k++) {
+        const p = (t * 0.7 + k / 3) % 1;
+        b.circle(x - 0.2 + k * 0.2 + Math.sin(p * 5 + k) * 0.06, y - p * 0.7, 0.07 + p * 0.09, `rgba(235,240,240,${0.4 * (1 - p)})`);
+      }
+    } else if (hz.kind === 'wire') {
+      b.g.save();
+      b.g.strokeStyle = '#1d1d1b';
+      b.g.lineWidth = Math.max(1, 0.06 * b.T);
+      b.g.beginPath();
+      b.g.moveTo((x - 0.45) * b.T, (y - 0.25) * b.T);
+      b.g.bezierCurveTo((x - 0.1) * b.T, (y - 0.35) * b.T, (x - 0.15) * b.T, (y + 0.3) * b.T, (x + 0.15) * b.T, (y + 0.12) * b.T);
+      b.g.stroke();
+      b.g.restore();
+      b.rect(x + 0.12, y + 0.06, 0.1, 0.1, '#b87333');
+      if (Math.sin(t * 9 + x) > 0.3) {
+        for (let k = 0; k < 4; k++) {
+          const a = k * 1.7 + t * 13;
+          b.line(x + 0.17, y + 0.11, x + 0.17 + Math.cos(a) * 0.18, y + 0.11 + Math.sin(a) * 0.18, '#f5e27a', 0.025);
+        }
+        b.circle(x + 0.17, y + 0.11, 0.12, 'rgba(245,226,122,0.25)');
+      }
+    } else if (hz.kind === 'hole') {
+      b.g.save();
+      b.g.fillStyle = '#050505';
+      b.g.beginPath();
+      b.g.moveTo((x - 0.38) * b.T, (y - 0.1) * b.T);
+      b.g.lineTo((x - 0.12) * b.T, (y - 0.36) * b.T);
+      b.g.lineTo((x + 0.3) * b.T, (y - 0.28) * b.T);
+      b.g.lineTo((x + 0.4) * b.T, (y + 0.12) * b.T);
+      b.g.lineTo((x + 0.05) * b.T, (y + 0.36) * b.T);
+      b.g.lineTo((x - 0.3) * b.T, (y + 0.25) * b.T);
+      b.g.closePath();
+      b.g.fill();
+      b.g.restore();
+      b.line(x - 0.38, y - 0.1, x - 0.48, y - 0.3, 'rgba(0,0,0,0.6)', 0.02);
+      b.line(x + 0.4, y + 0.12, x + 0.5, y + 0.3, 'rgba(0,0,0,0.6)', 0.02);
+      b.rect(x - 0.25, y - 0.05, 0.12, 0.05, '#6b6b66');
+    } else if (hz.kind === 'rats') {
+      b.circle(x, y, 0.2, '#0c0b0a');
+      for (let k = 0; k < 2; k++) {
+        const a = t * (1.3 + k * 0.4) + k * 3;
+        const rx = x + Math.cos(a) * 0.32, ry = y + Math.sin(a) * 0.2;
+        b.g.save();
+        b.g.translate(rx * b.T, ry * b.T);
+        b.g.rotate(a + Math.PI / 2);
+        b.g.fillStyle = '#4a3f36';
+        b.g.beginPath();
+        b.g.ellipse(0, 0, 0.1 * b.T, 0.05 * b.T, 0, 0, Math.PI * 2);
+        b.g.fill();
+        b.g.restore();
+        b.line(rx, ry, rx - Math.cos(a + Math.PI / 2) * 0.15, ry - Math.sin(a + Math.PI / 2) * 0.15, '#6b5a4c', 0.012);
+      }
+    } else {
+      b.circle(x, y, 0.3, 'rgba(200,60,40,0.4)');
+    }
+    if (hz.fenced) {
+      // барьер с табличкой «ОСТОРОЖНО»
+      for (const [px, py] of [[-0.45, -0.4], [0.45, -0.4], [-0.45, 0.4], [0.45, 0.4]]) b.rect(x + px - 0.03, y + py - 0.18, 0.06, 0.22, '#c9c2ac');
+      for (const py of [-0.48, 0.32]) {
+        for (let k = 0; k < 6; k++) b.rect(x - 0.45 + k * 0.15, y + py, 0.15, 0.05, k % 2 ? '#e9e3d0' : '#c4342b');
+      }
+      b.rrect(x - 0.38, y - 0.82, 0.76, 0.24, 0.03, '#e3c23b');
+      b.text('ОСТОРОЖНО', x, y - 0.7, 0.13, '#1b1b18');
+    } else {
+      // мигающий предупреждающий отблеск — чтобы было видно и в полутьме
+      const a = 0.25 + 0.2 * Math.sin(t * 4 + x * 3);
+      b.g.save();
+      b.g.strokeStyle = `rgba(224,90,79,${a})`;
+      b.g.lineWidth = Math.max(1, 0.03 * b.T);
+      b.g.setLineDash([0.1 * b.T, 0.08 * b.T]);
+      b.g.beginPath();
+      b.g.arc(x * b.T, y * b.T, 0.5 * b.T, 0, Math.PI * 2);
+      b.g.stroke();
+      b.g.restore();
+    }
+  }
+
   function brush(g, T) {
     return {
       g,
@@ -675,8 +766,9 @@
   // Рендерер
   // ---------------------------------------------------------------------------
   class Renderer {
-    constructor(canvas) {
+    constructor(canvas, opts = {}) {
       this.canvas = canvas;
+      this.fitAll = !!opts.fitAll; // Глазок ЖЭК: вся сцена целиком, без слежения за жильцом
       this.ctx = canvas.getContext('2d');
       this.scene = null;
       this.static = null;
@@ -720,8 +812,12 @@
       if (!this.scene || !this.cssW) return;
       // сколько клеток видно по ширине: на телефоне — меньше, зато всё крупнее
       const cols = this.cssW < 520 ? 9 : 12;
-      const T = Math.min(this.cssW / Math.min(this.scene.w, cols), this.cssH / Math.min(this.scene.h + 0.3, 9.6));
-      this.T = Math.max(22, Math.min(80, T));
+      if (this.fitAll) {
+        this.T = Math.max(8, Math.min(64, Math.min(this.cssW / this.scene.w, this.cssH / (this.scene.h + 0.3))));
+      } else {
+        const T = Math.min(this.cssW / Math.min(this.scene.w, cols), this.cssH / Math.min(this.scene.h + 0.3, 9.6));
+        this.T = Math.max(22, Math.min(80, T));
+      }
       const TD = this.T * this.dpr;
       if (Math.abs(TD - this.staticT) > 0.5) {
         this.static = buildStatic(this.scene, TD);
@@ -893,6 +989,7 @@
         for (let k = 0; k < 5; k++) b.rect(l[0] - 0.2 + ((k * 37) % 40) / 100, l[1] - 0.12 + ((k * 23) % 25) / 100, 0.06, 0.03, 'rgba(210,230,235,0.8)');
         b.g.restore();
       }
+      for (const hz of s.hazards || []) drawHazard(b, hz, t);
       if (s.marker) {
         // стрелка памятки новосёла над нужным объектом
         const bob = Math.sin(t * 4) * 0.12;
@@ -921,7 +1018,8 @@
       const g = this.light.getContext('2d');
       const vw = this.light.width, vh = this.light.height;
       // ночью (22:00–06:00) в коридорах горит каждая вторая лампа и всё чуть темнее
-      const ambient = s.dark ? 0.93 : Math.min(0.85, scene.style.ambient + (s.night ? 0.12 : 0) + ((s.lampsOut || []).length ? 0.1 * (s.lampsOut || []).length : 0));
+      let ambient = s.dark ? 0.93 : Math.min(0.85, scene.style.ambient + (s.night ? 0.12 : 0) + ((s.lampsOut || []).length ? 0.1 * (s.lampsOut || []).length : 0));
+      if (s.god) ambient = Math.min(ambient, 0.55); // Глазок ЖЭК видит и в темноте — но видно, что темно
       g.globalCompositeOperation = 'source-over';
       g.clearRect(0, 0, vw, vh);
       g.fillStyle = `rgba(3,4,7,${ambient})`;

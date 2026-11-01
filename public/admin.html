@@ -42,12 +42,23 @@
 
     <div class="status-strip" id="status"></div>
 
+    <section class="director" id="director" aria-label="Режиссёр">
+      <div class="tension" title="Сколько сейчас всего происходит в доме">
+        <span class="tension-label">Напряжение</span>
+        <span class="tension-bar"><i id="tension-bar"></i></span>
+        <b id="tension-val">0</b>
+      </div>
+      <ul class="director-hints" id="director-hints"></ul>
+    </section>
+
     <nav class="admin-tabs" role="tablist">
       <button class="tab active" data-tab="players">Жильцы</button>
       <button class="tab" data-tab="events">События дома</button>
+      <button class="tab" data-tab="eye">Глазок</button>
       <button class="tab" data-tab="schedule">Расписание</button>
       <button class="tab" data-tab="log">Журнал</button>
       <button class="tab" data-tab="radio">Чаты</button>
+      <button class="tab" data-tab="palette">Палитра бед</button>
     </nav>
 
     <main class="admin-main">
@@ -80,6 +91,45 @@
 
       <section class="tab-page" id="tab-events" hidden>
         <div class="event-grid" id="event-grid"></div>
+      </section>
+
+      <section class="tab-page" id="tab-eye" hidden>
+        <div class="eye-layout">
+          <aside class="panel eye-side">
+            <h2>Дом в разрезе</h2>
+            <form class="eye-go" id="eye-go" autocomplete="off">
+              <select id="eye-place" aria-label="Помещение">
+                <option value="corridor">Коридор</option>
+                <option value="home">Квартира</option>
+                <option value="canteen">Столовая</option>
+                <option value="medpost">Медпункт</option>
+                <option value="factory">Цех</option>
+              </select>
+              <input id="eye-arg" inputmode="numeric" maxlength="6" placeholder="101" aria-label="Этаж или номер квартиры">
+              <button class="btn small" type="submit">Смотреть</button>
+            </form>
+            <ul class="eye-scenes" id="eye-scenes"></ul>
+            <h2>Опасности на клетках</h2>
+            <ul class="eye-hazards" id="eye-hazards"></ul>
+          </aside>
+          <div class="panel eye-main">
+            <div class="eye-head">
+              <h2 id="eye-title">Выберите помещение слева</h2>
+              <span class="eye-meta" id="eye-meta"></span>
+            </div>
+            <div class="eye-tools">
+              <label class="f inline">Клик по полу
+                <select id="eye-tool" aria-label="Что делает клик по полу">
+                  <option value="">ничего не ставит</option>
+                </select>
+              </label>
+              <label class="f inline">на, мин <input id="eye-minutes" type="number" min="0" max="1440" value="0" title="0 — пока не уберут"></label>
+              <button class="btn small" type="button" id="eye-clear">Убрать опасности здесь</button>
+            </div>
+            <div class="eye-stage" id="eye-stage"><canvas id="eye-view" aria-label="Глазок: помещение сверху"></canvas></div>
+            <p class="hint">Клик по жильцу — открыть его карточку. 0 минут — опасность стоит, пока её не уберут.</p>
+          </div>
+        </div>
       </section>
 
       <section class="tab-page" id="tab-schedule" hidden>
@@ -125,12 +175,18 @@
           </div>
         </div>
       </section>
+      <section class="tab-page" id="tab-palette" hidden>
+        <p class="hint palette-hint">Свои болезни, несчастные случаи и предметы — без перезапуска сервера. Появляются во всех списках Пульта; предметы — и в карманах жильцов.</p>
+        <div class="event-grid" id="palette-grid"></div>
+      </section>
     </main>
   </div>
 
   <div id="toasts" class="toasts" aria-live="polite"></div>
   <div id="conn" class="conn" hidden>Нет связи с сервером. Переподключение…</div>
 
+  <script src="shared/world.js"></script>
+  <script src="render.js"></script>
   <script src="admin.js"></script>
 </body>
 </html>
