@@ -1116,3 +1116,99 @@ test('смена, прерванная перезапуском сервера, 
   const g2 = new (require('../server/game').Game)(JSON.parse(JSON.stringify(game.state)));
   assert.equal(Math.round(g2.getPlayer(p.id).stats.energy), Math.round(before));
 });
+
+test('суточный завоз: запас кончается, в 08:00 привозят по числу закрытых смен', () => {
+  const { game, advance } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'canteen' });
+  walkTo(game, p, type('counter'));
+  p.money = 100;
+  game.state.stock.canteen.stew = 1;
+  assert.equal(game.buy(p, 'canteen', 'stew').ok, true);
+  const out = game.buy(p, 'canteen', 'stew');
+  assert.equal(out.ok, false);
+  assert.match(out.error, /кончилось/);
+  assert.equal(game.playerView(p).here.shop.find((e) => e.key === 'stew').left, 0);
+  assert.equal(game.playerView(p).here.shop.find((e) => e.key === 'tea').left, null, 'чай без ограничений');
+  // ни одной смены за сутки — завоз скудный (60%)
+  game.world.gameMinutes = 7 * 60 + 59 + 1440;
+  advance(2000);
+  assert.equal(game.state.stock.canteen.stew, Math.round(C.SHOPS.canteen.find((e) => e.item === 'stew').daily * 0.6));
+  // смены закрыты — завоз полный+
+  game.world.shiftsToday = 100;
+  game.world.gameMinutes = 7 * 60 + 59 + 2 * 1440;
+  advance(2000);
+  assert.equal(game.state.stock.canteen.stew, Math.round(C.SHOPS.canteen.find((e) => e.item === 'stew').daily * 1.4));
+  assert.equal(game.world.shiftsToday, 0);
+  // ЖЭК: недовоз и внеплановая машина
+  game.admin('supply', { mode: 'short' });
+  game.world.gameMinutes = 7 * 60 + 59 + 3 * 1440;
+  advance(2000);
+  assert.ok(game.state.stock.canteen.stew <= 2, 'урезанный завоз');
+  const before = game.state.stock.canteen.bread;
+  game.admin('supply', { mode: 'extra' });
+  assert.ok(game.state.stock.canteen.bread > before);
+});
+
+test('расходники: фильтр противогаза и батарейка фонарика', () => {
+  const { game, advance } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  game.addItem(p, 'gasmask');
+  game.admin('fog', { from: 101, to: 101, warnSec: 0, durationMin: 20, intensity: 0.1 });
+  advance(6 * 60000);
+  assert.equal(p.gasmaskCharge, 0, 'фильтр забился');
+  assert.equal(p.inventory.gasmask, 1, 'сам противогаз остался');
+  assert.equal(game.maskWorks(p), false);
+  game.addItem(p, 'filter');
+  assert.equal(game.useItem(p, 'filter').ok, true);
+  assert.equal(game.maskWorks(p), true);
+  assert.equal(game.useItem(p, 'battery').ok, false, 'батарейки нет');
+  game.addItem(p, 'battery');
+  assert.equal(game.useItem(p, 'battery').ok, false, 'нет фонарика');
+  game.admin('fogEnd');
+  game.addItem(p, 'flashlight');
+  game.admin('power', { on: false, from: 101, to: 101 });
+  advance(13 * 60000);
+  assert.equal(p.flashCharge, 0, 'фонарик сел');
+  assert.equal(game.useItem(p, 'battery').ok, true);
+  assert.equal(game.torchWorks(p), true);
+});
+
+test('лампы: ЖЭК гасит, в коридоре темно, жилец с лампочкой вкручивает', () => {
+  const { game } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  assert.equal(game.isDarkFor(p), false);
+  game.admin('lamps', { from: 101, to: 101, count: 4 });
+  assert.equal(game.world.lampsOut[101].length, 4);
+  assert.equal(game.isDarkFor(p), true, 'половина ламп погасла — темно');
+  const i = game.world.lampsOut[101][0];
+  const lamp = game.sceneOf(p).lamps[i];
+  assert.equal(game.fixLamp(p, i).ok, false, 'надо подойти');
+  p.pos = { x: lamp[0], y: lamp[1], d: 'up' };
+  assert.equal(game.fixLamp(p, i).ok, false, 'нужна лампочка');
+  game.addItem(p, 'bulb');
+  assert.equal(game.fixLamp(p, i).ok, true);
+  assert.equal(game.world.lampsOut[101].length, 3);
+  assert.equal(game.isDarkFor(p), true, 'три из шести всё ещё не горят');
+  game.admin('lamps', { from: 101, to: 101, on: true });
+  assert.equal(game.isDarkFor(p), false);
+});
+
+test('трудовая книжка: опыт, разряд, задания сложнее, надбавка', () => {
+  const { game, clock } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'factory' });
+  walkTo(game, p, (o) => o.type === 'station' && o.game === 'sort');
+  assert.equal(game.rankOf(p, 'sort'), 1);
+  p.skills = { sort: C.RANKS[2] }; // 3 разряд
+  p.stats.energy = 100;
+  const r = game.workStart(p, 'sort');
+  assert.equal(r.job.data.items.length, 16, 'больше деталей');
+  clock.t += 10000;
+  const done = game.workSubmit(p, r.job.id, p.job.secret.answers);
+  assert.match(done.result.text, /надбавка за разряд \+1/);
+  assert.equal(done.result.reward, 7);
+  assert.equal(game.playerView(p).you.skills.find((x) => x.id === 'sort').rank, 3);
+});

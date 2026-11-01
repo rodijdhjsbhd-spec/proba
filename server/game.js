@@ -91,6 +91,10 @@ function freshState() {
       power: null, // { from, to, until }
       fog: null, // { from, to, warnUntil, until, intensity, arrived }
       cutleryStolen: false,
+      shiftsToday: 0, // смен закрыто за игровые сутки — от них зависит завоз
+      lastSupplyDay: null,
+      supplyNext: 1, // множитель следующего завоза (ЖЭК может устроить недовоз)
+      lampsOut: {}, // этаж → номера погасших ламп в коридоре
     },
     players: {},
     trades: {},
@@ -103,6 +107,7 @@ function freshState() {
     noteFeed: [], // лента записок и листков для Пульта
     schedule: [], // планировщик ЖЭК: отложенные и повторяющиеся команды
     accounts: {}, // логин (строчными) → паспорт жильца { login, salt, hash, playerIds, banned }
+    stock: null, // запасы столовой и медпункта на сегодня: { canteen: { ключ: штук } } — заполняется при загрузке
     bannedIps: {}, // адрес → { until, reason }
   };
 }
@@ -122,6 +127,13 @@ class Game extends EventEmitter {
     this.localChat = new Map(); // key → последние сообщения (только в памяти)
     this.byToken = new Map();
     this.map = World.create(WORLD_CONFIG);
+    if (!this.state.stock) this.state.stock = this.fullStock(1);
+    if (this.world.lastSupplyDay == null) {
+      // сегодняшний завоз уже был, если сейчас позже часа завоза
+      const day = Math.floor(this.world.gameMinutes / 1440);
+      const hour = Math.floor((this.world.gameMinutes % 1440) / 60);
+      this.world.lastSupplyDay = hour >= B.supplyHour ? day : day - 1;
+    }
     this.lastKnock = new Map();
     this.knocks = new Map(); // хозяин → кто стучит { guestId, ts }
     this.refusals = new Map(); // гость → кто не открыл ему в туман или выставил { apt, owner, ts, kind }
@@ -142,12 +154,15 @@ class Game extends EventEmitter {
     if (!state || typeof state !== 'object') return fresh;
     const s = { ...fresh, ...state };
     s.world = { ...fresh.world, ...(state.world || {}) };
+    s.world.lampsOut = s.world.lampsOut || {};
     s.world.breakdowns = { ...fresh.world.breakdowns, ...((state.world || {}).breakdowns || {}) };
     for (const p of Object.values(s.players || {})) {
       p.inventory = p.inventory || {};
       p.conditions = p.conditions || [];
       p.journal = p.journal || [];
       p.gasmaskCharge = p.gasmaskCharge ?? 100;
+      p.flashCharge = p.flashCharge ?? 100;
+      p.skills = p.skills || {};
       if (p.job) {
         // смену прервал перезапуск сервера — силы и сытость, потраченные на неё, возвращаются
         p.stats.energy = Math.min(100, (p.stats.energy || 0) + B.workEnergyCost);
@@ -568,8 +583,38 @@ class Game extends EventEmitter {
         hurt: p.conditions.some((c) => C.CONDITIONS[c.id]?.kind === 'injury'),
         sleep: !!p.sleeping,
         down: !!p.down,
-        mask: this.hasItem(p, 'gasmask') && this.inFog(p.location.floor),
+        mask: this.maskWorks(p) && this.inFog(p.location.floor),
       }));
+  }
+
+  /** Темно ли там, где стоит жилец: нет света на этаже или в коридоре погасла половина ламп. */
+  isDarkFor(p) {
+    if (this.isDark(p.location.floor)) return true;
+    if (p.location.place !== 'corridor') return false;
+    const out = (this.world.lampsOut[p.location.floor] || []).length;
+    return out > 0 && out >= Math.ceil(this.map.scene(`corridor:${p.location.floor}`).lamps.length / 2);
+  }
+
+  /** Вкрутить лампочку в погасший плафон коридора. */
+  fixLamp(p, index) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (p.location.place !== 'corridor') return { ok: false, error: 'Плафоны — в коридоре.' };
+    const floor = p.location.floor;
+    const out = this.world.lampsOut[floor] || [];
+    const i = toInt(index, -1);
+    if (!out.includes(i)) return { ok: false, error: 'Эта лампа и так горит.' };
+    const lamp = this.map.scene(`corridor:${floor}`).lamps[i];
+    if (!lamp || Math.hypot(p.pos.x - lamp[0], p.pos.y - lamp[1]) > 1.8) return { ok: false, error: 'Подойдите под плафон.' };
+    if (!this.hasItem(p, 'bulb')) return { ok: false, error: 'Нужна лампочка.' };
+    this.removeItem(p, 'bulb', 1);
+    this.world.lampsOut[floor] = out.filter((x) => x !== i);
+    if (!this.world.lampsOut[floor].length) delete this.world.lampsOut[floor];
+    this.journal(p, `Вы вкрутили лампочку в коридоре ${floor} этажа. Стало светлее.`, 'good');
+    const others = this.othersAt(p);
+    this.notify(others, { title: 'Светлее', text: `${p.name} вкрутил лампочку в погасший плафон.`, style: 'good', journal: false });
+    this.log(`${p.name} вкрутил лампочку в коридоре ${floor} этажа`, 'social', p.id);
+    this.dirty([p.id, ...others.map((q) => q.id)]);
+    return { ok: true, message: 'Стало светлее.' };
   }
 
   isDark(floor) {
@@ -817,6 +862,7 @@ class Game extends EventEmitter {
   updateWorldTimers(now) {
     const w = this.world;
     this.runSchedule(now);
+    this.supplyCheck();
     for (const key of Object.keys(w.breakdowns)) {
       const b = w.breakdowns[key];
       if (b && b.until && now >= b.until) this.setBreakdown(key, false, {});
@@ -842,6 +888,46 @@ class Game extends EventEmitter {
     if (this.world.tick % 60 === 0) {
       this.archiveDead(now);
       this.expireBoardNotes(now);
+    }
+  }
+
+  /** Полный запас на сутки с множителем factor (null у позиций без ограничений). */
+  fullStock(factor) {
+    const stock = {};
+    for (const [shop, entries] of Object.entries(C.SHOPS)) {
+      stock[shop] = {};
+      for (const e of entries) if (e.daily != null) stock[shop][e.id || e.item] = Math.round(e.daily * factor);
+    }
+    return stock;
+  }
+
+  /** Завоз в 08:00: чем больше смен закрыли за сутки, тем больше привезут (60–140% нормы). */
+  supplyCheck() {
+    const w = this.world;
+    const day = Math.floor(w.gameMinutes / 1440);
+    const hour = Math.floor((w.gameMinutes % 1440) / 60);
+    if (w.lastSupplyDay == null) w.lastSupplyDay = hour >= B.supplyHour ? day : day - 1;
+    if (hour >= B.supplyHour && w.lastSupplyDay < day) {
+      w.lastSupplyDay = day;
+      this.deliver();
+    }
+  }
+
+  deliver(extra = false) {
+    const w = this.world;
+    const need = Math.max(6, this.alivePlayers().length * B.supplyShiftsPerResident);
+    const factor = extra ? 0.5 : (0.6 + 0.8 * Math.min(1, w.shiftsToday / need)) * (w.supplyNext ?? 1);
+    const fresh = this.fullStock(factor);
+    for (const [shop, items] of Object.entries(fresh)) {
+      for (const [key, n] of Object.entries(items)) this.state.stock[shop][key] = extra ? (this.state.stock[shop][key] || 0) + n : n;
+    }
+    const pct = Math.round(factor * 100);
+    if (!extra) {
+      this.log(`Завоз: ${pct}% нормы (смен за сутки: ${w.shiftsToday}${w.supplyNext !== 1 ? `, множитель ЖЭК ${w.supplyNext}` : ''})`, 'event', null, {
+        public: pct >= 100 ? 'в столовую и медпункт привезли полный завоз' : pct >= 80 ? 'завоз в столовую и медпункт' : 'скудный завоз: в столовой и медпункте многого не хватит',
+      });
+      w.shiftsToday = 0;
+      w.supplyNext = 1;
     }
   }
 
@@ -931,7 +1017,7 @@ class Game extends EventEmitter {
     const fogged = this.inFog(floor) && !(atHome && this.doorSealed(this.currentApt(p)));
     if (fogged) {
       let factor = this.world.fog.intensity || 1;
-      if (this.hasItem(p, 'gasmask')) {
+      if (this.maskWorks(p)) {
         factor *= B.gasMaskFactor;
         this.wearGasmask(p, dh);
       }
@@ -945,7 +1031,17 @@ class Game extends EventEmitter {
       }
     }
 
-    if (this.isDark(floor) && !this.hasItem(p, 'flashlight')) delta.sanity += B.darkSanityPerMin * dh;
+    if (this.isDarkFor(p)) {
+      if (this.torchWorks(p)) {
+        p.flashCharge = Math.max(0, (p.flashCharge ?? 100) - B.flashDrainPerMin * dh);
+        if (p.flashCharge <= 0) {
+          this.journal(p, 'Фонарик мигнул и погас: села батарейка.', 'warn');
+          this.dirty([p.id]);
+        }
+      } else {
+        delta.sanity += B.darkSanityPerMin * dh;
+      }
+    }
 
     // Голод сам по себе отсутствующего не убивает: сытость не опускается ниже порога
     if (!online && p.stats.hunger + delta.hunger < B.offlineHungerFloor) delta.hunger = Math.min(0, B.offlineHungerFloor - p.stats.hunger);
@@ -1008,12 +1104,20 @@ class Game extends EventEmitter {
     }
   }
 
+  /** Противогаз защищает, пока фильтр не забит. */
+  maskWorks(p) {
+    return this.hasItem(p, 'gasmask') && p.gasmaskCharge > 0;
+  }
+
+  /** Фонарик светит, пока не села батарейка. */
+  torchWorks(p) {
+    return this.hasItem(p, 'flashlight') && (p.flashCharge ?? 100) > 0;
+  }
+
   wearGasmask(p, d) {
-    p.gasmaskCharge -= 20 * d; // одного противогаза хватает примерно на 5 минут тумана
+    p.gasmaskCharge = Math.max(0, p.gasmaskCharge - B.gasMaskDrainPerMin * d); // фильтра хватает минут на пять тумана
     if (p.gasmaskCharge <= 0) {
-      this.removeItem(p, 'gasmask', 1);
-      p.gasmaskCharge = 100;
-      this.journal(p, 'Фильтр противогаза забился. Противогаз пришёл в негодность.', 'danger');
+      this.journal(p, 'Фильтр противогаза забился — он больше не защищает. Нужен сменный фильтр (медпункт).', 'danger');
       this.dirty([p.id]);
     }
   }
@@ -1170,6 +1274,8 @@ class Game extends EventEmitter {
   /** Можно ли применить предмет к жильцу (чтобы не тратить таблетки на здорового). */
   itemUseful(target, itemId) {
     const u = C.ITEMS[itemId].use;
+    if (u.refill === 'gasmask') return this.hasItem(target, 'gasmask') && target.gasmaskCharge < 100;
+    if (u.refill === 'flashlight') return this.hasItem(target, 'flashlight') && (target.flashCharge ?? 100) < 100;
     const curable = (u.cure || []).some((id) => this.hasCondition(target, id));
     const shortenable = (u.shorten || []).some((id) => this.hasCondition(target, id));
     const onlyCures = !u.hunger && !u.health && !u.sanity;
@@ -1181,6 +1287,14 @@ class Game extends EventEmitter {
     const u = C.ITEMS[itemId].use;
     this.applyStats(target, u);
     const parts = [];
+    if (u.refill === 'gasmask') {
+      target.gasmaskCharge = 100;
+      parts.push('противогаз снова защищает');
+    }
+    if (u.refill === 'flashlight') {
+      target.flashCharge = 100;
+      parts.push('фонарик снова светит');
+    }
     for (const id of (u.cure || []).filter((c) => this.hasCondition(target, c))) {
       this.cureCondition(target, id);
       parts.push(`прошло: ${C.CONDITIONS[id].name}`);
@@ -1200,7 +1314,10 @@ class Game extends EventEmitter {
     if (!def || !this.hasItem(p, itemId)) return { ok: false, error: 'У вас этого нет.' };
     if (def.equip) return { ok: false, error: 'Работает сам, пока лежит у вас в кармане.' };
     if (!def.use) return { ok: false, error: 'Это не используется. Зато можно обменять.' };
-    if (!this.itemUseful(p, itemId)) return { ok: false, error: 'Вам это сейчас не нужно.' };
+    if (!this.itemUseful(p, itemId)) {
+      if (def.use.refill) return { ok: false, error: def.use.refill === 'gasmask' ? 'Нужен противогаз — или фильтр в нём ещё свежий.' : 'Нужен фонарик — или он и так заряжен.' };
+      return { ok: false, error: 'Вам это сейчас не нужно.' };
+    }
     p.sleeping = false;
     this.removeItem(p, itemId, 1);
     const parts = this.applyItemUse(p, itemId);
@@ -1267,6 +1384,21 @@ class Game extends EventEmitter {
     this.journal(p, `Вы помогли ${t.name}: ${what}.`, 'good');
     this.dirty([p.id, t.id, ...this.othersAt(t).map((q) => q.id)]);
     return { ok: true, message: t.down ? '' : `${t.name} приходит в себя.` };
+  }
+
+  /** Разряд жильца на станке (1–6) по опыту из трудовой книжки. */
+  rankOf(p, gameId) {
+    const xp = (p.skills && p.skills[gameId]) || 0;
+    let rank = 1;
+    C.RANKS.forEach((need, i) => {
+      if (xp >= need) rank = i + 1;
+    });
+    return rank;
+  }
+
+  /** Лучший разряд — его видят соседи. */
+  bestRank(p) {
+    return Math.max(...Object.keys(MG.GAMES).map((g) => this.rankOf(p, g)));
   }
 
   /** Новосёл: первые часы его нельзя обокрасть (злые механики сначала бьют по новичкам). */
@@ -1632,8 +1764,11 @@ class Game extends EventEmitter {
     if (entry.needsSpoon && this.world.cutleryStolen && !this.hasItem(p, 'spoon')) {
       return { ok: false, error: 'В столовой украли ложки. Без своей ложки суп не съесть.' };
     }
+    const stock = this.state.stock[shopId];
+    if (entry.daily != null && !(stock[entry.key] > 0)) return { ok: false, error: `${entry.name} — кончилось. Завоз — в 0${B.supplyHour}:00.` };
     if (p.money < entry.price) return { ok: false, error: `Не хватает талонов (нужно ${entry.price}).` };
     p.money -= entry.price;
+    if (entry.daily != null) stock[entry.key] -= 1;
     if (entry.eat) {
       this.applyStats(p, entry.effect || {});
       this.journal(p, `${entry.name} — за ${talons(entry.price)}.`);
@@ -1664,7 +1799,7 @@ class Game extends EventEmitter {
       return { ok: false, error: `Мастер: «Норму на этот час вы выработали. Приходите через ${waitMin} мин.»` };
     }
     p.shiftLog.push(this.now());
-    const job = MG.createJob(gameId);
+    const job = MG.createJob(gameId, this.rankOf(p, gameId));
     if (!job) return { ok: false, error: 'Такой работы нет.' };
     job.id = newId('j');
     job.startedAt = this.now();
@@ -1691,6 +1826,21 @@ class Game extends EventEmitter {
       reward = Math.max(1, Math.floor(reward * 0.75));
       notes.push('больной работает хуже');
     }
+    // трудовая книжка: опыт, разряд, надбавка за разряд
+    const rankBefore = this.rankOf(p, job.game);
+    p.skills = p.skills || {};
+    p.skills[job.game] = (p.skills[job.game] || 0) + Math.round(score * 10);
+    const rankAfter = this.rankOf(p, job.game);
+    const rankBonus = reward > 0 ? Math.floor((rankBefore - 1) / 2) : 0;
+    if (rankBonus) {
+      reward += rankBonus;
+      notes.push(`надбавка за разряд +${rankBonus}`);
+    }
+    if (rankAfter > rankBefore) {
+      this.journal(p, `Мастер записал в трудовую книжку: ${MG.GAMES[job.game].name} — ${rankAfter} разряд. Платят больше, но и спрос строже.`, 'good');
+      this.log(`${p.name}: ${MG.GAMES[job.game].name} — ${rankAfter} разряд`, 'social', p.id);
+    }
+    if (reward > 0) this.world.shiftsToday = (this.world.shiftsToday || 0) + 1;
     p.money += reward;
     p.shifts = (p.shifts || 0) + 1;
     const pct = Math.round(score * 100);
@@ -2309,6 +2459,48 @@ const ADMIN_COMMANDS = {
     return { ok: true, message: `Спросили: ${victims.length}` };
   },
 
+  /** Снабжение: 'extra' — внеплановый завоз сейчас (+50% нормы), 'short' — недовоз в следующий раз, 'normal' — отменить недовоз. */
+  supply({ mode }) {
+    if (mode === 'extra') {
+      this.deliver(true);
+      this.log('Внеплановый завоз', 'event', null, { public: 'внеплановый завоз в столовую и медпункт' });
+      this.notify(this.alivePlayers(), { title: 'Завоз', text: 'В столовую и медпункт пришла внеплановая машина.', style: 'good', journal: false });
+      return { ok: true, message: 'Привезли' };
+    }
+    if (mode === 'short') {
+      this.world.supplyNext = 0.3;
+      this.log('Следующий завоз будет урезан (30%)', 'admin');
+      return { ok: true, message: 'Следующий завоз — 30%' };
+    }
+    this.world.supplyNext = 1;
+    return { ok: true, message: 'Завоз как обычно' };
+  },
+
+  /** Лампы в коридорах: погасить count случайных на этажах from–to или зажечь все. */
+  lamps({ from, to, count = 3, on }) {
+    const a = toInt(from, C.BUILDING.firstResidentialFloor);
+    const b = toInt(to, a);
+    if (Math.abs(b - a) > 300) throw new Error('Не больше 300 этажей за раз');
+    let n = 0;
+    for (let f = Math.min(a, b); f <= Math.max(a, b); f++) {
+      if (on) {
+        if (this.world.lampsOut[f]) n += this.world.lampsOut[f].length;
+        delete this.world.lampsOut[f];
+        continue;
+      }
+      const total = this.map.scene(`corridor:${f}`).lamps.length;
+      const lit = [...Array(total).keys()].filter((i) => !(this.world.lampsOut[f] || []).includes(i));
+      const howMany = Math.min(Math.max(0, toInt(count, 3)), lit.length);
+      for (let k = 0; k < howMany; k++) {
+        const i = lit.splice(Math.floor(this.random() * lit.length), 1)[0];
+        this.world.lampsOut[f] = [...(this.world.lampsOut[f] || []), i];
+        n++;
+      }
+    }
+    this.log(on ? `Лампы зажжены на этажах ${a}–${b}` : `Погасло ламп: ${n} на этажах ${a}–${b}`, 'event', null, { public: on ? `на этажах ${a}–${b} заменили лампы` : `в коридорах ${a}–${b} перегорели лампы` });
+    return { ok: true, message: on ? `Зажжено: ${n}` : `Погашено: ${n}` };
+  },
+
   // ---- модерация ----
   mute({ id, minutes = 30 }) {
     const p = this.requirePlayer(id, { alive: false });
@@ -2482,6 +2674,11 @@ Game.prototype.playerView = function playerView(p) {
       equip: !!C.ITEMS[id]?.equip,
     })),
     gasmaskCharge: Math.round(p.gasmaskCharge),
+    flashCharge: Math.round(p.flashCharge ?? 100),
+    skills: Object.entries(MG.GAMES).map(([id, g]) => {
+      const rank = this.rankOf(p, id);
+      return { id, name: g.name, rank, xp: (p.skills && p.skills[id]) || 0, next: C.RANKS[rank] ?? null };
+    }),
     location: { ...p.location, title: this.placeTitle(p) },
     pos: p.pos,
     posSeq: p.posSeq,
@@ -2575,6 +2772,7 @@ Game.prototype.describePlace = function describePlace(p) {
     name: q.name,
     apt: q.apartment.number,
     symptoms: q.conditions.map((c) => C.CONDITIONS[c.id]?.symptom).filter(Boolean),
+    rank: this.bestRank(q),
   }));
   const here = { key: this.locationKey(p), place: l.place, floor: l.floor, title: this.placeTitle(p), text: '', people, shop: null, residents: null, closed: null };
 
@@ -2607,6 +2805,8 @@ Game.prototype.describePlace = function describePlace(p) {
         residents.push({ number, name: r ? r.name : null, online: r ? this.isOnline(r.id) : false, you: r?.id === p.id });
       }
       if (kind === 'residential') here.residents = residents;
+      here.lampsOut = this.world.lampsOut[l.floor] || [];
+      if (here.lampsOut.length && !dark) here.text += ` Плафонов не горит: ${here.lampsOut.length}.`;
       break;
     }
     case 'canteen':
@@ -2624,15 +2824,19 @@ Game.prototype.describePlace = function describePlace(p) {
           desc: e.desc,
           price: e.price,
           eat: !!e.eat,
+          left: e.daily == null ? null : this.state.stock[l.place][e.key] || 0,
           note: e.needsSpoon && w.cutleryStolen ? 'нужна своя ложка' : null,
         }));
+      here.supplyAt = `0${B.supplyHour}:00`;
       break;
     }
     case 'factory': {
       const st = this.facilityStatus('factory');
       here.text = 'Цех №4. Грохот станков, конвейер уходит в темноту. Мастер с журналом выдаёт наряды.';
       if (!st.open) here.closed = st.reason;
-      here.jobs = Object.entries(MG.GAMES).map(([id, g]) => ({ id, name: g.name }));
+      here.jobs = Object.entries(MG.GAMES).map(([id, g]) => ({ id, name: g.name, rank: this.rankOf(p, id) }));
+      p.shiftLog = (p.shiftLog || []).filter((t) => this.now() - t < 3600 * 1000);
+      here.shiftsLeft = Math.max(0, B.shiftsPerHour - p.shiftLog.length);
       here.workCost = { energy: B.workEnergyCost, hunger: B.workHungerCost };
       break;
     }
@@ -2663,6 +2867,10 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
         Object.entries(w.breakdowns).map(([k, b]) => [k, b ? { reason: b.reason, endsInSec: b.until ? Math.round((b.until - now) / 1000) : null } : null]),
       ),
       cutleryStolen: w.cutleryStolen,
+      shiftsToday: w.shiftsToday || 0,
+      supplyNext: w.supplyNext ?? 1,
+      lampsOutFloors: Object.keys(w.lampsOut).length,
+      stock: this.state.stock,
     },
     online: this.onlineSet.size,
     archived: this.state.archive.length,
@@ -2705,6 +2913,7 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       account: p.account ? (this.state.accounts[p.account] || {}).login || p.account : null,
       mutedMin: this.mutedFor(p),
       harmsHour: (p.harmLog || []).filter((t) => now - t < 3600 * 1000).length,
+      ranks: Object.fromEntries(Object.keys(MG.GAMES).map((g) => [g, this.rankOf(p, g)])),
       newbie: this.isNewbie(p),
       banned: !!this.banInfo(p),
       down: p.down ? Math.max(0, Math.ceil((p.down.until - now) / 1000)) : null,

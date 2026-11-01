@@ -287,6 +287,7 @@ const PLAYER_ACTIONS = {
   aid: (p, a) => game.aid(p, a.target, a.item),
   rob: (p, a) => game.rob(p, a.target),
   pickpocket: (p, a) => game.pickpocket(p, a.target),
+  fix_lamp: (p, a) => game.fixLamp(p, a.index),
   answer: (p, a) => game.answer(p, String(a.id || ''), a.option),
   evict: (p, a) => game.evict(p, a.guest),
   note: (p, a) => game.slipNote(p, a.apt, a.text, !!a.anon),

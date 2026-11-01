@@ -404,3 +404,11 @@ body.sanity-critical .place h1 { animation: flicker 2s infinite; }
 .msg-tools button { background: none; border: 0; color: var(--muted); cursor: pointer; padding: 0 3px; font-size: 12px; }
 .msg-tools button:hover { color: var(--amber); }
 @media (hover: none) { .chat-log li .msg-tools { visibility: visible; } }
+
+/* Трудовая книжка, остатки, расходники */
+.skills { list-style: none; padding: 0; margin: 0; display: grid; gap: 4px; font-size: 13px; }
+.skills li { display: grid; grid-template-columns: 1fr auto; gap: 0 8px; }
+.skills li b { color: var(--amber); font-weight: 400; font-family: var(--mono); font-size: 12px; }
+.skills li small { grid-column: 1 / -1; color: var(--muted); font-size: 11px; }
+.price.out { color: var(--red); }
+.inventory .equip.dead { color: var(--red); }

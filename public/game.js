@@ -260,6 +260,10 @@
       e.preventDefault();
     } else if (e.code === 'KeyE') {
       e.preventDefault();
+      if (S.lampNear != null) {
+        act('fix_lamp', { index: S.lampNear }).then((r) => r.ok && say(r.message));
+        return;
+      }
       const info = S.near && objectInfo(S.near);
       if (info && info.actions[0]) info.actions[0].run();
     } else if (e.code === 'Enter') {
@@ -466,7 +470,8 @@
         return { label: 'Окошко фельдшера', sub: v.facilities.medpost.open ? null : 'закрыто', actions: [{ label: 'Постучать в окошко', run: () => openShop('medpost', o) }] };
       case 'station': {
         const job = (v.here.jobs || []).find((j) => j.id === o.game);
-        return { label: o.label, sub: v.facilities.factory.open ? null : 'цех стоит', actions: [{ label: `Взять наряд: ${job ? job.name : o.game}`, run: () => startWork(o.game) }] };
+        const sub = !v.facilities.factory.open ? 'цех стоит' : `${job ? job.rank : 1} разряд · смен в этот час: ${v.here.shiftsLeft ?? '—'}`;
+        return { label: o.label, sub, actions: [{ label: `Взять наряд: ${job ? job.name : o.game}`, run: () => startWork(o.game) }] };
       }
       default: {
         const f = FLAVOR[o.type];
@@ -491,7 +496,33 @@
     return best;
   }
 
+  /** Погасший плафон рядом (в коридоре) — номер лампы или null. */
+  function nearestDeadLamp() {
+    const v = S.view;
+    if (!v || !S.scene || v.here.place !== 'corridor' || !(v.here.lampsOut || []).length) return null;
+    for (const i of v.here.lampsOut) {
+      const l = S.scene.lamps[i];
+      if (l && Math.hypot(S.me.x - l[0], S.me.y - l[1]) <= 1.6) return i;
+    }
+    return null;
+  }
+
   function renderPrompt() {
+    const lamp = S.view && !S.view.you.travel && !S.view.you.down ? nearestDeadLamp() : null;
+    if (lamp != null) {
+      S.near = null;
+      const hasBulb = S.view.you.inventory.some((i) => i.id === 'bulb');
+      const sig = `lamp${lamp}${hasBulb}`;
+      if (S.memo.prompt === sig) return;
+      S.memo.prompt = sig;
+      $('#prompt').replaceChildren(
+        h('span', { class: 'label' }, 'Погасший плафон', h('small', { text: hasBulb ? ' · у вас есть лампочка' : ' · нужна лампочка (бывает в мусоропроводе)' })),
+        hasBulb ? h('button', { class: 'btn small primary', onclick: () => act('fix_lamp', { index: lamp }).then((r) => r.ok && say(r.message)) }, h('kbd', { text: 'E' }), 'Вкрутить лампочку') : null,
+      );
+      S.lampNear = hasBulb ? lamp : null;
+      return;
+    }
+    S.lampNear = null;
     const o = S.view && (S.view.you.travel || S.view.you.down) ? null : nearestObject();
     S.near = o;
     const info = o && objectInfo(o);
@@ -615,18 +646,18 @@
               'div',
               { class: 'shop-row' },
               h('div', null, e.name, e.desc ? h('span', { class: 'desc', text: e.desc }) : null, e.note ? h('span', { class: 'note', text: e.note }) : null),
-              h('span', { class: 'price', text: `${e.price} ₸` }),
+              h('span', { class: `price${e.left === 0 ? ' out' : ''}`, text: e.left === 0 ? 'нет' : `${e.price} ₸${e.left != null ? ` · ${e.left} шт.` : ''}` }),
               h('button', {
                 class: 'btn small',
                 text: e.eat ? 'Взять' : 'Купить',
-                disabled: !!here.closed || you.money < e.price,
+                disabled: !!here.closed || you.money < e.price || e.left === 0,
                 onclick: () => act('buy', { shop: here.place, key: e.key }),
               }),
             ),
           ),
         ),
       );
-      kids.push(h('p', { class: 'note', text: `У вас ${you.money} ₸. Талоны дают за смену в цеху.` }));
+      kids.push(h('p', { class: 'note', text: `У вас ${you.money} ₸. Завоз — в ${here.supplyAt || '08:00'}: чем больше смен закроют в цеху, тем больше привезут.` }));
       body.replaceChildren(...kids);
     });
   }
@@ -923,7 +954,14 @@
     for (const a of you.asks || []) openAsk(a);
     radioSignals(v);
     memo('stats', [you.stats, you.conditions.map((c) => [c.id, c.remainingSec == null ? null : Math.ceil(c.remainingSec / 10)])], () => renderStats(you));
-    memo('inv', [you.inventory, you.gasmaskCharge], () => renderInventory(you));
+    memo('inv', [you.inventory, you.gasmaskCharge, you.flashCharge], () => renderInventory(you));
+    memo('skills', you.skills, () => {
+      $('#skills').replaceChildren(
+        ...you.skills.map((k) =>
+          h('li', null, h('span', { text: k.name }), h('b', { text: `${k.rank} разряд` }), h('small', { text: k.next != null ? `опыт ${k.xp}/${k.next}` : `опыт ${k.xp} · высший` })),
+        ),
+      );
+    });
     memo('head', [v.here.title, v.here.text, v.here.floor, v.here.place], () => {
       const showFloor = v.here.floor != null && ['canteen', 'medpost', 'factory'].includes(v.here.place);
       $('#place-title').replaceChildren(v.here.title, ...(showFloor ? [h('span', { class: 'floor-tag', text: ` ${v.here.floor} этаж` })] : []));
@@ -1049,7 +1087,12 @@
             it.name,
             ' ',
             h('span', { class: 'count', text: `×${it.count}` }),
-            it.equip ? h('span', { class: 'equip', text: it.id === 'gasmask' ? ` · фильтр ${you.gasmaskCharge}%` : ' · в кармане' }) : null,
+            it.equip
+              ? h('span', {
+                  class: `equip${(it.id === 'gasmask' && !you.gasmaskCharge) || (it.id === 'flashlight' && !you.flashCharge) ? ' dead' : ''}`,
+                  text: it.id === 'gasmask' ? (you.gasmaskCharge ? ` · фильтр ${you.gasmaskCharge}%` : ' · фильтр забит') : it.id === 'flashlight' ? (you.flashCharge ? ` · заряд ${you.flashCharge}%` : ' · сел') : ' · в кармане',
+                })
+              : null,
           ),
           it.usable ? h('button', { class: 'btn small', text: 'Исп.', title: `Использовать: ${it.name}`, onclick: () => act('use', { item: it.id }) }) : null,
         ),
@@ -1071,6 +1114,7 @@
           'span',
           { class: 'chip-person' },
           h('b', { text: p.name }),
+          p.rank > 1 ? h('span', { class: 'symptom', text: `${p.rank} разряд` }) : null,
           p.symptoms.length ? h('span', { class: 'symptom', text: p.symptoms.join(', ') }) : null,
           h('button', { class: 'btn small', text: 'Обмен', onclick: () => tradeWith(p) }),
           evict,
@@ -1158,7 +1202,7 @@
         hurt: you.conditions.some((c) => c.kind === 'injury'),
         sleep: you.sleeping && !S.me.m,
         down: !!you.down,
-        mask: has('gasmask') && !!fog && fog !== 'window',
+        mask: has('gasmask') && you.gasmaskCharge > 0 && !!fog && fog !== 'window',
       },
       actors: [...S.actors.values()],
       time,
@@ -1166,7 +1210,8 @@
       gameMinutes: hh * 60 + mm,
       dark: v.world.dark,
       night: isNight(v),
-      flashlight: has('flashlight'),
+      lampsOut: v.here.lampsOut || [],
+      flashlight: has('flashlight') && you.flashCharge > 0,
       fog,
       fogOutside: !!(f && f.phase === 'active' && f.affectsYou),
       siren: !!(f && f.phase === 'warning' && f.affectsYou),

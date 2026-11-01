@@ -884,6 +884,15 @@
           b.line(o.x + 1, o.y + 0.8, o.x + 1 + Math.cos(a) * 0.2, o.y + 0.8 + Math.sin(a) * 0.2, '#b22', 0.03);
         }
       }
+      for (const i of s.lampsOut || []) {
+        const l = scene.lamps[i];
+        if (!l) continue;
+        b.g.save();
+        b.g.globalAlpha = 0.85;
+        b.circle(l[0], l[1], 0.28, 'rgba(0,0,0,0.25)');
+        for (let k = 0; k < 5; k++) b.rect(l[0] - 0.2 + ((k * 37) % 40) / 100, l[1] - 0.12 + ((k * 23) % 25) / 100, 0.06, 0.03, 'rgba(210,230,235,0.8)');
+        b.g.restore();
+      }
       if (s.pathEnd) {
         const p = (t * 2) % 1;
         b.g.strokeStyle = `rgba(227,161,59,${1 - p})`;
@@ -899,7 +908,7 @@
       const g = this.light.getContext('2d');
       const vw = this.light.width, vh = this.light.height;
       // ночью (22:00–06:00) в коридорах горит каждая вторая лампа и всё чуть темнее
-      const ambient = s.dark ? 0.93 : Math.min(0.85, scene.style.ambient + (s.night ? 0.12 : 0));
+      const ambient = s.dark ? 0.93 : Math.min(0.85, scene.style.ambient + (s.night ? 0.12 : 0) + ((s.lampsOut || []).length ? 0.1 * (s.lampsOut || []).length : 0));
       g.globalCompositeOperation = 'source-over';
       g.clearRect(0, 0, vw, vh);
       g.fillStyle = `rgba(3,4,7,${ambient})`;
@@ -914,7 +923,10 @@
         g.fillStyle = grad;
         g.fillRect(x - r * TD, y - r * TD, r * TD * 2, r * TD * 2);
       };
-      const lamps = s.dark ? [] : s.night && scene.kind === 'corridor' ? scene.lamps.filter((_, i) => i % 2 === 0) : scene.lamps;
+      const out = new Set(s.lampsOut || []);
+      const lamps = s.dark ? [] : scene.lamps.filter((_, i) => !out.has(i) && !(s.night && scene.kind === 'corridor' && i % 2 === 1));
+      // если погасла половина ламп — в коридоре темно (как без света), но горящие лампы светят
+      const dim = scene.kind === 'corridor' && out.size > 0 && out.size >= Math.ceil(scene.lamps.length / 2);
       const broken = scene.kind === 'corridor' || scene.style.technical ? scene.seed % Math.max(1, lamps.length) : -1;
       const intensities = lamps.map((_, i) => {
         if (i === broken || (scene.style.technical && i % 2 === 0)) {
@@ -926,7 +938,7 @@
       lamps.forEach(([lx, ly], i) => hole(lx, ly, 3.6, intensities[i]));
       if (s.you) {
         hole(s.you.x, s.you.y - 0.5, s.dark ? 1.1 : 1.4, s.dark ? 0.55 : 0.35);
-        if (s.flashlight && s.dark) {
+        if (s.flashlight && (s.dark || dim)) {
           const d = s.you.d;
           const dx = d === 'left' ? -1.6 : d === 'right' ? 1.6 : 0;
           const dy = d === 'up' ? -1.6 : d === 'down' ? 1.6 : 0;

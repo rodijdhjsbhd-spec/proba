@@ -29,8 +29,8 @@ const SORT_BINS = [
 ];
 const SIZES = ['М6', 'М8', 'М10', 'М12'];
 
-function createSort() {
-  const count = 12;
+function createSort(rank = 1) {
+  const count = 12 + (rank - 1) * 2; // выше разряд — больше деталей за то же время
   const items = [];
   const answers = [];
   for (let i = 0; i < count; i++) {
@@ -66,15 +66,17 @@ function scoreSort(job, answers) {
 // ---------------------------------------------------------------------------
 // 2. Снятие показаний счётчиков (на память)
 // ---------------------------------------------------------------------------
-function createMeter() {
+function createMeter(rank = 1) {
+  const digits = rank >= 4 ? 6 : 5; // со 4-го разряда — шестизначные счётчики
   const readings = [];
-  for (let i = 0; i < 5; i++) readings.push(String(rnd(100000)).padStart(5, '0'));
+  for (let i = 0; i < 5; i++) readings.push(String(rnd(10 ** digits)).padStart(digits, '0'));
+  const showMs = Math.max(1100, 2000 - (rank - 1) * 150);
   return {
     publicData: {
       title: 'Показания счётчиков',
-      rules: 'Каждое показание видно 2 секунды. Запомните и перепишите все пять в журнал.',
+      rules: `Каждое показание видно ${(showMs / 1000).toFixed(1).replace('.', ',')} с. Запомните и перепишите все пять в журнал.`,
       readings, // клиент показывает их по одному и прячет
-      showMs: 2000,
+      showMs,
       limitSec: 60,
     },
     secret: { readings },
@@ -89,7 +91,7 @@ function scoreMeter(job, answers) {
   let digits = 0;
   let ok = 0;
   correct.forEach((value, i) => {
-    const given = String(answers[i] ?? '').replace(/\D/g, '').padStart(5, '0').slice(-5);
+    const given = String(answers[i] ?? '').replace(/\D/g, '').padStart(value.length, '0').slice(-value.length);
     for (let d = 0; d < value.length; d++) {
       digits++;
       if (given[d] === value[d]) ok++;
@@ -109,14 +111,14 @@ function gaugePos(p, tMs) {
   return clamp01(0.5 + 0.33 * Math.sin(t * p.w1 + p.p1) + 0.14 * Math.sin(t * p.w2 + p.p2));
 }
 
-function createGauge() {
+function createGauge(rank = 1) {
   const params = {
     w1: 1.6 + Math.random() * 0.9,
     p1: Math.random() * Math.PI * 2,
     w2: 3.4 + Math.random() * 1.8,
     p2: Math.random() * Math.PI * 2,
     center: 0.3 + Math.random() * 0.4,
-    width: 0.12,
+    width: Math.max(0.06, 0.12 - (rank - 1) * 0.012), // выше разряд — уже зелёная зона
     presses: 6,
   };
   return {
@@ -163,10 +165,10 @@ function rewardFor(score) {
   return Math.max(1, Math.round(score * 6));
 }
 
-function createJob(gameId) {
+function createJob(gameId, rank = 1) {
   const game = GAMES[gameId];
   if (!game) return null;
-  const job = game.create();
+  const job = game.create(Math.max(1, Math.min(6, rank)));
   return { game: gameId, ...job };
 }
 

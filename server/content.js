@@ -50,6 +50,13 @@ const BALANCE = {
   // Карманники в темноте: шанс успеха и пауза между попытками
   pickpocketChance: 0.5,
   pickpocketCooldownSec: 60,
+  // Завоз в столовую и медпункт — в 08:00 игрового времени. Сколько привезут (от 60% до 140% нормы),
+  // зависит от числа смен, закрытых за прошлые сутки, на одного живого жильца:
+  supplyHour: 8,
+  supplyShiftsPerResident: 3,
+  // Расходники: противогаз (фильтр) и фонарик (батарейка) — сколько процентов заряда в минуту
+  gasMaskDrainPerMin: 20,
+  flashDrainPerMin: 8,
 
   hungerPerMin: -3, // сытость падает: 100 → 0 примерно за 33 минуты
   starvationHpPerMin: -6, // урон здоровью при сытости 0
@@ -114,34 +121,43 @@ const ITEMS = {
   pills: { name: 'Таблетки', desc: 'Лечат почти всё. Почти.', use: { cure: ['flu', 'cough', 'poisoning'] } },
   serum: { name: 'Сыворотка', desc: 'Ампула с мутной жидкостью.', use: { cure: ['fogsick', 'insomnia'], sanity: 10 } },
   bandage: { name: 'Бинт', desc: 'Стерильный (по документам).', use: { health: 15, cure: ['burn', 'bite'], shorten: ['arm', 'leg'] } },
-  gasmask: { name: 'Противогаз', desc: 'ГП-5. Снижает вред тумана. Изнашивается.', equip: true },
-  flashlight: { name: 'Фонарик', desc: 'Спасает рассудок в темноте.', equip: true },
+  gasmask: { name: 'Противогаз', desc: 'ГП-5. Снижает вред тумана. Фильтр забивается — нужен сменный.', equip: true },
+  flashlight: { name: 'Фонарик', desc: 'Спасает рассудок в темноте. Садится — нужна батарейка.', equip: true },
+  filter: { name: 'Фильтр ГП-5', desc: 'Сменный фильтр для противогаза.', use: { refill: 'gasmask' } },
+  battery: { name: 'Батарейка', desc: '«Крона». Для фонарика.', use: { refill: 'flashlight' } },
   spoon: { name: 'Ложка', desc: 'Алюминиевая. Ценная вещь.' },
   fork: { name: 'Вилка', desc: 'Три зубца из четырёх.' },
-  bulb: { name: 'Лампочка', desc: '60 Вт. Валюта на чёрном рынке.' },
+  bulb: { name: 'Лампочка', desc: '60 Вт. Можно вкрутить в погасший плафон в коридоре.' },
 };
 
 // Меню учреждений: что можно купить за талоны.
 // eat: true — съедается на месте (суп). needsSpoon — нужна своя ложка, если в столовой украли приборы.
+// daily — сколько привозят на игровые сутки (null — без ограничений). Реальный завоз зависит от того,
+// сколько смен жильцы закрыли в цеху за прошлые сутки (см. BALANCE.supply*).
 const SHOPS = {
   canteen: [
-    { id: 'soup', name: 'Суп дня', price: 4, eat: true, effect: { hunger: 35 }, needsSpoon: true },
-    { id: 'tea', name: 'Чай', price: 1, eat: true, effect: { hunger: 2, sanity: 6 } },
-    { item: 'bread', price: 2 },
-    { item: 'kissel', price: 2 },
-    { item: 'rusk', price: 1 },
-    { item: 'stew', price: 7 },
-    { item: 'spoon', price: 3, hiddenIfStolen: true },
+    { id: 'soup', name: 'Суп дня', price: 4, eat: true, effect: { hunger: 35 }, needsSpoon: true, daily: 40 },
+    { id: 'tea', name: 'Чай', price: 1, eat: true, effect: { hunger: 2, sanity: 6 }, daily: null },
+    { item: 'bread', price: 2, daily: 30 },
+    { item: 'kissel', price: 2, daily: 20 },
+    { item: 'rusk', price: 1, daily: 25 },
+    { item: 'stew', price: 7, daily: 6 },
+    { item: 'spoon', price: 3, hiddenIfStolen: true, daily: 4 },
   ],
   medpost: [
-    { id: 'checkup', name: 'Осмотр фельдшера (+20 здоровья)', price: 3, eat: true, effect: { health: 20 } },
-    { item: 'pills', price: 5 },
-    { item: 'bandage', price: 3 },
-    { item: 'serum', price: 9 },
-    { item: 'flashlight', price: 8 },
-    { item: 'gasmask', price: 15 },
+    { id: 'checkup', name: 'Осмотр фельдшера (+20 здоровья)', price: 3, eat: true, effect: { health: 20 }, daily: null },
+    { item: 'pills', price: 5, daily: 8 },
+    { item: 'bandage', price: 3, daily: 10 },
+    { item: 'serum', price: 9, daily: 3 },
+    { item: 'filter', price: 4, daily: 4 },
+    { item: 'battery', price: 2, daily: 6 },
+    { item: 'flashlight', price: 8, daily: 2 },
+    { item: 'gasmask', price: 15, daily: 1 },
   ],
 };
+
+// Трудовая книжка: сколько опыта нужно для разряда 1…6 на каждом станке
+const RANKS = [0, 30, 80, 160, 280, 450];
 
 // ---------------------------------------------------------------------------
 // Состояния: болезни и травмы. perMin — эффекты в минуту, пока состояние активно.
@@ -256,5 +272,5 @@ const NOTES = {
 
 module.exports = {
   BUILDING, FACILITIES, BALANCE, ITEMS, SHOPS, CONDITIONS, ACCIDENTS, PLACES, BREAKDOWNS, HALLUCINATIONS,
-  HALLUCINATION_VOICES, RESERVED_NAMES, ARCHIVE_DEAD_AFTER_H, NOTES,
+  HALLUCINATION_VOICES, RESERVED_NAMES, ARCHIVE_DEAD_AFTER_H, NOTES, RANKS,
 };

@@ -392,6 +392,24 @@
 
     withSchedule(grid.lastElementChild, { label: 'Кража столовых приборов', cmd: 'cutlery', args: () => ({ steal: true, percent: steal.value }) });
 
+    // --- Снабжение и лампы ---
+    A.supplyInfo = h('p', { class: 'hint' });
+    const lampFrom = num(firstFloor, { min: 1, max: 999 });
+    const lampTo = num(firstFloor + 4, { min: 1, max: 999 });
+    const lampCount = num(3, { min: 1, max: 6 });
+    grid.append(
+      card(
+        'Снабжение и лампы',
+        'Завоз в 08:00: чем больше смен закрыли жильцы, тем больше привезут. Погасшие лампы жильцы могут вкрутить сами (лампочки — из мусоропровода).',
+        'warn-card',
+        A.supplyInfo,
+        actions(button('Внеплановый завоз', () => cmd('supply', { mode: 'extra' }), 'small'), button('Недовоз в 08:00', () => cmd('supply', { mode: 'short' }), 'small'), button('Обычный завоз', () => cmd('supply', { mode: 'normal' }), 'small')),
+        h('div', { class: 'grid3' }, field('С этажа', lampFrom), field('По этаж', lampTo), field('Сколько ламп', lampCount)),
+        actions(button('Погасить лампы', () => cmd('lamps', { from: lampFrom.value, to: lampTo.value, count: lampCount.value }), 'small'), button('Заменить все', () => cmd('lamps', { from: lampFrom.value, to: lampTo.value, on: true }), 'small')),
+      ),
+    );
+    withSchedule(grid.lastElementChild, { label: () => `Погасить лампы ${lampFrom.value}–${lampTo.value}`, cmd: 'lamps', args: () => ({ from: lampFrom.value, to: lampTo.value, count: lampCount.value }) });
+
     // --- Эпидемия ---
     const epiTarget = targetPicker('random');
     const epiCond = select(opts(C.conditions));
@@ -603,6 +621,11 @@
     $('#pause-btn').textContent = s.world.paused ? '▶ Запустить время' : '⏸ Пауза мира';
     renderStatus();
     renderSchedule();
+    if (A.supplyInfo) {
+      const st = s.world.stock || {};
+      const short = Object.entries(st).flatMap(([shop, items]) => Object.entries(items).filter(([, n]) => n <= 2).map(([k, n]) => `${A.content.items[k]?.name || k}: ${n}`));
+      A.supplyInfo.textContent = `Смен за сутки: ${s.world.shiftsToday}. Следующий завоз: ${Math.round((s.world.supplyNext ?? 1) * 100)}% от расчёта.${short.length ? ` Заканчивается: ${short.join(', ')}.` : ''}${s.world.lampsOutFloors ? ` Этажей с погасшими лампами: ${s.world.lampsOutFloors}.` : ''}`;
+    }
     renderPlayers();
     renderCard();
     for (const picker of A.pickers) picker.refresh();
@@ -946,6 +969,7 @@
     if (!A.card) return;
     A.card.title.textContent = p.name;
     A.card.meta.textContent = `кв. ${p.apartment.number} · ${p.online ? 'в сети' : 'не в сети'} · смен отработано: ${p.shifts} · ${p.account ? `паспорт «${p.account}»` : 'без паспорта'}${p.newbie ? ' · новосёл' : ''}${p.mutedMin ? ` · заглушён ещё ${p.mutedMin} мин` : ''}${p.banned ? ' · ЗАБАНЕН' : ''}`;
+    A.card.meta.textContent += p.ranks ? ` · разряды: ${Object.values(p.ranks).join('/')}` : '';
     A.card.harm.textContent = p.harmsHour ? `Бед от ЖЭК за час: ${p.harmsHour}${p.harmsHour >= 3 ? ' — не слишком ли часто одному?' : ''}` : '';
     A.card.harm.className = `card-meta${p.harmsHour >= 3 ? ' harm-warn' : ''}`;
     A.card.dyn.replaceChildren(
