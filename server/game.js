@@ -101,6 +101,8 @@ function freshState() {
       hazards: {}, // сцена → опасности на клетках [{ id, kind, x, y, fenced, until }]
       scars: {}, // сцена → следы событий [{ id, kind, x, y, at, text? }], выцветают за B.scarHours
       radio: { queue: [], silenceUntil: null, lastAirMin: 0, lastNewsTs: 0, slot: 0, log: [] },
+      rent: null, // талонов в сутки; null — по умолчанию из BALANCE.rent, 0 — квартплаты нет
+      lastDay: null, // игровые сутки, для которых уже прошла полночь (порча еды, квартплата)
     },
     players: {},
     trades: {},
@@ -147,6 +149,7 @@ class Game extends EventEmitter {
       const hour = Math.floor((this.world.gameMinutes % 1440) / 60);
       this.world.lastSupplyDay = hour >= B.supplyHour ? day : day - 1;
     }
+    if (this.world.lastDay == null) this.world.lastDay = Math.floor(this.world.gameMinutes / 1440); // первая полночь — впереди
     this.lastKnock = new Map();
     this.knocks = new Map(); // хозяин → кто стучит { guestId, ts }
     this.groupSince = new Map(); // сцена → с какого момента там собралось 3+ жильцов (для режиссёра)
@@ -1207,6 +1210,7 @@ class Game extends EventEmitter {
       }
     }
     this.radioTick(now);
+    this.dayCheck(now);
     if (this.state.assignments.length) this.closeAssignments(now);
     if (this.world.tick % 30 === 0 && this.state.petitions.length) this.expirePetitions(now);
     this.elderWarnings(now);
@@ -1383,6 +1387,132 @@ class Game extends EventEmitter {
     }
     // закрытые больше суток назад — в архив (нужны только для целей «сдавшие/не сдавшие»)
     this.state.assignments = this.state.assignments.filter((a) => !a.closed || now - a.closedAt < 24 * 3600 * 1000).slice(-30);
+  }
+
+  // =========================================================================
+  // Полночь: порча еды и квартплата
+  // =========================================================================
+  dayCheck(now) {
+    const day = Math.floor(this.world.gameMinutes / 1440);
+    if (this.world.lastDay == null) this.world.lastDay = day;
+    if (day <= this.world.lastDay) return;
+    this.world.lastDay = day;
+    this.spoilFood(day);
+    this.chargeRent(now);
+  }
+
+  rentAmount() {
+    return this.world.rent == null ? B.rent : this.world.rent;
+  }
+
+  /** Хлеб черствеет за ночь, кисель киснет. В авоське за окном — медленнее. */
+  spoilFood(day) {
+    for (const p of this.alivePlayers()) {
+      const changed = [];
+      for (const [from, to] of Object.entries(C.SPOIL)) {
+        const n = p.inventory[from] || 0;
+        if (!n) continue;
+        this.removeItem(p, from, n);
+        this.addItem(p, to, n);
+        changed.push(`${C.ITEMS[from].name} → ${C.ITEMS[to].name.toLowerCase()} ×${n}`);
+      }
+      if (p.window && day % B.windowSpoilEvery === 0) {
+        for (const [from, to] of Object.entries(C.SPOIL)) {
+          const n = p.window[from] || 0;
+          if (!n) continue;
+          delete p.window[from];
+          p.window[to] = (p.window[to] || 0) + n;
+        }
+      }
+      if (changed.length) this.journal(p, `За ночь еда испортилась: ${changed.join(', ')}.`, 'warn');
+    }
+  }
+
+  /** Квартплата в полночь. С тех, кто был в доме за сутки; новосёлов не трогаем. Не хватило — долг. */
+  chargeRent(now) {
+    const rent = this.rentAmount();
+    if (!rent) return;
+    for (const p of this.alivePlayers()) {
+      if (this.isNewbie(p)) continue;
+      const active = this.isOnline(p.id) || now - (p.lastSeen || 0) < 30 * 60000;
+      if (!active) continue;
+      const due = rent + (p.rentDebt || 0);
+      const pay = Math.min(p.money, due);
+      p.money -= pay;
+      p.rentDebt = due - pay;
+      this.journal(p, p.rentDebt ? `Квартплата: списано ${talons(pay)}, долг за квартиру — ${talons(p.rentDebt)}. Висит на доске этажа.` : `Квартплата: списано ${talons(pay)}.`, p.rentDebt ? 'warn' : 'info');
+      if (p.rentDebt) this.log(`${p.name}: долг за квартиру ${talons(p.rentDebt)}`, 'trade', p.id);
+      this.dirty([p.id]);
+    }
+  }
+
+  /** Погасить долг за квартиру у доски. */
+  payRent(p) {
+    if (!this.nearTo(p, (o) => o.type === 'board')) return { ok: false, error: 'Платят у доски объявлений (там ящик ЖЭК).' };
+    if (!p.rentDebt) return { ok: false, error: 'Долга за квартиру нет.' };
+    const pay = Math.min(p.money, p.rentDebt);
+    if (!pay) return { ok: false, error: 'Нечем платить.' };
+    p.money -= pay;
+    p.rentDebt -= pay;
+    this.journal(p, `Вы погасили долг за квартиру: ${talons(pay)}${p.rentDebt ? `, осталось ${talons(p.rentDebt)}` : ''}.`, 'good');
+    return { ok: true, message: p.rentDebt ? `Внесено ${talons(pay)}. Осталось ${talons(p.rentDebt)}.` : 'Долг погашен.' };
+  }
+
+  // ---- авоська за окном ----
+  windowPut(p, itemId, count = 1) {
+    if (!this.isOwnHome(p) || !this.nearTo(p, (o) => o.type === 'window')) return { ok: false, error: 'Авоська — за окном вашей квартиры.' };
+    const n = Math.max(1, toInt(count, 1));
+    if (!C.ITEMS[itemId] || (p.inventory[itemId] || 0) < n) return { ok: false, error: 'У вас этого нет.' };
+    p.window = p.window || {};
+    const inside = Object.values(p.window).reduce((a, b) => a + b, 0);
+    if (inside + n > B.windowCapacity) return { ok: false, error: `В авоську влезает ${B.windowCapacity} штук.` };
+    this.removeItem(p, itemId, n);
+    p.window[itemId] = (p.window[itemId] || 0) + n;
+    return { ok: true, message: `За окном: ${C.ITEMS[itemId].name} ×${p.window[itemId]}.` };
+  }
+
+  windowTake(p, itemId, count = 1) {
+    if (!this.isOwnHome(p) || !this.nearTo(p, (o) => o.type === 'window')) return { ok: false, error: 'Авоська — за окном вашей квартиры.' };
+    const have = (p.window || {})[itemId] || 0;
+    const n = Math.min(have, Math.max(1, toInt(count, 1)));
+    if (!n) return { ok: false, error: 'В авоське этого нет.' };
+    p.window[itemId] -= n;
+    if (!p.window[itemId]) delete p.window[itemId];
+    this.addItem(p, itemId, n);
+    return { ok: true, message: `Взяли: ${C.ITEMS[itemId].name} ×${n}.` };
+  }
+
+  /** Туман на этаже: еда в авоське за окном покрывается налётом. Только от тумана, который наслал бог. */
+  fogWindows(f) {
+    for (const p of this.alivePlayers()) {
+      if (!p.window || p.apartment.floor < f.from || p.apartment.floor > f.to) continue;
+      let n = 0;
+      for (const [from, to] of Object.entries(C.FOGGED)) {
+        if (!p.window[from]) continue;
+        n += p.window[from];
+        p.window[to] = (p.window[to] || 0) + p.window[from];
+        delete p.window[from];
+      }
+      if (n) this.journal(p, 'Пока шёл туман, хлеб в авоське за окном покрылся серым налётом.', 'warn');
+    }
+  }
+
+  // ---- честная экономика ----
+  /** Один адрес у двух жильцов — пометка в журнале обменов (и счётчик для флажка «подозрительный»). */
+  sameAddress(p, q) {
+    if (!p.lastIp || p.lastIp !== q.lastIp) return '';
+    p.sameIpGifts = (p.sameIpGifts || 0) + 1;
+    return ' · один адрес';
+  }
+
+  /** Новосёл не может раздаривать талоны без меры: иначе новых жильцов заводят как «ферму». */
+  newbieGiftCheck(p, money) {
+    if (!money || !this.isNewbie(p)) return null;
+    const day = this.gameDay();
+    if (!p.newbieGifts || p.newbieGifts.day !== day) p.newbieGifts = { day, money: 0 };
+    if (p.newbieGifts.money + money > B.newbieGiftLimit) return `Новосёл может отдать не больше ${talons(B.newbieGiftLimit)} в сутки. ЖЭК присматривает.`;
+    p.newbieGifts.money += money;
+    return null;
   }
 
   // =========================================================================
@@ -2453,7 +2583,8 @@ class Game extends EventEmitter {
     const debtors = this.state.ious
       .filter((x) => this.iouOverdue(x) && (this.getPlayer(x.debtorId) || {}).apartment?.floor === floor)
       .map((x) => this.iouView(x));
-    return { ok: true, notes, pinned, assignments, petitions, elder: elderInfo, debtors };
+    const rentDebtors = this.floorResidents(floor).filter((q) => q.rentDebt > 0).map((q) => ({ name: q.name, apt: q.apartment.number, debt: q.rentDebt }));
+    return { ok: true, notes, pinned, assignments, petitions, elder: elderInfo, debtors, rentDebtors, myRentDebt: p.rentDebt || 0, rent: this.rentAmount() };
   }
 
   /** Кто сейчас стучит к хозяину (если стучали недавно и гость всё ещё у двери). */
@@ -2623,6 +2754,8 @@ class Game extends EventEmitter {
     const bundle = this.normalizeBundle(rawBundle);
     if (this.bundleEmpty(bundle)) return { ok: false, error: 'Пустой свёрток.' };
     if (!this.hasBundle(p, bundle)) return { ok: false, error: 'У вас нет того, что вы хотите оставить.' };
+    const limit = this.newbieGiftCheck(p, bundle.money);
+    if (limit) return { ok: false, error: limit };
     p.money -= bundle.money;
     for (const [id, n] of Object.entries(bundle.items)) this.removeItem(p, id, n);
     // заглушённый жилец передаёт вещи молча — приписка была лазейкой мимо запрета
@@ -2913,11 +3046,13 @@ class Game extends EventEmitter {
     if (!this.hasBundle(p, give)) return { ok: false, error: 'У вас нет того, что вы предлагаете.' };
 
     if (this.bundleEmpty(want)) {
+      const limit = this.newbieGiftCheck(p, give.money);
+      if (limit) return { ok: false, error: limit };
       this.moveBundle(p, q, give);
       const what = this.bundleText(give);
       this.journal(p, `Вы отдали жильцу ${q.name}: ${what}.`);
       this.notify([q], { title: 'Подарок', text: `${p.name} (кв. ${p.apartment.number}) отдал вам: ${what}.`, style: 'good' });
-      this.log(`${p.name} → ${q.name}: подарок (${what})`, 'trade', p.id);
+      this.log(`${p.name} → ${q.name}: подарок (${what})${this.sameAddress(p, q)}`, 'trade', p.id);
       this.markDeed(p, 'gift');
       return { ok: true, gift: true };
     }
@@ -2977,7 +3112,7 @@ class Game extends EventEmitter {
     this.journal(a, `Обмен с ${b.name}: отдали ${this.bundleText(t.give)}, получили ${this.bundleText(t.want)}.`, 'good');
     this.journal(b, `Обмен с ${a.name}: отдали ${this.bundleText(t.want)}, получили ${this.bundleText(t.give)}.`, 'good');
     this.notify([a], { title: 'Обмен состоялся', text: `${b.name} принял ваше предложение.`, style: 'good', journal: false });
-    this.log(`Обмен ${a.name} ⇄ ${b.name}: ${this.bundleText(t.give)} ⇄ ${this.bundleText(t.want)}`, 'trade', a.id);
+    this.log(`Обмен ${a.name} ⇄ ${b.name}: ${this.bundleText(t.give)} ⇄ ${this.bundleText(t.want)}${this.sameAddress(a, b)}`, 'trade', a.id);
     return { ok: true };
   }
 
@@ -3065,8 +3200,9 @@ class Game extends EventEmitter {
         return inRange.filter((p) => !!a.done[p.apartment.number] === (target.type === 'assignmentDone'));
       }
       case 'debtors': {
+        // долг за квартиру или просроченная расписка
         const ids = new Set(this.state.ious.filter((x) => this.iouOverdue(x)).map((x) => x.debtorId));
-        return alive.filter((p) => ids.has(p.id));
+        return alive.filter((p) => ids.has(p.id) || p.rentDebt > 0);
       }
       case 'elders':
         return Object.keys(this.state.elders).map((f) => this.elderOf(Number(f))).filter(Boolean);
@@ -3201,6 +3337,7 @@ class Game extends EventEmitter {
     const f = this.world.fog;
     if (!f || f.arrived) return;
     f.arrived = true;
+    this.fogWindows(f);
     const victims = this.alivePlayers().filter((p) => p.location.floor >= f.from && p.location.floor <= f.to);
     this.notify(victims, {
       title: 'ТУМАН',
@@ -3643,6 +3780,26 @@ const ADMIN_COMMANDS = {
     return { ok: true, message: this.isOwnHome(p) ? 'Записка у жильца' : 'Записка ждёт под дверью' };
   },
 
+  /** Квартплата: сколько талонов в сутки (0 — отменить). */
+  rentSet({ amount }) {
+    const n = Math.max(0, Math.min(50, toInt(amount, B.rent)));
+    this.world.rent = n;
+    this.log(n ? `Квартплата: ${talons(n)} в сутки` : 'Квартплата отменена', 'event', null, { public: n ? `квартплата — ${talons(n)} в сутки` : 'квартплату отменили' });
+    return { ok: true, message: n ? `Квартплата ${talons(n)} в сутки` : 'Квартплата отменена' };
+  },
+
+  /** Простить долг за квартиру (одному или всем). */
+  rentForgive({ id }) {
+    const list = id ? [this.requirePlayer(id)] : this.alivePlayers();
+    let n = 0;
+    for (const p of list) if (p.rentDebt) {
+      p.rentDebt = 0;
+      n++;
+      this.journal(p, 'ЖЭК списал ваш долг за квартиру.', 'good');
+    }
+    return { ok: true, message: `Долги прощены: ${n}` };
+  },
+
   /** Ответ ЖЭК на коллективное заявление: выполнить, оставить без ответа или наказать подписавших. */
   petitionResolve({ id, verdict, reply }) {
     const pet = this.state.petitions.find((x) => x.id === id);
@@ -4057,6 +4214,8 @@ Game.prototype.playerView = function playerView(p) {
     held: this.state.ious.filter((x) => x.status === 'open' && x.holderId === p.id).map((x) => this.iouView(x)),
   };
   you.elderOf = this.elderOf(p.apartment.floor)?.id === p.id ? p.apartment.floor : null;
+  you.rentDebt = p.rentDebt || 0;
+  you.window = Object.entries(p.window || {}).map(([id, count]) => ({ id, count, name: C.ITEMS[id]?.name || id }));
   you.day = this.gameDay();
 
   return {
@@ -4198,6 +4357,7 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       shiftsToday: w.shiftsToday || 0,
       supplyNext: w.supplyNext ?? 1,
       lampsOutFloors: Object.keys(w.lampsOut).length,
+      rent: this.rentAmount(),
       stock: this.state.stock,
       radio: { queue: w.radio.queue, silenceSec: w.radio.silenceUntil ? Math.max(0, Math.round((w.radio.silenceUntil - now) / 1000)) : 0, log: w.radio.log },
       scarsCount: Object.values(w.scars).reduce((n, l) => n + l.length, 0),
@@ -4253,6 +4413,8 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       rumor: this.rumor(p),
       deeds: p.deedTotals || {},
       elder: this.elderOf(p.apartment.floor)?.id === p.id,
+      rentDebt: p.rentDebt || 0,
+      suspicious: (p.sameIpGifts || 0) >= 2,
       debts: this.state.ious.filter((x) => x.debtorId === p.id && this.iouOverdue(x)).length,
       goodness: Math.round(this.goodness(p) * 10) / 10,
       ranks: Object.fromEntries(Object.keys(MG.GAMES).map((g) => [g, this.rankOf(p, g)])),

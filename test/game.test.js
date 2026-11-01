@@ -1550,6 +1550,7 @@ test('передачка погибшему возвращается отпра�
   const b = join(game, 'Мария');
   game.setOnline(b.id, false);
   a.money = 20;
+  a.createdAt -= 3 * 3600 * 1000; // не новосёл: у новосёлов лимит подарков
   game.admin('teleport', { id: a.id, place: 'corridor', floor: 101 });
   walkTo(game, a, (o) => o.type === 'apt' && o.number === b.apartment.number);
   assert.equal(game.leaveParcel(a, b.apartment.number, { money: 10, items: {} }, 'Маше').ok, true);
@@ -1824,4 +1825,65 @@ test('долговая расписка: в долг до дня N, вернут
   assert.equal(game.repayIou(b, iou.id).ok, true);
   assert.equal(c.money, 5, 'долг ушёл тому, у кого расписка');
   assert.equal(game.resolveTargets({ type: 'debtors' }).length, 0);
+});
+
+test('полночь: хлеб черствеет, в авоське за окном — медленнее, туман делает его туманным', () => {
+  const { game } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('give', { id: p.id, item: 'bread', count: 3, silent: true });
+  walkTo(game, p, type('window'));
+  assert.equal(game.windowPut(p, 'bread', 2).ok, true);
+  game.world.gameMinutes = Math.ceil(game.world.gameMinutes / 1440) * 1440 + 1; // за полночь
+  game.dayCheck(game.now());
+  assert.equal(p.inventory.stale_bread, 1, 'в кармане зачерствел');
+  const day = Math.floor(game.world.gameMinutes / 1440);
+  assert.equal(p.window.bread, day % C.BALANCE.windowSpoilEvery === 0 ? undefined : 2, 'за окном — не каждую ночь');
+  p.window = { bread: 2 };
+  game.admin('fog', { from: p.apartment.floor, to: p.apartment.floor, warnSec: 0, durationMin: 1 });
+  assert.equal(p.window.fog_bread, 2, 'туман покрыл налётом');
+  assert.equal(game.windowTake(p, 'fog_bread', 2).ok, true);
+  assert.equal(p.inventory.fog_bread, 2);
+});
+
+test('квартплата: в полночь со всех, кто был в доме; не хватило — долг на доске и цель «должники»', () => {
+  const { game, clock } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  for (const p of [a, b]) p.createdAt -= 3 * 3600 * 1000;
+  a.money = 10;
+  b.money = 1;
+  game.world.gameMinutes = Math.ceil(game.world.gameMinutes / 1440) * 1440 + 1;
+  game.dayCheck(game.now());
+  assert.equal(a.money, 10 - C.BALANCE.rent);
+  assert.equal(b.money, 0);
+  assert.equal(b.rentDebt, C.BALANCE.rent - 1);
+  assert.deepEqual(game.resolveTargets({ type: 'debtors' }).map((p) => p.id), [b.id]);
+  game.admin('teleport', { id: a.id, place: 'corridor', floor: 101 });
+  walkTo(game, a, type('board'));
+  assert.equal(game.readBoard(a).rentDebtors[0].name, 'Мария');
+  b.money = 5;
+  game.admin('teleport', { id: b.id, place: 'corridor', floor: 101 });
+  walkTo(game, b, type('board'));
+  assert.equal(game.payRent(b).ok, true);
+  assert.equal(b.rentDebt, 0);
+  game.admin('rentSet', { amount: 0 });
+  game.world.gameMinutes += 1440;
+  game.dayCheck(game.now());
+  assert.equal(b.money, 5 - (C.BALANCE.rent - 1), 'квартплату отменили');
+  clock.t += 1;
+});
+
+test('честная экономика: новосёл дарит не больше лимита; один адрес — пометка и флажок', () => {
+  const { game } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  for (const p of [a, b]) game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  b.pos = { ...a.pos };
+  a.money = 20;
+  a.lastIp = b.lastIp = '10.0.0.1';
+  assert.equal(game.tradeOffer(a, b.id, { money: C.BALANCE.newbieGiftLimit + 1, items: {} }, { money: 0, items: {} }).ok, false);
+  assert.equal(game.tradeOffer(a, b.id, { money: 3, items: {} }, { money: 0, items: {} }).ok, true);
+  assert.ok(game.state.log.at(-1).text.includes('один адрес'));
+  game.tradeOffer(a, b.id, { money: 2, items: {} }, { money: 0, items: {} });
+  assert.equal(game.adminSnapshot().players.find((p) => p.id === a.id).suspicious, true);
 });

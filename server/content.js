@@ -78,6 +78,13 @@ const BALANCE = {
   elderLeadMin: 3,
   // Долговая расписка: самый долгий срок, игровых дней
   iouMaxDays: 7,
+  // Квартплата: талонов в сутки (в полночь; ЖЭК может поменять или отменить в Пульте)
+  rent: 2,
+  // Авоська за окном: еда в ней портится раз в столько суток; сколько штук влезает
+  windowSpoilEvery: 3,
+  windowCapacity: 10,
+  // Новосёл может подарить не больше стольких талонов в сутки (защита от «ферм» из новых жильцов)
+  newbieGiftLimit: 5,
 
   hungerPerMin: -3, // сытость падает: 100 → 0 примерно за 33 минуты
   starvationHpPerMin: -6, // урон здоровью при сытости 0
@@ -149,7 +156,15 @@ const ITEMS = {
   spoon: { name: 'Ложка', desc: 'Алюминиевая. Ценная вещь.' },
   fork: { name: 'Вилка', desc: 'Три зубца из четырёх.' },
   bulb: { name: 'Лампочка', desc: '60 Вт. Можно вкрутить в погасший плафон в коридоре.' },
+  stale_bread: { name: 'Чёрствый хлеб', desc: 'Позавчерашний. Размочить бы.', use: { hunger: 8 } },
+  sour_kissel: { name: 'Прокисший кисель', desc: 'Пахнет так себе. Но съедобно.', use: { hunger: 3 } },
+  fog_bread: { name: 'Хлеб с серым налётом', desc: 'Лежал за окном, пока шёл туман.', use: { hunger: 8, sanity: -6 } },
 };
+
+// Порча еды: за ночь (в полночь) свежее становится несвежим. Сухари и тушёнка вечны.
+// «Туманной» еда становится только от тумана, который наслал бог (если лежала за окном).
+const SPOIL = { bread: 'stale_bread', kissel: 'sour_kissel' };
+const FOGGED = { bread: 'fog_bread', stale_bread: 'fog_bread' };
 
 // Домовая книга: молва. Поступок → черта, которую видят соседи (на двери, рядом, в глазок).
 const DEEDS = {
@@ -380,5 +395,5 @@ const NOTES = {
 module.exports = {
   BUILDING, FACILITIES, BALANCE, ITEMS, SHOPS, CONDITIONS, ACCIDENTS, PLACES, BREAKDOWNS, HALLUCINATIONS,
   HALLUCINATION_VOICES, RESERVED_NAMES, ARCHIVE_DEAD_AFTER_H, NOTES, RANKS, TUTORIAL, ECHO_PHRASES, HAZARDS,
-  LORE, RADIO, DEEDS,
+  LORE, RADIO, DEEDS, SPOIL, FOGGED,
 };

@@ -73,7 +73,7 @@
         '#####DD#####',
       ],
       legend: {
-        w: { type: 'window', label: 'Окно', wall: true, decor: true },
+        w: { type: 'window', label: 'Окно', wall: true },
         r: { type: 'radio', label: 'Радиоточка', wall: true },
         b: { type: 'bed', label: 'Кровать' },
         s: { type: 'sink', label: 'Раковина', decor: true },

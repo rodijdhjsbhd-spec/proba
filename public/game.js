@@ -466,6 +466,9 @@
       }
       case 'board':
         return { label: 'Доска объявлений', actions: [{ label: 'Читать', run: () => openBoard(o) }] };
+      case 'window':
+        if (!v.here.ownHome) return { label: 'Окно', actions: [{ label: 'Посмотреть в окно', run: () => say(v.world.fog && v.world.fog.affectsYou ? 'За окном — серая муть.' : 'Окна дома напротив. Где-то горит свет.') }] };
+        return { label: 'Окно', sub: (you.window || []).length ? `в авоське: ${you.window.map((x) => `${x.name} ×${x.count}`).join(', ')}` : 'авоська пуста', actions: [{ label: 'Авоська за окном', run: () => openWindowStash() }] };
       case 'memorial':
         return { label: 'Стена памяти', sub: 'имена выбывших жильцов', actions: [{ label: 'Прочитать имена', run: () => openMemorial() }] };
       case 'chute':
@@ -540,6 +543,31 @@
   /** Бумага, записка, листок: текст в окне. */
   function showPaper(title, text) {
     openModal({ title, style: 'paper', body: h('div', { class: 'paper-text' }, String(text).split('\n').map((l) => h('p', { text: l }))), actions: [{ label: 'Отложить', primary: true }] });
+  }
+
+  /** Авоська за окном: еда там портится медленнее (но туман до неё добирается). */
+  function openWindowStash() {
+    openSheet('window', 'Авоська за окном');
+    S.memo.sheet = null;
+    renderWindowStash();
+  }
+
+  function renderWindowStash() {
+    const you = S.view.you;
+    memo('sheet', [you.window, you.inventory], () => {
+      const food = you.inventory.filter((it) => it.usable || it.id === 'bread');
+      $('#sheet-body').replaceChildren(
+        h('p', { class: 'hint', text: 'Холодно за окном — хлеб черствеет медленнее. Но если на этаж придёт туман, всё в авоське покроется налётом.' }),
+        h('h4', { class: 'board-h', text: 'В авоське' }),
+        (you.window || []).length
+          ? h('ul', { class: 'inventory' }, you.window.map((x) => h('li', null, h('span', { class: 'name', text: `${x.name} ×${x.count}` }), h('button', { class: 'btn small', text: 'Взять', onclick: () => act('window_take', { item: x.id, count: 1 }) }))))
+          : h('p', { class: 'note', text: 'Пусто.' }),
+        h('h4', { class: 'board-h', text: 'В карманах' }),
+        food.length
+          ? h('ul', { class: 'inventory' }, food.map((x) => h('li', null, h('span', { class: 'name', text: `${x.name} ×${x.count}` }), h('button', { class: 'btn small', text: 'Положить', onclick: () => act('window_put', { item: x.id, count: 1 }) }))))
+          : h('p', { class: 'note', text: 'Нечего класть.' }),
+      );
+    });
   }
 
   async function listenRadio() {
@@ -746,6 +774,7 @@
     if (!S.sheet || !S.view) return;
     if (S.sheet.kind === 'shop') renderShop();
     else if (S.sheet.kind === 'travel') renderTravel();
+    else if (S.sheet.kind === 'window') renderWindowStash();
   }
 
   // ---- раздача и окошко фельдшера ----
@@ -937,12 +966,23 @@
           ? null
           : h('p', { class: 'note', text: 'Голосовать можно у доски своего этажа.' }),
     );
+    const rentBox = res.rent || res.myRentDebt || (res.rentDebtors || []).length
+      ? h(
+          'div',
+          { class: 'rent' },
+          h('h4', { class: 'board-h', text: 'Квартплата' }),
+          h('p', { class: 'note', text: res.rent ? `${res.rent} ₸ в сутки, списывается в полночь.` : 'Квартплаты сейчас нет.' }),
+          res.myRentDebt ? h('div', { class: 'actions' }, h('span', { class: 'bad', text: `Ваш долг: ${res.myRentDebt} ₸` }), h('button', { class: 'btn small primary', type: 'button', text: 'Погасить', onclick: async () => { const r = await act('pay_rent'); if (r.ok) { say(r.message); openBoard(obj); } } })) : null,
+          (res.rentDebtors || []).length ? h('ul', { class: 'board-notes' }, res.rentDebtors.map((d) => h('li', null, `Долг за квартиру: ${d.name} (кв. ${d.apt}) — ${d.debt} ₸`))) : null,
+        )
+      : null;
     const debtors = (res.debtors || []).length
       ? h('div', { class: 'debtors' }, h('h4', { class: 'board-h', text: 'Книга должников этажа' }), h('ul', { class: 'board-notes' }, res.debtors.map((d) => h('li', null, `Должник: ${d.debtor}. Кому: ${d.holder}. Долг: ${d.what} — срок вышел (день ${d.dueDay})`))))
       : null;
     body.replaceChildren(
       ...(assignments.length ? [h('ul', { class: 'board-notes assignments' }, assignments)] : []),
       ...(debtors ? [debtors] : []),
+      ...(rentBox ? [rentBox] : []),
       h('h4', { class: 'board-h', text: 'Листки жильцов' }),
       res.pinned.length
         ? h('ul', { class: 'board-notes pinned' }, res.pinned.map((n) => h('li', { class: n.mine ? 'mine' : '' }, h('small', { text: `${n.name}, кв. ${n.apt} · ${new Date(n.ts).toLocaleString('ru-RU')}` }), n.text)))

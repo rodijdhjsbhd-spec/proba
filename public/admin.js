@@ -657,6 +657,20 @@
     );
     withSchedule(grid.lastElementChild, { label: () => `Опасность: ${C.hazards[hzKind.value]}`, cmd: 'hazard', args: hzArgs });
 
+    // --- Квартплата ---
+    const rentAmt = num(2, { min: 0, max: 50 });
+    A.rentInfo = h('p', { class: 'hint' });
+    grid.append(
+      card(
+        'Квартплата',
+        'Списывается в полночь с тех, кто был в доме за сутки (новосёлов не трогает). Не хватило — долг: он висит на доске этажа. Мир должникам ничего не делает — цель «Должники» в любой карточке.',
+        'warn-card',
+        A.rentInfo,
+        h('div', { class: 'row' }, 'Талонов в сутки', rentAmt, button('Установить', () => cmd('rentSet', { amount: rentAmt.value }), 'small'), button('Отменить', () => cmd('rentSet', { amount: 0 }), 'small')),
+        actions(button('Простить все долги', () => confirm('Простить долги за квартиру всем?') && cmd('rentForgive', {}), 'small')),
+      ),
+    );
+
     // --- Коллективные заявления ---
     A.petitionList = h('ul', { class: 'hazard-list' });
     grid.append(
@@ -850,6 +864,10 @@
     renderHazards();
     renderRadio();
     renderAssignments();
+    if (A.rentInfo) {
+      const debtors = s.players.filter((p) => p.alive && p.rentDebt > 0);
+      A.rentInfo.textContent = `Сейчас: ${s.world.rent ? `${s.world.rent} ₸ в сутки` : 'квартплаты нет'}. Должников: ${debtors.length}${debtors.length ? ` (${debtors.map((p) => `${p.name} ${p.rentDebt} ₸`).join(', ')})` : ''}.`;
+    }
     renderPetitions();
     renderEyeSide();
     for (const picker of A.pickers) {
@@ -984,7 +1002,7 @@
         A.rows.set(p.id, tr);
       }
       const td = tr.children;
-      setCell(td[0], `${p.online ? '●' : '○'} ${p.name}`, p.online ? 'on' : '');
+      setCell(td[0], `${p.online ? '●' : '○'} ${p.name}${p.suspicious ? ' ⚠' : ''}`, p.online ? 'on' : '');
       td[0].style.color = p.online ? 'var(--green)' : '';
       setCell(td[1], p.apartment.number, 'num');
       setCell(td[2], whereText(p));
@@ -1221,7 +1239,7 @@
     const DEED_NAMES = { gift: 'подарки', aid: 'помощь', rescue: 'спас лежачих', shelter: 'пускал переждать', care: 'берёг дом', assignment: 'разнарядки', theft: 'кражи', rob: 'обирал лежачих', cold: 'не открыл в туман' };
     const deeds = Object.entries(p.deeds || {}).map(([k, n]) => `${DEED_NAMES[k] || k}: ${n}`);
     A.card.rumor.textContent = p.alive
-      ? `${p.elder ? '★ старший по этажу · ' : ''}${p.debts ? `просрочено расписок: ${p.debts} · ` : ''}Молва: ${p.rumor && p.rumor.length ? p.rumor.join(', ') : 'ничего не говорят'}${deeds.length ? ` · досье — ${deeds.join(', ')}` : ''}${p.goodness ? ` · за сутки ${p.goodness > 0 ? '+' : ''}${p.goodness}` : ''}`
+      ? `${p.suspicious ? '⚠ подозрительный: подарки жильцу с того же адреса · ' : ''}${p.elder ? '★ старший по этажу · ' : ''}${p.rentDebt ? `долг за квартиру: ${p.rentDebt} ₸ · ` : ''}${p.debts ? `просрочено расписок: ${p.debts} · ` : ''}Молва: ${p.rumor && p.rumor.length ? p.rumor.join(', ') : 'ничего не говорят'}${deeds.length ? ` · досье — ${deeds.join(', ')}` : ''}${p.goodness ? ` · за сутки ${p.goodness > 0 ? '+' : ''}${p.goodness}` : ''}`
       : '';
     A.card.harm.textContent = p.harmsHour ? `Бед от ЖЭК за час: ${p.harmsHour}${p.harmsHour >= 3 ? ' — не слишком ли часто одному?' : ''}` : '';
     A.card.harm.className = `card-meta${p.harmsHour >= 3 ? ' harm-warn' : ''}`;
