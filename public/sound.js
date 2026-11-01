@@ -66,20 +66,24 @@
 
     // --- постоянные слои ---
     const buildHum = (g) => {
+      // «дыхание» ламп — на своём узле: громкость слоя (g) остаётся только за setLevel,
+      // иначе колебание складывалось бы с ней, гул гремел и не затихал при уходе из коридора
+      const breath = a.createGain();
+      breath.gain.value = 0.7;
+      breath.connect(g);
       for (const [f, v] of [[100, 1], [150, 0.5], [50, 0.7]]) {
         const o = a.createOscillator();
         const og = a.createGain();
         o.frequency.value = f;
         og.gain.value = v;
-        o.connect(og).connect(g);
+        o.connect(og).connect(breath);
         o.start();
       }
-      // лампы мигают — гул чуть «дышит»
       const lfo = a.createOscillator();
       const lg = a.createGain();
       lfo.frequency.value = 0.3;
       lg.gain.value = 0.3;
-      lfo.connect(lg).connect(g.gain);
+      lfo.connect(lg).connect(breath.gain);
       lfo.start();
     };
     const buildMachines = (g) => {

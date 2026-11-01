@@ -447,7 +447,10 @@ const SNAP_DIR = path.join(path.dirname(DATA_FILE), 'snapshots');
 game.on('snapshot_taken', (snap) => {
   try {
     fs.mkdirSync(SNAP_DIR, { recursive: true });
-    fs.writeFileSync(path.join(SNAP_DIR, `${snap.ts}-${snap.id}.json`), JSON.stringify(snap));
+    // как мир: во временный файл и rename — падение посреди записи не оставит полфайла
+    const file = path.join(SNAP_DIR, `${snap.ts}-${snap.id}.json`);
+    fs.writeFileSync(`${file}.tmp`, JSON.stringify(snap));
+    fs.renameSync(`${file}.tmp`, file);
     const files = fs.readdirSync(SNAP_DIR).filter((f) => f.endsWith('.json')).sort();
     for (const f of files.slice(0, Math.max(0, files.length - 8))) fs.unlinkSync(path.join(SNAP_DIR, f));
   } catch (err) {
@@ -455,7 +458,15 @@ game.on('snapshot_taken', (snap) => {
   }
 });
 try {
-  game.snapshots = fs.readdirSync(SNAP_DIR).filter((f) => f.endsWith('.json')).sort().slice(-8).map((f) => JSON.parse(fs.readFileSync(path.join(SNAP_DIR, f), 'utf8')));
+  // битый файл пропускаем, остальные снимки — на месте
+  game.snapshots = fs.readdirSync(SNAP_DIR).filter((f) => f.endsWith('.json')).sort().slice(-8).flatMap((f) => {
+    try {
+      return [JSON.parse(fs.readFileSync(path.join(SNAP_DIR, f), 'utf8'))];
+    } catch (err) {
+      console.error('[snapshot] битый файл', f, err.message);
+      return [];
+    }
+  });
 } catch {
   /* снимков ещё нет */
 }
@@ -494,6 +505,8 @@ game.on('log', (entry) => {
 });
 
 // ---- игроки ----
+// мёртвый жилец только оставляет «отголосок» и смотрит: перекладывать вещи (подстроить наследство) нельзя
+const DEAD_ACTIONS = new Set(['echo', 'report', 'claim_account']);
 const PLAYER_ACTIONS = {
   move: (p, a) => game.move(p, a),
   knock: (p, a) => game.knock(p, a.apt),
@@ -814,6 +827,7 @@ function handleRest(ws, msg) {
     let res;
     try {
       if (!handler) res = { ok: false, error: 'Неизвестное действие' };
+      else if (!p.alive && !DEAD_ACTIONS.has(msg.action) && !msg.action.startsWith('push_')) res = { ok: false, error: 'Вы мертвы.' };
       else if (p.down && !msg.action.startsWith('push_')) res = { ok: false, error: 'Вы без сознания.' };
       else res = handler(p, args);
     } catch (err) {
@@ -848,8 +862,8 @@ adminWss.on('connection', (ws, req) => {
 
 /** Впустить бога в Пульт: роль ограничивает команды, имя — в журнал богов. */
 function admitAdmin(ws, ip, name, role) {
-  failedLogins.delete(ip);
-  adminIps.add(ip);
+  failedLogins.delete(name === 'root' ? `root:${ip}` : ip);
+  if (role === 'god') adminIps.add(ip); // доверие при общей тревоге — только адресам богов
   ws.isAdmin = true;
   ws.adminName = name;
   ws.adminRole = role;
@@ -878,7 +892,10 @@ function handleAdminMessage(ws, ip, raw) {
   if (!msg || typeof msg !== 'object') return;
 
   if (msg.t === 'auth') {
-    const lock = failedLogins.get(ip);
+    const login = String(msg.login || '').trim().toLowerCase();
+    const isRoot = !login || login === 'root';
+    // неудачи общего пароля считаются отдельно: успешный вход наблюдателя их не обнуляет
+    const lock = failedLogins.get(isRoot ? `root:${ip}` : ip);
     const total = failedLogins.get('admin:*');
     // общая тревога (перебор с многих адресов) не запирает адреса, с которых бог уже входил
     const trusted = adminIps.has(ip);
@@ -886,8 +903,7 @@ function handleAdminMessage(ws, ip, raw) {
       send(ws, { t: 'auth_error', error: 'Слишком много попыток. Подождите минуту.' });
       return;
     }
-    const login = String(msg.login || '').trim().toLowerCase();
-    if (login && login !== 'root') {
+    if (!isRoot) {
       // личная учётка бога — пароль проверяем асинхронно
       if (!heavyAllowed(ws)) return send(ws, { t: 'auth_error', error: BUSY });
       heavyInFlight++;
@@ -915,8 +931,7 @@ function handleAdminMessage(ws, ip, raw) {
     const expected = Buffer.from(ADMIN_PASSWORD);
     const ok = given.length === expected.length && crypto.timingSafeEqual(given, expected);
     if (!ok) {
-      const count = (lock?.count || 0) + 1;
-      failedLogins.set(ip, { count, until: count >= 5 ? Date.now() + 60000 : 0 });
+      countFailure(`root:${ip}`);
       // общий счётчик — против перебора с разных адресов
       const all = failedLogins.get('admin:*');
       const fresh = all && Date.now() - all.since < 60000 ? all : { since: Date.now(), count: 0, until: 0 };
@@ -943,6 +958,11 @@ function handleAdminMessage(ws, ip, raw) {
   }
 
   if (msg.t === 'cmd') {
+    // не больше 10 команд в секунду с одного Пульта: каждая строит полный снимок для админки
+    const nowMs = Date.now();
+    ws.cmdTimes = (ws.cmdTimes || []).filter((t) => nowMs - t < 1000);
+    if (ws.cmdTimes.length >= 10) return send(ws, { t: 'res', id: msg.id, ok: false, error: 'Не так часто.' });
+    ws.cmdTimes.push(nowMs);
     const res = game.admin(String(msg.cmd), msg.args && typeof msg.args === 'object' ? msg.args : {}, { who: ws.adminName, role: ws.adminRole });
     send(ws, { t: 'res', ...res, id: msg.id }); // id запроса важнее: в res может быть свой id (созданной записи)
     sendSnapshot([ws], game.adminSnapshot());

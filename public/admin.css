@@ -196,5 +196,6 @@ table.players tbody tr.down td { background: rgba(221,90,79,0.14); }
 .scen-json { font-family: var(--mono); font-size: 12px; }
 #scen-editor label.f { display: grid; gap: 3px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
 
-.closet-opts { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); font-size: 12px; }
+.closet-opts { display: inline-flex; flex-wrap: wrap; max-width: 100%; gap: 6px; align-items: center; color: var(--muted); font-size: 12px; }
 .closet-opts input { width: 200px; }
+.closet-opts select, .closet-opts input { min-width: 0; max-width: 100%; }

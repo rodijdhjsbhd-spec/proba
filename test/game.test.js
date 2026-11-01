@@ -1861,11 +1861,18 @@ test('квартплата: в полночь со всех, кто был в д
   const { game, clock } = makeWorld();
   const a = join(game, 'Иван');
   const b = join(game, 'Мария');
-  for (const p of [a, b]) p.createdAt -= 3 * 3600 * 1000;
+  for (const p of [a, b]) {
+    p.createdAt -= 3 * 3600 * 1000;
+    p.settledDay -= 2; // живут не первые сутки
+  }
+  const c = join(game, 'Пётр'); // заселился сегодня — за эти сутки не платит
+  c.createdAt -= 3 * 3600 * 1000;
+  c.money = 10;
   a.money = 10;
   b.money = 1;
   game.world.gameMinutes = Math.ceil(game.world.gameMinutes / 1440) * 1440 + 1;
   game.dayCheck(game.now());
+  assert.equal(c.money, 10, 'в день заселения квартплаты нет');
   assert.equal(a.money, 10 - C.BALANCE.rent);
   assert.equal(b.money, 0);
   assert.equal(b.rentDebt, C.BALANCE.rent - 1);

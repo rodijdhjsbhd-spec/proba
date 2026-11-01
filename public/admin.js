@@ -420,7 +420,8 @@
     buildEvents();
     renderPalette();
     fillEyeTools();
-    A.memo.cardShell = null;
+    // всё перестроено с нуля — пустые списки (заявления, разнарядки, климат…) должны заполниться заново
+    for (const k of Object.keys(A.memo)) A.memo[k] = null;
     renderSnapshot();
     if (A.selected === cardFor) {
       fields().forEach((el, i) => {
@@ -1200,10 +1201,20 @@
         A.selected = null;
         A.memo.cardShell = null;
       }
-      memo('cardShell', 'none', () => box.replaceChildren(h('p', { class: 'empty', text: 'Выберите жильца в таблице, чтобы решить его судьбу.' })));
+      memo('cardShell', 'none', () => {
+        delete box.dataset.sig;
+        box.replaceChildren(h('p', { class: 'empty', text: 'Выберите жильца в таблице, чтобы решить его судьбу.' }));
+      });
       return;
     }
-    memo('cardShell', [p.id, p.alive], () => buildCard(box, p));
+    memo('cardShell', [p.id, p.alive], () => {
+      const sig = JSON.stringify([p.id, p.alive]);
+      const q = 'input:not([type=checkbox]), textarea';
+      const keep = box.dataset.sig === sig ? [...box.querySelectorAll(q)].map((el) => el.value) : null;
+      buildCard(box, p);
+      box.dataset.sig = sig;
+      if (keep) [...box.querySelectorAll(q)].forEach((el, i) => { if (i < keep.length) el.value = keep[i]; });
+    });
     memo('cardDyn', p, () => fillCard(p));
   }
 
@@ -1894,13 +1905,13 @@
       cmd('hazard', { scene: E.key, kind, x: pt.x, y: pt.y, minutes: $('#eye-minutes').value });
       return;
     }
-    const pp = (A.snap.world.puppets || []).find((x) => x.id === E.puppet);
-    if (pp && pp.scene === E.key) {
-      cmd('puppetMove', { id: pp.id, x: pt.x, y: pt.y });
+    const hz = (E.scene?.hazards || []).find((z) => Math.hypot(z.x - pt.x, z.y - pt.y) < 0.6);
+    if (hz) {
+      if (confirm(`Убрать опасность «${A.content.hazards[hz.kind]}»?`)) cmd('hazardClear', { scene: E.key, id: hz.id });
       return;
     }
-    const hz = (E.scene?.hazards || []).find((z) => Math.hypot(z.x - pt.x, z.y - pt.y) < 0.6);
-    if (hz && confirm(`Убрать опасность «${A.content.hazards[hz.kind]}»?`)) cmd('hazardClear', { scene: E.key, id: hz.id });
+    const pp = (A.snap.world.puppets || []).find((x) => x.id === E.puppet);
+    if (pp && pp.scene === E.key) cmd('puppetMove', { id: pp.id, x: pt.x, y: pt.y });
   }
 
   function renderPuppets() {
@@ -1921,7 +1932,7 @@
                 { class: x.id === E.puppet ? 'selected' : '' },
                 h('span', { class: 'txt' }, h('b', { text: x.name }), ` — ${x.title}`),
                 button(x.id === E.puppet ? 'Выбрана' : 'Выбрать', () => {
-                  E.puppet = x.id;
+                  E.puppet = E.puppet === x.id ? null : x.id; // повторное нажатие — отпустить
                   A.memo.puppets = null;
                   renderPuppets();
                   if (x.scene !== E.key) watchScene(x.scene);

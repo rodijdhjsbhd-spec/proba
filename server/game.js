@@ -25,6 +25,16 @@ const PUSH_TAG_GAP_MS = 10 * 60000;
 const PUSH_URGENT_GAP_MS = 30000;
 const PUSH_PER_HOUR = 12;
 const PEOPLE_SHOWN = 30; // сколько соседей по сцене попадает в вид жильца (остальные — числом)
+/** Цена вещей по прилавкам (для лимита подарков новосёла: что сверх цены — подарок). */
+function bundleWorth(b) {
+  let sum = (b && b.money) || 0;
+  for (const [id, n] of Object.entries((b && b.items) || {})) {
+    let price = 0;
+    for (const list of Object.values(C.SHOPS)) for (const e of list) if (e.item === id) price = Math.max(price, e.price);
+    sum += price * n;
+  }
+  return sum;
+}
 const STAT_NAMES = { health: 'Здоровье', hunger: 'Сытость', energy: 'Силы', sanity: 'Рассудок' };
 const MOVE_PLACES = ['home', 'corridor', 'canteen', 'medpost', 'factory'];
 
@@ -226,9 +236,10 @@ class Game extends EventEmitter {
       p.flashCharge = p.flashCharge ?? 100;
       p.skills = p.skills || {};
       if (p.job) {
-        // смену прервал перезапуск сервера — силы и сытость, потраченные на неё, возвращаются
-        p.stats.energy = Math.min(100, (p.stats.energy || 0) + B.workEnergyCost);
-        p.stats.hunger = Math.min(100, (p.stats.hunger || 0) + B.workHungerCost);
+        // смену прервал перезапуск сервера (или откат) — возвращается ровно то, что она стоила
+        const cost = p.job.cost || { energy: B.workEnergyCost, hunger: B.workHungerCost };
+        p.stats.energy = Math.min(100, (p.stats.energy || 0) + (cost.energy || 0));
+        p.stats.hunger = Math.min(100, (p.stats.hunger || 0) + (cost.hunger || 0));
       }
       p.job = null;
       if (p.sealed && p.apartment) s.doors[p.apartment.number] = { sealed: true };
@@ -302,7 +313,7 @@ class Game extends EventEmitter {
   }
 
   getPlayer(id) {
-    return this.state.players[id] || null;
+    return typeof id === 'string' && Object.hasOwn(this.state.players, id) ? this.state.players[id] : null;
   }
 
   playerByToken(token) {
@@ -427,6 +438,8 @@ class Game extends EventEmitter {
     // если только туман не стоит и здесь: тогда стоять на месте хуже, чем идти.
     if (this.inFog(homeFloor) && !this.inFog(here.floor)) return wait(5000);
     const via = this.world.breakdowns.lift ? 'stairs' : 'lift';
+    // тело уже раз попало в петлю на лестнице — второй раз не идёт: ждёт лифта или конца аномалии
+    if (via === 'stairs' && h.looped && this.world.anomalies.stairLoop) return wait(60000);
     const target = scene.objects.find((o) => o.type === via);
     if (h.step !== via) {
       h.step = via;
@@ -683,8 +696,10 @@ class Game extends EventEmitter {
   addItem(p, id, n = 1, charge = 100) {
     if (!C.ITEMS[id] || n <= 0) return;
     const key = CHARGE_KEYS[id];
-    if (key && !(p.inventory[id] > 0)) p[key] = charge;
-    p.inventory[id] = (p.inventory[id] || 0) + n;
+    const have = p.inventory[id] || 0;
+    // заряд у жильца один на все штуки: при слиянии — средний, чтобы передачами его нельзя было размножить
+    if (key) p[key] = have > 0 ? Math.round(((p[key] ?? 100) * have + charge * n) / (have + n)) : charge;
+    p.inventory[id] = have + n;
   }
 
   /** Заряд вещи, которую жилец отдаёт (у противогаза и фонарика). */
@@ -1151,6 +1166,7 @@ class Game extends EventEmitter {
       lastHarm: null,
       deeds: { helped: 0 },
       tutorial: { done: [], rewarded: false, drill: false },
+      settledDay: Math.floor(this.world.gameMinutes / 1440),
     };
     this.state.players[id] = p;
     this.invalidatePlayers();
@@ -1538,15 +1554,18 @@ class Game extends EventEmitter {
   // Домовая книга: молва
   // =========================================================================
   /** Запомнить поступок: из них складывается молва (выцветает за B.rumorHours). */
-  markDeed(p, kind) {
+  /** Поступок в молву. to — кому (подарок, помощь): одному и тому же засчитывается раз за rumorHours. */
+  markDeed(p, kind, to = null) {
     if (!p || !C.DEEDS[kind]) return;
     const now = this.now();
+    const ttl0 = B.rumorHours * 3600 * 1000;
+    if (to && (p.deedLog || []).some((d) => d.k === kind && d.to === to && now - d.ts < ttl0)) return; // взаимные подарки по сухарю молву не накручивают
     p.deeds = p.deeds || { helped: 0 };
     if (C.DEEDS[kind].good) p.deeds.helped++;
     p.deedTotals = p.deedTotals || {};
     p.deedTotals[kind] = (p.deedTotals[kind] || 0) + 1;
     const ttl = B.rumorHours * 3600 * 1000;
-    p.deedLog = [...(p.deedLog || []).filter((d) => now - d.ts < ttl), { k: kind, ts: now }].slice(-80);
+    p.deedLog = [...(p.deedLog || []).filter((d) => now - d.ts < ttl), to ? { k: kind, ts: now, to } : { k: kind, ts: now }].slice(-80);
   }
 
   /** Вес поступков за последние сутки (свежие — тяжелее). */
@@ -1585,7 +1604,7 @@ class Game extends EventEmitter {
   }
 
   assignmentView(a, p) {
-    const floorApts = this.alivePlayers().filter((q) => q.apartment.floor >= a.from && q.apartment.floor <= a.to).map((q) => q.apartment.number);
+    const floorApts = this.assignmentResidents(a).map((q) => q.apartment.number);
     const what = a.kind === 'money' ? talons(a.amount) : a.kind === 'shifts' ? `${a.amount} ${plural(a.amount, 'смена', 'смены', 'смен')} в цеху` : `${C.ITEMS[a.item]?.name || a.item} ×${a.amount}`;
     const mine = p ? a.done[p.apartment.number] : null;
     return {
@@ -1601,6 +1620,13 @@ class Game extends EventEmitter {
       mineApplies: p ? p.apartment.floor >= a.from && p.apartment.floor <= a.to : false,
       progress: p && a.kind === 'shifts' ? (a.progress || {})[p.apartment.number] || 0 : null,
     };
+  }
+
+  /** Кого касается разнарядка: живущие на её этажах, кто сдал или бывал в игре за сутки. */
+  assignmentResidents(a) {
+    const all = this.alivePlayers().filter((q) => q.apartment.floor >= a.from && q.apartment.floor <= a.to);
+    const active = new Set(this.activeResidents(24 * 3600 * 1000, all).map((q) => q.id));
+    return all.filter((q) => active.has(q.id) || a.done[q.apartment.number]);
   }
 
   /** Сдать по разнарядке: у доски, за свою квартиру. Смены засчитываются сами. */
@@ -1648,7 +1674,7 @@ class Game extends EventEmitter {
       if (a.closed || now < a.until) continue;
       a.closed = true;
       a.closedAt = now;
-      const residents = this.alivePlayers().filter((q) => q.apartment.floor >= a.from && q.apartment.floor <= a.to);
+      const residents = this.assignmentResidents(a);
       a.failed = residents.filter((q) => !a.done[q.apartment.number]).map((q) => q.apartment.number);
       const done = Object.keys(a.done).length;
       this.log(`Разнарядка «${a.text}» закрыта: сдали ${done} из ${done + a.failed.length}${a.failed.length ? `; не сдали: ${a.failed.join(', ')}` : ''}`, 'event', null, { public: `разнарядка «${a.text}»: сдали ${done} из ${done + a.failed.length} квартир` });
@@ -1684,7 +1710,8 @@ class Game extends EventEmitter {
     const week = this.planWeek();
     if (w.plan && w.plan.week === week) return;
     if (w.plan) this.closePlan(w.plan);
-    w.plan = { week, target: Math.max(20, this.alivePlayers().length * B.planShiftsPerResident), done: 0, participants: {} };
+    // план — по тем, кто бывал в доме за игровую неделю, а не по всем, кто когда-то заселился
+    w.plan = { week, target: Math.max(20, this.activeResidents(7 * 24 * 60000).length * B.planShiftsPerResident), done: 0, participants: {} };
   }
 
   planShift(p) {
@@ -1775,6 +1802,7 @@ class Game extends EventEmitter {
     job.id = newId('j');
     job.startedAt = this.now();
     job.side = here.key;
+    job.cost = { energy: cost, hunger: 0 };
     p.job = job;
     p.sleeping = false;
     p.sideDone = { ...(p.sideDone || {}), [kind]: here.key };
@@ -1907,6 +1935,8 @@ class Game extends EventEmitter {
     if (!rent) return;
     for (const p of this.alivePlayers()) {
       if (this.isNewbie(p)) continue;
+      // за сутки, в которые заселился, не платят (наследник тоже начинает с нуля)
+      if (p.settledDay != null && p.settledDay >= this.world.lastDay - 1) continue;
       const active = this.isOnline(p.id) || now - (p.lastSeen || 0) < 30 * 60000;
       if (!active) continue;
       const due = rent + (p.rentDebt || 0);
@@ -1921,6 +1951,7 @@ class Game extends EventEmitter {
 
   /** Погасить долг за квартиру у доски. */
   payRent(p) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
     if (!this.nearTo(p, (o) => o.type === 'board')) return { ok: false, error: 'Платят у доски объявлений (там ящик ЖЭК).' };
     if (!p.rentDebt) return { ok: false, error: 'Долга за квартиру нет.' };
     const pay = Math.min(p.money, p.rentDebt);
@@ -1933,6 +1964,7 @@ class Game extends EventEmitter {
 
   // ---- авоська за окном ----
   windowPut(p, itemId, count = 1) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
     if (!this.isOwnHome(p) || !this.nearTo(p, (o) => o.type === 'window')) return { ok: false, error: 'Авоська — за окном вашей квартиры.' };
     const n = Math.max(1, toInt(count, 1));
     if (!C.ITEMS[itemId] || (p.inventory[itemId] || 0) < n) return { ok: false, error: 'У вас этого нет.' };
@@ -1946,6 +1978,7 @@ class Game extends EventEmitter {
   }
 
   windowTake(p, itemId, count = 1) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
     if (!this.isOwnHome(p) || !this.nearTo(p, (o) => o.type === 'window')) return { ok: false, error: 'Авоська — за окном вашей квартиры.' };
     const have = (p.window || {})[itemId] || 0;
     const n = Math.min(have, Math.max(1, toInt(count, 1)));
@@ -2017,15 +2050,23 @@ class Game extends EventEmitter {
       this.world.pried[d.id] = { by: p.name, at: now };
       this.log(`${p.name} вскрыл подсобку на ${p.location.floor} этаже`, 'social', p.id);
     }
-    p.stashAt = p.stashAt || {};
-    const wait = (p.stashAt[d.id] || 0) + B.stashCooldownMin * 60000 - now;
-    if (wait > 0) return { ok: false, error: `Здесь вы уже всё перерыли. Загляните через ${Math.ceil(wait / 60000)} мин.` };
-    p.stashAt[d.id] = now;
+    // перезарядка общая на жильца (как у мусоропровода): одна монтировка — не конвейер по всем подсобкам
+    const last = typeof p.stashAt === 'number' ? p.stashAt : 0;
+    const wait = last + B.stashCooldownMin * 60000 - now;
+    if (wait > 0) return { ok: false, error: `Вы уже лазили по подсобкам. Сил на новую вылазку — через ${Math.ceil(wait / 60000)} мин.` };
+    p.stashAt = now;
+    // подсобку, которую уже обчистили сегодня, до завтрашнего дня никто не найдёт полной
+    const pried = this.world.pried[d.id];
+    if (pried.lootDay === this.gameDay()) {
+      this.log(`${p.name} обшарил подсобку на ${p.location.floor} этаже — уже пусто`, 'social', p.id);
+      return { ok: true, message: 'Здесь до вас уже всё вынесли. Следы на пыли свежие.' };
+    }
     if (this.random() < B.stashEmptyChance) {
       this.log(`${p.name} обшарил подсобку на ${p.location.floor} этаже — пусто`, 'social', p.id);
       return { ok: true, message: 'Пыль, ржавые трубы, чей-то старый ватник. Пусто.' };
     }
     const item = this.stashLoot(d.id);
+    pried.lootDay = this.gameDay();
     this.addItem(p, item, 1);
     this.journal(p, `В подсобке на ${p.location.floor} этаже нашлось: ${C.ITEMS[item].name}.`, 'good');
     this.log(`${p.name} обшарил подсобку на ${p.location.floor} этаже: ${C.ITEMS[item].name}`, 'social', p.id);
@@ -2034,6 +2075,7 @@ class Game extends EventEmitter {
 
   /** Барыга продаёт монтировку и мебель — каждой вещи по одной в сутки. */
   barygaBuy(p, itemId = 'crowbar') {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
     if (!this.barygaNear(p)) return { ok: false, error: 'Тут никого нет.' };
     const price = C.BARYGA_SELLS[itemId];
     if (!price) return { ok: false, error: '«Такого не держу».' };
@@ -2061,6 +2103,7 @@ class Game extends EventEmitter {
 
   /** Поставить мебель у себя дома. */
   installFurniture(p, itemId) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
     if (!this.isOwnHome(p)) return { ok: false, error: 'Мебель ставят у себя дома.' };
     p.furniture = p.furniture || {};
     if (p.furniture[itemId]) return { ok: false, error: 'Такое уже стоит.' };
@@ -2074,6 +2117,7 @@ class Game extends EventEmitter {
 
   /** Убрать мебель обратно в карманы (например, чтобы продать или отдать). */
   removeFurniture(p, itemId) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
     if (!this.isOwnHome(p)) return { ok: false, error: 'Только у себя дома.' };
     if (!(p.furniture || {})[itemId]) return { ok: false, error: 'Такого нет.' };
     if (itemId === 'stash_box' && Object.keys(p.stash || {}).length) return { ok: false, error: 'Сначала освободите тайник.' };
@@ -2085,6 +2129,7 @@ class Game extends EventEmitter {
 
   /** Шкаф-тайник: положить и взять. Вещи в нём не крадут и не портятся. */
   stashMove(p, itemId, count, put) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
     if (!this.isOwnHome(p) || !(p.furniture || {}).stash_box) return { ok: false, error: 'Тайник — в вашей квартире, если он есть.' };
     if (!this.nearTo(p, (o) => o.type === 'wardrobe')) return { ok: false, error: 'Подойдите к шкафу.' };
     const n = Math.max(1, toInt(count, 1));
@@ -2138,6 +2183,8 @@ class Game extends EventEmitter {
     job.id = newId('j');
     job.startedAt = now;
     job.repair = key;
+    job.cost = { energy: B.workEnergyCost, hunger: 0 };
+    job.since = this.world.breakdowns[key].since; // наряд — на эту поломку; ЖЭК переставит — наряд отменится
     job.publicData = { ...job.publicData, title: `Аварийный наряд: ${C.BREAKDOWNS[key].name}`, rules: 'Стравите давление в аварийной магистрали: жмите «Сброс», когда стрелка в зелёной зоне.' };
     p.job = job;
     p.sleeping = false;
@@ -2149,12 +2196,13 @@ class Game extends EventEmitter {
     const b = this.world.breakdowns[job.repair];
     const name = C.BREAKDOWNS[job.repair].name;
     if (!b || !b.until) return { ok: true, result: { score, reward: 0, text: `${name}: уже починили без вас.` } };
+    if (!b.repairable || (job.since != null && b.since !== job.since)) return { ok: true, result: { score, reward: 0, text: `${name}: наряд отменён — ЖЭК распорядился иначе.` } };
     if (score < 0.5) return { ok: true, result: { score, reward: 0, text: `${name}: не вышло — качество ${Math.round(score * 100)}%. Попробуйте ещё раз.` } };
     b.until -= B.repairMinutes * 60000;
     p.money += B.repairReward;
     this.markDeed(p, 'care');
     this.log(`${p.name} на аварийном наряде: ${name} — поломка короче на ${B.repairMinutes} мин`, 'social', p.id);
-    const fixed = b.until <= this.now();
+    const fixed = b.until <= this.timerNow(); // на паузе часы поломки стоят
     if (fixed) this.setBreakdown(job.repair, false, {});
     const text = fixed ? `${name}: починено! Премия ${talons(B.repairReward)}.` : `${name}: дело пошло, до починки на ${B.repairMinutes} мин меньше. Премия ${talons(B.repairReward)}.`;
     this.journal(p, text, 'good');
@@ -2352,6 +2400,8 @@ class Game extends EventEmitter {
     const text = sanitizeText(rawText, 300);
     if (!text || text.length < 10) return { ok: false, error: 'Опишите, на что жалуетесь (хотя бы пару слов).' };
     if (this.state.petitions.some((x) => x.status === 'open' && x.authorId === p.id)) return { ok: false, error: 'У вас уже есть заявление, которое собирает подписи.' };
+    // пока ЖЭК не ответил на ваше отправленное заявление, новое не пишут (иначе очередь забивается)
+    if (this.state.petitions.some((x) => x.status === 'sent' && x.authorId === p.id && this.now() - (x.sentAt || x.createdAt) < B.petitionTtlH * 3600 * 1000)) return { ok: false, error: 'Ваше заявление уже у ЖЭК. Дождитесь ответа.' };
     const floor = p.location.floor;
     if (this.state.petitions.filter((x) => x.status === 'open' && x.floor === floor).length >= 3) return { ok: false, error: 'На доске уже три заявления — подпишите одно из них.' };
     const pet = { id: newId('j'), floor, text, authorId: p.id, authorName: p.name, signers: [{ id: p.id, name: p.name, apt: p.apartment.number }], status: 'open', createdAt: this.now() };
@@ -2385,7 +2435,10 @@ class Game extends EventEmitter {
 
   expirePetitions(now) {
     for (const pet of this.state.petitions) if (pet.status === 'open' && now - pet.createdAt > B.petitionTtlH * 3600 * 1000) pet.status = 'expired';
-    this.state.petitions = this.state.petitions.filter((x) => ['open', 'sent'].includes(x.status) || now - (x.resolvedAt || x.createdAt) < 24 * 3600 * 1000).slice(-50);
+    // открытые и отправленные (ждут ответа ЖЭК) не вытесняются; закрытые — последние 50 за сутки
+    const active = (x) => ['open', 'sent'].includes(x.status);
+    const closed = new Set(this.state.petitions.filter((x) => !active(x) && now - (x.resolvedAt || x.createdAt) < 24 * 3600 * 1000).slice(-50));
+    this.state.petitions = this.state.petitions.filter((x) => active(x) || closed.has(x));
   }
 
   petitionView(pet, p) {
@@ -2409,6 +2462,19 @@ class Game extends EventEmitter {
     return this.alivePlayers().filter((q) => q.apartment.floor === floor);
   }
 
+  /**
+   * Те, кто бывает в игре: в сети или заходил не раньше windowMs назад. Заброшенные жильцы не
+   * умирают сами — без этого они раздували бы план дома, порог старшего и разнарядки.
+   */
+  activeResidents(windowMs, list = this.alivePlayers(), now = this.now()) {
+    return list.filter((q) => this.isOnline(q.id) || now - (q.lastSeen || 0) < windowMs);
+  }
+
+  /** Сколько голосов нужно старшему: половина тех, кто живёт на этаже и заходил за сутки. */
+  elderNeed(floor) {
+    return Math.max(1, Math.ceil(this.activeResidents(24 * 3600 * 1000, this.floorResidents(floor)).length / 2));
+  }
+
   /** Старший — за кого проголосовало не меньше половины жильцов этажа. */
   elderOf(floor) {
     const rec = this.state.elders[floor];
@@ -2420,7 +2486,7 @@ class Game extends EventEmitter {
       if (!ids.has(voter) || !ids.has(cand)) continue;
       tally.set(cand, (tally.get(cand) || 0) + 1);
     }
-    const need = Math.max(1, Math.ceil(residents.length / 2));
+    const need = this.elderNeed(floor);
     let best = null;
     for (const [cand, n] of tally) if (n >= need && (!best || n > best.n)) best = { id: cand, n };
     return best ? this.getPlayer(best.id) : null;
@@ -2529,7 +2595,7 @@ class Game extends EventEmitter {
     iou.closedAt = this.now();
     const debtor = this.getPlayer(iou.debtorId);
     if (debtor) this.notify([debtor], { title: 'Долг прощён', text: `${p.name} простил вам долг: ${this.bundleText(iou.bundle)}.`, style: 'good' });
-    this.markDeed(p, 'gift');
+    this.markDeed(p, 'gift', iou.debtorId);
     this.log(`${p.name} простил долг ${debtor ? debtor.name : '?'}`, 'trade', p.id);
     return { ok: true, message: 'Долг прощён.' };
   }
@@ -3124,6 +3190,7 @@ class Game extends EventEmitter {
       this.journal(p, `Вы шли и шли по лестнице… и вышли на ${t.fromFloor} этаж — туда же, откуда начали. Силы потрачены.`, 'whisper');
       this.log(`${p.name}: петля на лестнице (${t.fromFloor} → ${t.toFloor})`, 'social', p.id);
       this.relocate(p, { place: 'corridor', floor: t.fromFloor }, 'stairs');
+      if (p.homeward) p.homeward.looped = true; // тело ушедшего жильца не ходит по кругу бесконечно
       this.dirty([p.id, ...witnesses.map((q) => q.id), ...this.othersAt(p).map((q) => q.id)]);
       return;
     }
@@ -3302,7 +3369,7 @@ class Game extends EventEmitter {
       this.log(`${p.name} помог ${t.name}: ${what}`, 'social', p.id);
     }
     this.journal(p, `Вы помогли ${t.name}: ${what}.`, 'good');
-    this.markDeed(p, wasDown ? 'rescue' : 'aid');
+    this.markDeed(p, wasDown ? 'rescue' : 'aid', wasDown ? null : t.id);
     this.dirty([p.id, t.id, ...this.othersAt(t).map((q) => q.id)]);
     return { ok: true, message: wasDown ? `${t.name} приходит в себя.` : `Вы помогли: ${t.name}.` };
   }
@@ -3339,7 +3406,7 @@ class Game extends EventEmitter {
     if (!this.canTouch(p, t)) return { ok: false, error: 'Подойдите ближе.' };
     if (t.down) return { ok: false, error: 'Он без сознания — тут и так всё видно.' };
     if (this.isNewbie(p)) return { ok: false, error: 'Новосёлу не к лицу. ЖЭК присматривает и за вами.' };
-    if (!this.isDark(p.location.floor) || p.location.place === 'lift' || p.location.place === 'stairs') return { ok: false, error: 'Светло — сразу заметят.' };
+    if (!this.isDark(p.location.floor) || !this.isDarkFor(p) || p.location.place === 'lift' || p.location.place === 'stairs') return { ok: false, error: 'Светло — сразу заметят.' };
     if (this.isNewbie(t)) return { ok: false, error: 'Новосёла трогать — себе дороже: ЖЭК присматривает за новенькими.' };
     const now = this.now();
     if (now - (p.lastPickAt || 0) < B.pickpocketCooldownSec * 1000) return { ok: false, error: 'Слишком подозрительно — подождите.' };
@@ -3420,7 +3487,7 @@ class Game extends EventEmitter {
       this.knocks.set(owner.id, { guestId: p.id, ts: now });
       // туман на этаже, а хозяин дома — если не откроет, это запомнится
       if (this.world.fog && door && this.fogPhase() && p.location.floor >= this.world.fog.from && p.location.floor <= this.world.fog.to) {
-        this.refusals.set(p.id, { apt: door.number, owner: owner.name, ts: now, kind: 'ignored' });
+        this.refusals.set(p.id, { apt: door.number, owner: owner.name, ownerId: owner.id, ts: now, kind: 'ignored' });
       }
       this.notify([owner], {
         title: 'Стук в дверь',
@@ -3485,7 +3552,7 @@ class Game extends EventEmitter {
       canVote: own,
       myVote: votes[p.id] || null,
       candidates: own ? this.floorResidents(floor).map((q) => ({ id: q.id, name: q.name, apt: q.apartment.number, votes: tally[q.id] || 0 })) : [],
-      need: Math.max(1, Math.ceil(this.floorResidents(floor).length / 2)),
+      need: this.elderNeed(floor),
     };
     // книга должников этажа: просроченные расписки жильцов этого этажа
     const debtors = this.state.ious
@@ -3674,7 +3741,7 @@ class Game extends EventEmitter {
     this.addDrop(p, check.door, { kind: 'parcel', bundle, text }, check.now);
     const what = this.bundleText(bundle);
     this.journal(p, `Вы оставили передачку у кв. ${check.door.number}: ${what}.`);
-    this.markDeed(p, 'gift');
+    this.markDeed(p, 'gift', `apt:${check.door.number}`);
     this.log(`${p.name} оставил передачку у кв. ${check.door.number}: ${what}`, 'trade', p.id);
     this.feed({ channel: 'note', to: check.door.number, from: { id: p.id, name: p.name, apt: p.apartment.number }, parcel: what, text });
     return { ok: true, message: 'Свёрток лежит у двери.' };
@@ -3812,6 +3879,7 @@ class Game extends EventEmitter {
     if (!job) return { ok: false, error: 'Такой работы нет.' };
     job.id = newId('j');
     job.startedAt = this.now();
+    job.cost = { energy: B.workEnergyCost, hunger: B.workHungerCost };
     p.job = job;
     p.sleeping = false;
     this.applyStats(p, { energy: -B.workEnergyCost, hunger: -B.workHungerCost });
@@ -3971,7 +4039,7 @@ class Game extends EventEmitter {
       this.journal(p, `Вы отдали жильцу ${q.name}: ${what}.`);
       this.notify([q], { title: 'Подарок', text: `${p.name} (кв. ${p.apartment.number}) отдал вам: ${what}.`, style: 'good' });
       this.log(`${p.name} → ${q.name}: подарок (${what})${this.sameAddress(p, q)}`, 'trade', p.id);
-      this.markDeed(p, 'gift');
+      this.markDeed(p, 'gift', q.id);
       return { ok: true, gift: true };
     }
 
@@ -4009,6 +4077,11 @@ class Game extends EventEmitter {
     }
     if (this.distance(a, b) > 3) return { ok: false, error: `Подойдите ближе к ${a.name}.` };
     if (!this.hasBundle(a, t.give)) return { ok: false, error: `У ${a.name} уже нет обещанного.` };
+    // лимит новосёла: талоны сверх цены встречной части — тот же подарок; в долг — подарок целиком
+    const overA = t.credit ? t.give.money || 0 : Math.min(t.give.money || 0, bundleWorth(t.give) - bundleWorth(t.want));
+    const overB = t.credit ? 0 : Math.min(t.want.money || 0, bundleWorth(t.want) - bundleWorth(t.give));
+    const limit = (overA > 0 && this.newbieGiftCheck(a, overA)) || (overB > 0 && this.newbieGiftCheck(b, overB));
+    if (limit) return { ok: false, error: limit };
     if (t.credit) {
       // в долг: вещи переходят сейчас, а за b остаётся расписка
       this.moveBundle(a, b, t.give);
@@ -4019,7 +4092,7 @@ class Game extends EventEmitter {
       this.journal(a, `В долг жильцу ${b.name}: ${this.bundleText(t.give)}. Расписка: вернуть ${what} до дня ${iou.dueDay}.`, 'good');
       this.journal(b, `Вы взяли в долг у ${a.name}: ${this.bundleText(t.give)}. Вернуть ${what} до дня ${iou.dueDay}.`, 'warn');
       this.notify([a], { title: 'Расписка', text: `Согласие от ${b.name}: долг вам — ${what} до дня ${iou.dueDay}.`, style: 'good', journal: false });
-      this.log(`Расписка: ${b.name} должен ${a.name} ${what} до дня ${iou.dueDay} (взял ${this.bundleText(t.give)})`, 'trade', a.id);
+      this.log(`Расписка: ${b.name} должен ${a.name} ${what} до дня ${iou.dueDay} (взял ${this.bundleText(t.give)})${this.sameAddress(a, b)}`, 'trade', a.id);
       this.dirty([a.id, b.id]);
       return { ok: true };
     }
@@ -4063,7 +4136,11 @@ class Game extends EventEmitter {
           : `${p.name} погиб в тумане. Он стучал в кв. ${refusal.apt}, но ему не открыли.`,
       );
       this.log(`${p.name} погиб в тумане после того, как ${refusal.kind === 'evicted' ? 'его выставил' : 'ему не открыл'} ${refusal.owner}`, 'social', p.id);
-      if (refusal.kind === 'ignored') this.markDeed(this.ownerOf(refusal.apt), 'cold');
+      if (refusal.kind === 'ignored') {
+        // молва — тому, кто не открыл, а не новому жильцу этой квартиры
+        const o = this.getPlayer(refusal.ownerId);
+        if (o && o.alive && o.apartment.number === refusal.apt) this.markDeed(o, 'cold');
+      }
     }
     this.refusals.delete(p.id);
     // мел на полу, а рядом — последнее, что жилец успел сказать здесь же (за последние 10 минут)
@@ -4237,11 +4314,13 @@ class Game extends EventEmitter {
     if (!fn) return { ok: false, error: `Неизвестная команда: ${cmd}` };
     const role = ctx.role || 'god';
     if (role !== 'god' && !(ROLE_COMMANDS[role] || []).includes(cmd)) {
-      this.godLogAdd(ctx.who, cmd, args, { ok: false, error: 'нет прав' });
+      this.godLogDenied(ctx.who, cmd);
       return { ok: false, error: `Роль «${ROLE_NAMES[role] || role}» не может это делать.` };
     }
+    // снимок перед опасной командой попадает в кольцо, только если команда удалась: неудачные
+    // и отклонённые не вытесняют точки отката
     const danger = this.dangerLabel(cmd, args);
-    if (danger) this.takeSnapshot(danger, ctx.who);
+    const pending = danger ? this.makeSnapshot(danger, ctx.who) : null;
     let res;
     this.invalidatePlayers(); // команда ЖЭК может поменять кого угодно — кеш строим заново
     try {
@@ -4251,8 +4330,30 @@ class Game extends EventEmitter {
     } finally {
       this.invalidatePlayers();
     }
+    if (pending && res.ok) this.commitSnapshot(pending);
     if (!QUIET_COMMANDS.includes(cmd)) this.godLogAdd(ctx.who, cmd, args, res);
     return res;
+  }
+
+  /**
+   * Отказ по роли: подряд идущие отказы одного и того же схлопываются в одну запись со счётчиком —
+   * спамом запрещённых команд журнал богов не затереть.
+   */
+  godLogDenied(who, cmd) {
+    const last = this.state.godLog[this.state.godLog.length - 1];
+    const now = this.now();
+    if (last && last.denied && last.who === (who || 'система') && now - last.ts < 10 * 60000) {
+      last.count = (last.count || 1) + 1;
+      last.ts = now;
+      if (!last.cmds.includes(cmd) && last.cmds.length < 10) last.cmds.push(cmd);
+      last.args = `запрещённых команд: ${last.count} (${last.cmds.join(', ')})`;
+      return;
+    }
+    this.godLogAdd(who, cmd, {}, { ok: false, error: 'нет прав' });
+    const entry = this.state.godLog[this.state.godLog.length - 1];
+    entry.denied = true;
+    entry.count = 1;
+    entry.cmds = [cmd];
   }
 
   godLogAdd(who, cmd, args, res) {
@@ -4301,7 +4402,15 @@ class Game extends EventEmitter {
   }
 
   takeSnapshot(label, who) {
-    const snap = { id: newId('w'), ts: this.now(), clock: this.gameClock().label, label: label || 'снимок', who: who || 'система', data: this.snapshotData() };
+    return this.commitSnapshot(this.makeSnapshot(label, who));
+  }
+
+  /** Собрать снимок (ещё не в кольце): перед опасной командой — а сохранить, только если она удалась. */
+  makeSnapshot(label, who) {
+    return { id: newId('w'), ts: this.now(), clock: this.gameClock().label, label: label || 'снимок', who: who || 'система', data: this.snapshotData() };
+  }
+
+  commitSnapshot(snap) {
     this.snapshots.push(snap);
     while (this.snapshots.length > 8) this.snapshots.shift();
     this.emit('snapshot_taken', snap);
@@ -4314,12 +4423,16 @@ class Game extends EventEmitter {
 
   /** Проверить пароль бога (личная учётка). */
   async verifyAdminAsync(login, password) {
-    const acc = this.state.admins[String(login || '').trim().toLowerCase()];
+    const key = String(login || '').trim().toLowerCase();
+    const acc = Object.hasOwn(this.state.admins, key) ? this.state.admins[key] : null;
     if (!password || String(password).length > 200) return null;
     const given = Buffer.from(await Game.hashPasswordAsync(password, acc ? acc.salt : '00000000000000000000000000000000'), 'hex');
     if (!acc) return null;
+    // пока считался пароль, учётку могли удалить или сменить ей пароль — пускаем только по нынешней
+    const fresh = Object.hasOwn(this.state.admins, key) ? this.state.admins[key] : null;
+    if (!fresh || fresh.hash !== acc.hash) return null;
     const expected = Buffer.from(acc.hash, 'hex');
-    return given.length === expected.length && crypto.timingSafeEqual(given, expected) ? acc : null;
+    return given.length === expected.length && crypto.timingSafeEqual(given, expected) ? fresh : null;
   }
 
   requirePlayer(id, { alive = true } = {}) {
@@ -4414,7 +4527,8 @@ class Game extends EventEmitter {
       const text = sanitizeText(reason, 200) || def.brokenText;
       this.world.breakdowns[key] = { since: this.timerNow(), until, reason: text };
       if (key === 'factory') {
-        const workers = this.alivePlayers().filter((p) => p.job);
+        // срывается только работа в цеху: подработка в столовой и наряд на лифте идут дальше
+        const workers = this.alivePlayers().filter((p) => p.job && !p.job.side && (!p.job.repair || p.job.repair === 'factory'));
         for (const p of workers) p.job = null;
         this.notify(workers, { title: 'Авария в цеху', text: 'Линия встала. Смена сорвана.', style: 'warn' });
       }
@@ -5024,17 +5138,20 @@ const ADMIN_COMMANDS = {
   /** Личная учётка бога. role: god | moderator | observer. */
   adminAdd({ login, password, role = 'moderator' }) {
     const key = String(login || '').trim().toLowerCase();
-    if (!/^[a-zа-яё0-9_.-]{3,20}$/i.test(key) || key === 'root') throw new Error('Логин — 3–20 букв или цифр (не root)');
+    if (!/^[a-zа-яё0-9_.-]{3,20}$/i.test(key) || key === 'root' || key in Object.prototype) throw new Error('Логин — 3–20 букв или цифр (не root)');
     if (String(password || '').length < 8) throw new Error('Пароль — не короче 8 символов');
     if (!ROLE_NAMES[role]) throw new Error('Роль — бог, модератор или наблюдатель');
     const salt = crypto.randomBytes(16).toString('hex');
+    const existed = Object.hasOwn(this.state.admins, key);
     this.state.admins[key] = { login: key, salt, hash: Game.hashPassword(password, salt), role, createdAt: this.now() };
+    // сменили роль или пароль — открытые Пульты этой учётки закрываются, войти заново по новым правам
+    if (existed) this.emit('admin_removed', key);
     return { ok: true, message: `Учётка ${key}: ${ROLE_NAMES[role]}` };
   },
 
   adminRemove({ login }) {
     const key = String(login || '').trim().toLowerCase();
-    if (!this.state.admins[key]) throw new Error('Нет такой учётки');
+    if (!Object.hasOwn(this.state.admins, key)) throw new Error('Нет такой учётки');
     delete this.state.admins[key];
     this.emit('admin_removed', key);
     return { ok: true, message: `Учётка ${key} удалена` };
@@ -5133,7 +5250,7 @@ const ADMIN_COMMANDS = {
       if (!o) throw new Error('Здесь нечего замуровывать — кликните по двери или предмету на стене');
       if (['lift', 'stairs', 'exit', 'hermodoor'].includes(o.type)) throw new Error('Лифт, лестницу и выходы не замуровать: люди окажутся заперты');
       for (let i = 0; i < o.w; i++) for (let j = 0; j < o.h; j++) ov.tiles.push([o.x + i, o.y + j]);
-      ov.label = o.label || o.type;
+      ov.label = o.type === 'apt' ? `кв. ${o.number}` : o.label || o.type;
     } else if (kind === 'rubble') {
       if (World.isSolidTile(sc, tx, ty)) throw new Error('Завал — только на полу');
       if (sc.objects.some((o) => o.spot && Math.floor(o.spot.x) === tx && Math.floor(o.spot.y) === ty)) throw new Error('Не загораживайте подход к двери или предмету');
@@ -5141,6 +5258,8 @@ const ADMIN_COMMANDS = {
     } else if (kind === 'closet') {
       if (!World.isSolidTile(sc, tx, ty) || sc.objects.some((o) => tx >= o.x && tx < o.x + o.w && ty >= o.y && ty < o.y + o.h)) throw new Error('Кладовка — в пустой стене');
       if (World.isSolidTile(sc, tx, ty + 1)) throw new Error('Под кладовкой должен быть пол');
+      // соседние кладовки склеились бы в одну, и вещи второй пропали бы
+      if (sc.objects.some((o) => o.type === 'closet' && ty >= o.y && ty < o.y + o.h && (tx === o.x - 1 || tx === o.x + o.w))) throw new Error('Вплотную к другой кладовке нельзя — отступите на клетку');
       ov.tiles.push([tx, ty]);
       const clean = {};
       for (const [id, n] of Object.entries(items || {})) if (Object.hasOwn(C.ITEMS, id) && toInt(n) > 0) clean[id] = Math.min(9, toInt(n));
@@ -5584,6 +5703,7 @@ Game.prototype.playerView = function playerView(p) {
       name: C.ITEMS[id]?.name || id,
       desc: C.ITEMS[id]?.desc || '',
       usable: !!C.ITEMS[id]?.use,
+      food: !!C.ITEMS[id]?.use?.hunger, // в авоську за окном кладут только еду
       readable: !!C.ITEMS[id]?.read,
       furniture: !!C.ITEMS[id]?.furniture,
       equip: !!C.ITEMS[id]?.equip,

@@ -159,11 +159,14 @@
         renderChat();
         break;
       case 'world':
-        // ЖЭК перепланировал помещения: новая схема, сцену пересобираем
+        // ЖЭК перепланировал помещения: новая схема. Сцену перерисовываем, но соседей, марионеток
+        // и открытые панели не трогаем — перепланировка могла быть совсем в другом месте
         S.map = World.create(msg.world);
-        renderer.scene = null;
-        S.sceneKey = null;
-        syncScene();
+        if (S.sceneKey) {
+          S.scene = S.map.scene(S.sceneKey);
+          renderer.scene = null;
+          renderer.setScene(S.scene);
+        } else syncScene();
         break;
       case 'catalog':
         // ЖЭК добавил новый предмет — обновим справочник названий
@@ -426,6 +429,11 @@
     }
     // закрываем панель, если отошли от предмета
     if (S.sheet && S.sheet.obj && S.sheet.kind !== 'work' && World.distToObject(S.sheet.obj, me.x, me.y) > World.REACH + 1.2) closeSheet();
+    // барыга — не предмет сцены: отошли от него — лист закрывается
+    if (S.sheet && S.sheet.kind === 'baryga') {
+      const b = S.actors.get('npc:baryga');
+      if (!b || Math.hypot(b.x - me.x, b.y - me.y) > 2.2) closeSheet();
+    }
   }
 
   function stepActors(dt) {
@@ -524,12 +532,12 @@
         return { label: 'Кладовка', sub: 'вчера её здесь не было', actions: [{ label: 'Заглянуть', run: async () => { const r = await act('closet'); if (r.ok) showPaper('Кладовка', r.message); } }] };
       case 'wardrobe':
         if (v.here.ownHome && (you.furniture || []).includes('stash_box')) {
-          return { label: 'Шкаф-тайник', sub: (you.stash || []).length ? `внутри: ${you.stash.map((x) => `${x.name} ×${x.count}`).join(', ')}` : 'пусто', actions: [{ label: 'Открыть тайник', run: () => openStash() }] };
+          return { label: 'Шкаф-тайник', sub: (you.stash || []).length ? `внутри: ${you.stash.map((x) => `${x.name} ×${x.count}`).join(', ')}` : 'пусто', actions: [{ label: 'Открыть тайник', run: () => openStash(o) }] };
         }
         return { label: 'Шкаф', actions: [{ label: 'Осмотреть', run: () => say('В шкафу пусто. Пахнет нафталином.') }] };
       case 'window':
         if (!v.here.ownHome) return { label: 'Окно', actions: [{ label: 'Посмотреть в окно', run: () => say(v.world.fog && v.world.fog.affectsYou ? 'За окном — серая муть.' : 'Окна дома напротив. Где-то горит свет.') }] };
-        return { label: 'Окно', sub: (you.window || []).length ? `в авоське: ${you.window.map((x) => `${x.name} ×${x.count}`).join(', ')}` : 'авоська пуста', actions: [{ label: 'Авоська за окном', run: () => openWindowStash() }] };
+        return { label: 'Окно', sub: (you.window || []).length ? `в авоське: ${you.window.map((x) => `${x.name} ×${x.count}`).join(', ')}` : 'авоська пуста', actions: [{ label: 'Авоська за окном', run: () => openWindowStash(o) }] };
       case 'memorial':
         return { label: 'Стена памяти', sub: 'имена выбывших жильцов', actions: [{ label: 'Прочитать имена', run: () => openMemorial() }] };
       case 'chute':
@@ -609,8 +617,8 @@
   }
 
   /** Шкаф-тайник: вещи в нём не крадут и не портятся. */
-  function openStash() {
-    openSheet('stash', 'Шкаф-тайник');
+  function openStash(obj) {
+    openSheet('stash', 'Шкаф-тайник', obj);
     S.memo.sheet = null;
     renderStash();
   }
@@ -634,8 +642,8 @@
   }
 
   /** Авоська за окном: еда там портится медленнее (но туман до неё добирается). */
-  function openWindowStash() {
-    openSheet('window', 'Авоська за окном');
+  function openWindowStash(obj) {
+    openSheet('window', 'Авоська за окном', obj);
     S.memo.sheet = null;
     renderWindowStash();
   }
@@ -643,7 +651,7 @@
   function renderWindowStash() {
     const you = S.view.you;
     memo('sheet', [you.window, you.inventory], () => {
-      const food = you.inventory.filter((it) => it.usable || it.id === 'bread');
+      const food = you.inventory.filter((it) => it.food);
       $('#sheet-body').replaceChildren(
         h('p', { class: 'hint', text: 'Холодно за окном — хлеб черствеет медленнее. Но если на этаж придёт туман, всё в авоське покроется налётом.' }),
         h('h4', { class: 'board-h', text: 'В авоське' }),
@@ -2105,7 +2113,7 @@
     S.keys.clear();
     const station = side || S.scene.objects.find((o) => o.type === 'station' && o.game === job.game);
     openSheet('work', job.data.title, station);
-    S.job = { ...job, gameId, startedAt: performance.now(), state: 'playing', timers: [] };
+    S.job = { ...job, gameId, side, startedAt: performance.now(), state: 'playing', timers: [] };
     ({ sort: playSort, meter: playMeter, gauge: playGauge, serve: playSort, pack: playSort })[job.game](S.job);
   }
 
@@ -2221,7 +2229,12 @@
       h(
         'div',
         { class: 'actions' },
-        h('button', { class: 'btn primary', text: 'Ещё смену', onclick: () => { closeSheet(); startWork(job.gameId); } }),
+        // в цеху — «Ещё смену»; на наряде — «Чинить дальше»; подработка — раз в часы, только «Закрыть»
+        job.gameId === 'repair'
+          ? h('button', { class: 'btn primary', text: 'Чинить дальше', onclick: () => { closeSheet(); startWork('repair', job.side); } })
+          : job.side
+            ? null
+            : h('button', { class: 'btn primary', text: 'Ещё смену', onclick: () => { closeSheet(); startWork(job.gameId); } }),
         h('button', { class: 'btn', text: 'Закрыть', onclick: closeSheet }),
       ),
     );
