@@ -2193,40 +2193,57 @@ class Game extends EventEmitter {
     if (this.world.paused) return;
     for (const run of this.state.scenarioRuns.slice()) {
       if (now < run.nextAt) continue;
-      const def = this.scenarioDef(run.scenarioId) || run.def;
-      const who = { who: `сценарий: ${run.name}`, role: 'god' };
-      let guard = 0;
-      while (run.step < def.steps.length && guard++ < 20) {
-        const step = def.steps[run.step];
-        if (step.kind === 'wait') {
-          run.step++;
-          run.nextAt = now + Math.max(0, Number(step.minutes) || 0) * 60000;
-          if (run.nextAt > now) break;
-          continue;
-        }
-        if (step.kind === 'stopIfNone') {
-          if (!this.stepTargets(step).length) {
-            this.log(`Сценарий «${run.name}» остановлен на шаге ${run.step + 1}: никто не подходит под условие`, 'schedule');
-            run.step = def.steps.length;
-            break;
-          }
-          run.step++;
-          continue;
-        }
-        // do: команда Пульта; с фильтром — только подходящим жильцам
-        const args = JSON.parse(JSON.stringify(step.args || {}));
-        if (step.filter || step.target) {
-          const ids = this.stepTargets(step).map((p) => p.id);
-          args.target = { type: 'ids', ids };
-        }
-        const res = this.admin(step.cmd, args, who);
-        this.log(`Сценарий «${run.name}», шаг ${run.step + 1}: ${step.cmd}${res.ok ? (res.message ? ` — ${res.message}` : '') : ` — не вышло: ${res.error}`}`, 'schedule');
-        run.step++;
-      }
-      if (run.step >= def.steps.length) {
+      // у идущего сценария своя копия шагов: удаление или правка в библиотеке его не ломает
+      const def = run.def || this.scenarioDef(run.scenarioId);
+      if (!def || !Array.isArray(def.steps)) {
         this.state.scenarioRuns = this.state.scenarioRuns.filter((x) => x !== run);
-        this.log(`Сценарий «${run.name}» завершён`, 'schedule');
+        this.log(`Сценарий «${run.name}» снят: его описание больше не найти`, 'schedule');
+        continue;
       }
+      try {
+        this.stepScenario(run, def, now);
+      } catch (err) {
+        // ошибка одного сценария не должна останавливать мир
+        this.state.scenarioRuns = this.state.scenarioRuns.filter((x) => x !== run);
+        this.log(`Сценарий «${run.name}» снят из-за ошибки: ${err.message}`, 'schedule');
+      }
+    }
+  }
+
+  /** Шаги одного идущего сценария, пока не встретится ожидание. */
+  stepScenario(run, def, now) {
+    const who = { who: `сценарий: ${run.name}`, role: 'god' };
+    let guard = 0;
+    while (run.step < def.steps.length && guard++ < 20) {
+      const step = def.steps[run.step];
+      if (step.kind === 'wait') {
+        run.step++;
+        run.nextAt = now + Math.max(0, Number(step.minutes) || 0) * 60000;
+        if (run.nextAt > now) break;
+        continue;
+      }
+      if (step.kind === 'stopIfNone') {
+        if (!this.stepTargets(step).length) {
+          this.log(`Сценарий «${run.name}» остановлен на шаге ${run.step + 1}: никто не подходит под условие`, 'schedule');
+          run.step = def.steps.length;
+          break;
+        }
+        run.step++;
+        continue;
+      }
+      // do: команда Пульта; с фильтром — только подходящим жильцам
+      const args = JSON.parse(JSON.stringify(step.args || {}));
+      if (step.filter || step.target) {
+        const ids = this.stepTargets(step).map((p) => p.id);
+        args.target = { type: 'ids', ids };
+      }
+      const res = this.admin(step.cmd, args, who);
+      this.log(`Сценарий «${run.name}», шаг ${run.step + 1}: ${step.cmd}${res.ok ? (res.message ? ` — ${res.message}` : '') : ` — не вышло: ${res.error}`}`, 'schedule');
+      run.step++;
+    }
+    if (run.step >= def.steps.length) {
+      this.state.scenarioRuns = this.state.scenarioRuns.filter((x) => x !== run);
+      this.log(`Сценарий «${run.name}» завершён`, 'schedule');
     }
   }
 
@@ -2261,7 +2278,7 @@ class Game extends EventEmitter {
   scenarioRunsView() {
     const now = this.now();
     return this.state.scenarioRuns.map((r) => {
-      const def = this.scenarioDef(r.scenarioId) || r.def;
+      const def = r.def || this.scenarioDef(r.scenarioId);
       return { id: r.id, name: r.name, step: r.step + 1, steps: def ? def.steps.length : 0, inSec: Math.max(0, Math.round((r.nextAt - now) / 1000)) };
     });
   }
@@ -2746,16 +2763,49 @@ class Game extends EventEmitter {
     for (const c of w.climate || []) if (c.until) c.until += ms;
     for (const r of this.state.scenarioRuns) r.nextAt += ms;
     if (w.radio && w.radio.silenceUntil) w.radio.silenceUntil += ms;
+    for (const p of this.players()) this.shiftPlayerTimers(p, ms);
+  }
+
+  /**
+   * Вещи, которых больше нет в справочнике (убрали из палитры; откат вернул старую), исчезают отовсюду:
+   * карманы, авоськи, тайники, кладовки, обмены, передачки, расписки. Иначе виды жильцов падают.
+   */
+  purgeUnknownItems() {
+    const known = (id) => Object.hasOwn(C.ITEMS, id);
+    const clean = (bag) => {
+      if (bag && typeof bag === 'object') for (const id of Object.keys(bag)) if (!known(id)) delete bag[id];
+    };
     for (const p of this.players()) {
-      for (const c of p.conditions) if (c.until) c.until += ms;
-      if (p.travel && !p.travel.stuck) {
-        p.travel.arriveAt += ms;
-        p.travel.startedAt += ms;
-      }
-      if (p.down) p.down.until += ms;
-      if (p.homeward && p.homeward.nextAt) p.homeward.nextAt += ms;
-      if (p.job) p.job.startedAt += ms;
+      clean(p.inventory);
+      clean(p.window);
+      clean(p.stash);
+      clean(p.furniture);
     }
+    for (const c of Object.values(this.world.closets || {})) clean(c.items);
+    for (const t of Object.values(this.state.trades)) {
+      if (Object.keys(t.give.items || {}).some((id) => !known(id)) || Object.keys(t.want.items || {}).some((id) => !known(id))) delete this.state.trades[t.id];
+    }
+    for (const drops of Object.values(this.state.doorDrops)) for (const d of drops) if (d.bundle) clean(d.bundle.items);
+    // из долга вещь вычёркивается; если в долге ничего не осталось — расписка закрыта
+    for (const iou of this.state.ious) {
+      if (iou.status !== 'open' || !iou.bundle) continue;
+      clean(iou.bundle.items);
+      if (!iou.bundle.money && !Object.keys(iou.bundle.items || {}).length) {
+        iou.status = 'void';
+        iou.closedAt = this.now();
+      }
+    }
+  }
+
+  shiftPlayerTimers(p, ms) {
+    for (const c of p.conditions || []) if (c.until) c.until += ms;
+    if (p.travel && !p.travel.stuck) {
+      p.travel.arriveAt += ms;
+      p.travel.startedAt += ms;
+    }
+    if (p.down) p.down.until += ms;
+    if (p.homeward && p.homeward.nextAt) p.homeward.nextAt += ms;
+    if (p.job) p.job.startedAt += ms;
   }
 
   /** Давно погибших уносим из Пульта в архив домовой книги, чтобы снимок для админки не рос бесконечно. */
@@ -3897,7 +3947,8 @@ class Game extends EventEmitter {
   bundleText(b) {
     const parts = [];
     if (b.money) parts.push(talons(b.money));
-    for (const [id, n] of Object.entries(b.items)) parts.push(`${C.ITEMS[id].name}${n > 1 ? ` ×${n}` : ''}`);
+    // вещь могли убрать из палитры (или откат вернул старую) — показываем как есть, без падения
+    for (const [id, n] of Object.entries(b.items || {})) parts.push(`${C.ITEMS[id]?.name || id}${n > 1 ? ` ×${n}` : ''}`);
     return parts.join(', ') || 'ничего';
   }
 
@@ -4684,10 +4735,7 @@ const ADMIN_COMMANDS = {
     if (type === 'accidents') delete C.ACCIDENTS[id];
     if (type === 'items') {
       delete C.ITEMS[id];
-      for (const p of this.players()) delete p.inventory[id];
-      // вещь исчезает отовсюду: из обменов, передачек под дверью и рецептов лечения
-      for (const t of Object.values(this.state.trades)) if (t.give.items[id] || t.want.items[id]) delete this.state.trades[t.id];
-      for (const drops of Object.values(this.state.doorDrops)) for (const d of drops) if (d.bundle && d.bundle.items) delete d.bundle.items[id];
+      this.purgeUnknownItems();
     }
     if (type === 'conditions') {
       for (const it of Object.values(C.ITEMS)) if (it.use && it.use.cure) it.use.cure = it.use.cure.filter((c) => c !== id);
@@ -4915,10 +4963,19 @@ const ADMIN_COMMANDS = {
     const snap = this.snapshots.find((x) => x.id === snapshotId);
     if (!snap) throw new Error('Нет такого снимка');
     this.takeSnapshot('перед откатом дома', ctx.who);
+    const now = this.now();
+    const wasPaused = !!this.world.paused;
     const data = JSON.parse(snap.data);
     const fresh = Game.normalize({ ...this.state, ...data });
     Object.assign(this.state, fresh);
     this.invalidatePlayers();
+    // таймеры снимка (туман, поломки, «без сознания», расписание…) продолжаются с того места, где
+    // были в снимке, а не догоняют прошедшее с тех пор время; пауза — та, что сейчас
+    const w = this.world;
+    this.shiftTimers(now - (w.paused && w.pausedAt ? w.pausedAt : snap.ts));
+    w.paused = wasPaused;
+    w.pausedAt = wasPaused ? now : null;
+    this.purgeUnknownItems(); // палитра в снимок не входит: вещи, которых уже нет, убираем
     this.applyPalette();
     this.rebuildMap(); // перепланировка тоже откатилась
     this.byToken = new Map(Object.values(this.state.players).map((p) => [p.token, p.id]));
@@ -4937,15 +4994,25 @@ const ADMIN_COMMANDS = {
     if (!snap) throw new Error('Нет такого снимка');
     const cur = this.getPlayer(id);
     if (!cur) throw new Error('Жилец не найден');
-    const old = JSON.parse(snap.data).players[id];
+    const data = JSON.parse(snap.data);
+    const old = data.players && Object.hasOwn(data.players, id) ? data.players[id] : null;
     if (!old) throw new Error('В этом снимке такого жильца ещё не было');
+    // двух живых на одном паспорте не бывает (как и при воскрешении)
+    const acc = cur.account && this.state.accounts[cur.account];
+    const heir = old.alive && acc ? this.accountPlayer(acc) : null;
+    if (heir && heir.id !== id) throw new Error(`По этому паспорту уже живёт ${heir.name}. Двух живых на одном паспорте не бывает`);
     if (old.alive && !cur.alive && this.alivePlayers().some((q) => q.id !== id && q.apartment.number === old.apartment.number)) throw new Error('Его квартиру уже заняли — сначала освободите');
     this.takeSnapshot(`перед откатом жильца ${cur.name}`, ctx.who);
-    const keep = { token: cur.token, account: cur.account, journal: cur.journal };
+    // наследство уже забрали — второй раз его не взять (иначе вещь удвоится)
+    const keep = { token: cur.token, account: cur.account, journal: cur.journal, inheritedBy: cur.inheritedBy || old.inheritedBy };
     this.state.players[id] = Object.assign(old, keep);
     this.invalidatePlayers();
     const p = this.state.players[id];
     p.job = null;
+    // «без сознания», болезни, поездка — с того места, где были в снимке
+    const sw = data.world || {};
+    this.shiftPlayerTimers(p, this.timerNow() - (sw.paused && sw.pausedAt ? sw.pausedAt : snap.ts));
+    this.purgeUnknownItems();
     const scene = this.sceneOf(p);
     if (!p.pos || !World.canStand(scene, p.pos.x, p.pos.y)) p.pos = { ...this.map.spawn(scene.key), d: 'down' };
     this.journal(p, 'Вы вдруг оказались там, где были раньше. Будто время для вас отмоталось назад.', 'whisper');
@@ -5021,7 +5088,8 @@ const ADMIN_COMMANDS = {
     if (!Object.hasOwn(this.state.scenarios, id)) throw new Error('Такого своего сценария нет');
     delete this.state.scenarios[id];
     this.emit('content_changed');
-    return { ok: true, message: 'Сценарий удалён' };
+    const running = this.state.scenarioRuns.filter((r) => r.scenarioId === id).length;
+    return { ok: true, message: running ? `Сценарий удалён из библиотеки; идущий (${running}) доиграет — остановить можно в списке идущих` : 'Сценарий удалён' };
   },
 
   /** Запустить сценарий из библиотеки (или разовый — def без сохранения). */
@@ -5030,7 +5098,8 @@ const ADMIN_COMMANDS = {
     if (!scen && def) scen = this.cleanScenario(def);
     if (!scen) throw new Error('Нет такого сценария');
     if (this.state.scenarioRuns.length >= 10) throw new Error('Уже идёт 10 сценариев');
-    const run = { id: newId('sr'), scenarioId: id || null, def: id ? null : scen, name: scen.name, step: 0, nextAt: this.timerNow(), startedAt: this.now() };
+    // копия шагов — в сам запуск: удалить или поправить сценарий в библиотеке, пока он идёт, можно
+    const run = { id: newId('sr'), scenarioId: id || null, def: JSON.parse(JSON.stringify(scen)), name: scen.name, step: 0, nextAt: this.timerNow(), startedAt: this.now() };
     this.state.scenarioRuns.push(run);
     this.log(`Запущен сценарий «${scen.name}»`, 'schedule');
     this.runScenarios(this.now());

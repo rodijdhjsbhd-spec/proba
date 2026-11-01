@@ -2566,3 +2566,104 @@ test('вид изменениями: применённые изменения �
   const again = VP.diff(parts, game.playerView(a));
   assert.equal(again.patch, null);
 });
+
+test('проверка №4: удалить идущий сценарий — мир тикает дальше, а запуск доигрывает свою копию', () => {
+  const { game, advance } = makeWorld();
+  const p = join(game, 'Иван');
+  const r = game.admin('scenarioSave', { def: { name: 'Ждун', steps: [{ kind: 'wait', minutes: 1 }, { kind: 'do', cmd: 'announce', args: { text: 'Ждали!' } }] } });
+  assert.equal(game.admin('scenarioStart', { id: r.scenarioId }).ok, true);
+  assert.match(game.admin('scenarioDelete', { id: r.scenarioId }).message, /доиграет/);
+  const chat = [];
+  game.on('chat', (m) => chat.push(m.text));
+  const hunger = p.stats.hunger;
+  advance(90 * 1000);
+  assert.ok(p.stats.hunger < hunger, 'жильцы живут дальше');
+  assert.ok(chat.some((t) => /Ждали/.test(t)), 'запуск доиграл свою копию');
+  assert.equal(game.state.scenarioRuns.length, 0);
+  // запуск из старого сохранения без описания — снимается, а не роняет тик
+  game.state.scenarioRuns.push({ id: 'sr_old', scenarioId: 'нет_такого', def: null, name: 'Старый', step: 0, nextAt: 0 });
+  advance(2000);
+  assert.equal(game.state.scenarioRuns.length, 0);
+  assert.ok(p.stats.hunger < hunger);
+});
+
+test('проверка №4: откат дома продолжает таймеры с места снимка и не снимает паузу', () => {
+  const { game, clock, advance } = makeWorld();
+  join(game, 'Иван');
+  game.admin('fog', { from: 101, to: 101, warnSec: 0, durationMin: 10 });
+  advance(10 * 1000);
+  const snap = game.admin('snapshot', { label: 'тест' });
+  assert.equal(snap.ok, true, snap.error);
+  const snapId = game.snapshots.at(-1).id;
+  const leftAtSnap = game.world.fog.until - clock.t;
+  advance(8 * 60 * 1000);
+  game.admin('restoreHouse', { snapshotId: snapId });
+  assert.ok(Math.abs(game.world.fog.until - clock.t - leftAtSnap) < 2000, 'туману осталось столько же, сколько в снимке');
+  // пауза: поставили — откатили — пауза осталась
+  game.admin('pause', { paused: true });
+  clock.t += 60000;
+  game.admin('restoreHouse', { snapshotId: snapId });
+  assert.equal(game.world.paused, true);
+  assert.equal(game.world.pausedAt, clock.t);
+  clock.t += 30000;
+  game.admin('pause', { paused: false });
+  assert.ok(Math.abs(game.world.fog.until - clock.t - leftAtSnap) < 2000, 'и после паузы — с того же места');
+});
+
+test('проверка №4: вещь из палитры убрали — расписки, авоськи и кладовки не роняют виды', () => {
+  const { game } = makeWorld();
+  const [a, b] = ['Иван', 'Мария'].map((n) => join(game, n));
+  for (const p of [a, b]) game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  b.pos = { ...a.pos };
+  const it = game.admin('paletteAdd', { type: 'items', def: { name: 'Настойка', desc: 'Горькая', use: { sanity: 5 } } });
+  assert.equal(it.ok, true, it.error);
+  a.money = 5;
+  // Иван даёт 5 талонов в долг, взамен — настойка
+  const r = game.tradeOffer(a, b.id, { money: 5, items: {} }, { money: 0, items: { [it.id]: 1 } }, 2);
+  assert.equal(r.ok, true, r.error);
+  assert.equal(game.tradeRespond(b, r.trade, true).ok, true);
+  assert.equal(game.state.ious.length, 1);
+  b.window = { [it.id]: 1, bread: 1 };
+  game.admin('replan', { scene: 'corridor:101', kind: 'closet', x: 7, y: 1, items: { [it.id]: 1 } });
+  assert.equal(game.admin('paletteRemove', { type: 'items', id: it.id }).ok, true);
+  assert.doesNotThrow(() => game.playerView(a));
+  assert.doesNotThrow(() => game.playerView(b));
+  assert.equal(game.state.ious[0].status, 'void', 'в долге больше ничего — расписка закрыта');
+  assert.deepEqual(b.window, { bread: 1 });
+  assert.ok(Object.values(game.world.closets).every((c) => !c.items[it.id]));
+  // показ неизвестной вещи не падает
+  assert.equal(game.bundleText({ money: 0, items: { пропавшее: 2 } }), 'пропавшее ×2');
+});
+
+test('проверка №4: откат жильца не оживляет второго на том же паспорте и сдвигает его таймеры', () => {
+  const { game, clock, advance } = makeWorld();
+  const account = game.createAccount('ivan', 'secret12').account;
+  const a = game.register('Иван', { account }).player;
+  game.setOnline(a.id, true);
+  game.admin('snapshot', { label: 'до' });
+  const snapId = game.snapshots.at(-1).id;
+  game.kill(a, 'тест');
+  clock.t += (C.BALANCE.rebirthDelayMin + 1) * 60000;
+  const heir = game.register('Иван Второй', { account }).player;
+  assert.ok(heir && heir.alive);
+  const res = game.admin('restorePlayer', { snapshotId: snapId, id: a.id });
+  assert.equal(res.ok, false);
+  assert.match(res.error, /Иван Второй/);
+  // без наследника: лежачий из снимка не умирает сразу после отката
+  const { game: g2, clock: c2, advance: adv2 } = makeWorld();
+  const p = join(g2, 'Пётр');
+  g2.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  g2.admin('accident', { target: { type: 'player', id: p.id }, kind: 'fall' });
+  if (!p.down) p.down = { until: c2.t + 150000, cause: 'тест' };
+  const left = p.down.until - c2.t;
+  g2.admin('snapshot', { label: 'лежит' });
+  const sid = g2.snapshots.at(-1).id;
+  g2.wake ? g2.wake(p) : (p.down = null);
+  adv2(5 * 60 * 1000);
+  assert.equal(g2.admin('restorePlayer', { snapshotId: sid, id: p.id }).ok, true);
+  const back = g2.getPlayer(p.id);
+  assert.ok(back.down && Math.abs(back.down.until - c2.t - left) < 2000, 'лежит столько же, сколько в снимке');
+  adv2(1000);
+  assert.equal(back.alive, true);
+  assert.ok(advance && c2);
+});
