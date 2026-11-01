@@ -187,6 +187,23 @@ const SIDE_JOBS = {
 // Барыга на техническом этаже: что скупает и почём (бумаги — по 1). В туман дороже, ложки и вилки — после кражи.
 const BARYGA_PRICES = { bulb: 2, fork: 2, spoon: 3, filter: 3, battery: 2 };
 
+// Микроклимат этажей: по умолчанию — только вид, звук и тексты; вред в минуту — если ЖЭК включил множитель.
+const CLIMATES = {
+  cold: { name: 'Холод', text: 'Изо рта идёт пар, батареи ледяные.', harm: { energy: -0.6 } },
+  damp: { name: 'Сырость', text: 'Стены мокрые, по углам расползается плесень.', harm: { sanity: -0.3 } },
+  heat: { name: 'Жара', text: 'Душно, трубы раскалены, воздух дрожит.', harm: { hunger: -0.6 } },
+  draft: { name: 'Сквозняк', text: 'Откуда-то тянет: по полу гуляет пыль, хлопают двери.', harm: { health: -0.25 } },
+};
+
+// «Звук в доме» из Пульта: что услышат жильцы (и строка для тех, у кого выключен звук)
+const HOUSE_SOUNDS = {
+  bang: 'Где-то рядом — глухие удары. Три. Потом тишина.',
+  scrape: 'Скрежет — будто что-то тяжёлое тащат по бетону.',
+  cry: 'За стеной кто-то плачет.',
+  steps: 'Над головой шаги. Медленные. Туда и обратно.',
+  whisper: 'Шёпот. Слов не разобрать.',
+};
+
 // Порча еды: за ночь (в полночь) свежее становится несвежим. Сухари и тушёнка вечны.
 // «Туманной» еда становится только от тумана, который наслал бог (если лежала за окном).
 const SPOIL = { bread: 'stale_bread', kissel: 'sour_kissel' };
@@ -421,5 +438,5 @@ const NOTES = {
 module.exports = {
   BUILDING, FACILITIES, BALANCE, ITEMS, SHOPS, CONDITIONS, ACCIDENTS, PLACES, BREAKDOWNS, HALLUCINATIONS,
   HALLUCINATION_VOICES, RESERVED_NAMES, ARCHIVE_DEAD_AFTER_H, NOTES, RANKS, TUTORIAL, ECHO_PHRASES, HAZARDS,
-  LORE, RADIO, DEEDS, SPOIL, FOGGED, SIDE_JOBS, BARYGA_PRICES, STASH_LOOT,
+  LORE, RADIO, DEEDS, SPOIL, FOGGED, SIDE_JOBS, BARYGA_PRICES, STASH_LOOT, CLIMATES, HOUSE_SOUNDS,
 };

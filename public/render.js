@@ -983,6 +983,7 @@
         ctx.fillStyle = grad;
         ctx.fillRect(0, 0, vw, vh);
       }
+      if (s.climate) this.drawClimate(s, vw, vh, t);
       if (s.sanity != null && s.sanity < 25) {
         const k = (25 - s.sanity) / 25;
         const grad = ctx.createRadialGradient(vw / 2, vh / 2, Math.min(vw, vh) * 0.25, vw / 2, vh / 2, Math.max(vw, vh) * 0.7);
@@ -1113,6 +1114,48 @@
         b.g.beginPath();
         b.g.ellipse(s.pathEnd.x * b.T, s.pathEnd.y * b.T, (0.1 + p * 0.25) * b.T, (0.05 + p * 0.1) * b.T, 0, 0, Math.PI * 2);
         b.g.stroke();
+      }
+    }
+
+    /** Микроклимат: оттенок и частицы поверх света (холод, сырость, жара, сквозняк). */
+    drawClimate(s, vw, vh, t) {
+      const ctx = this.ctx;
+      const tint = { cold: 'rgba(150,195,255,0.10)', damp: 'rgba(80,130,100,0.12)', heat: 'rgba(255,140,60,0.08)', draft: 'rgba(200,200,190,0.04)' }[s.climate];
+      if (tint) {
+        ctx.fillStyle = tint;
+        ctx.fillRect(0, 0, vw, vh);
+      }
+      const d = this.dpr;
+      if (s.climate === 'draft' || s.climate === 'cold') {
+        // пыль (сквозняк) или снежинки инея (холод) летят поперёк
+        ctx.fillStyle = s.climate === 'cold' ? 'rgba(235,245,255,0.55)' : 'rgba(200,190,170,0.45)';
+        for (let i = 0; i < 36; i++) {
+          const speed = s.climate === 'cold' ? 20 : 90;
+          const x = (((i * 137.5 + t * speed * (0.6 + (i % 5) * 0.1)) % (vw + 40)) + vw + 40) % (vw + 40) - 20;
+          const y = ((i * 89.3) % vh) + Math.sin(t * 1.3 + i) * 8 * d;
+          ctx.fillRect(x, y, 2 * d, 2 * d);
+        }
+      } else if (s.climate === 'damp') {
+        // капли по экрану
+        ctx.strokeStyle = 'rgba(170,210,190,0.35)';
+        ctx.lineWidth = d;
+        for (let i = 0; i < 14; i++) {
+          const x = (i * 97.7) % vw;
+          const y = ((t * 60 + i * 53) % (vh + 40)) - 20;
+          ctx.beginPath();
+          ctx.moveTo(x, y);
+          ctx.lineTo(x, y + 8 * d);
+          ctx.stroke();
+        }
+      } else if (s.climate === 'heat') {
+        // марево
+        ctx.strokeStyle = 'rgba(255,220,180,0.06)';
+        ctx.lineWidth = 2 * d;
+        for (let y = 0; y < vh; y += 24 * d) {
+          ctx.beginPath();
+          for (let x = 0; x <= vw; x += 16 * d) ctx.lineTo(x, y + Math.sin(x / (40 * d) + t * 2 + y) * 3 * d);
+          ctx.stroke();
+        }
       }
     }
 

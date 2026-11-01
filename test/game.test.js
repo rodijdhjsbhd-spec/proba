@@ -2081,3 +2081,40 @@ test('аварийный наряд: только у поломок со сро�
   game.workSubmit(p, r2.job.id, presses2);
   assert.equal(game.world.breakdowns.lift, null, 'починили');
 });
+
+test('микроклимат: тексты и вид без вреда; с множителем — вред, но не за задраенной дверью', () => {
+  const { game, advance } = makeWorld();
+  const out = join(game, 'Иван');
+  const home = join(game, 'Мария');
+  game.admin('teleport', { id: out.id, place: 'corridor', floor: 101 });
+  game.admin('climate', { from: 101, to: 101, kind: 'draft', minutes: 30 });
+  const v = game.playerView(out);
+  assert.equal(v.here.climate.kind, 'draft');
+  assert.match(v.here.text, /тянет/);
+  const hp = out.stats.health;
+  advance(60 * 1000);
+  assert.ok(out.stats.health >= hp, 'без множителя — без вреда');
+  game.admin('climate', { from: 101, to: 101, kind: 'draft', minutes: 30, harm: 2 });
+  walkTo(game, home, type('hermodoor'));
+  game.seal(home, true);
+  const hp1 = out.stats.health;
+  const hp2 = home.stats.health;
+  advance(5 * 60 * 1000);
+  assert.ok(out.stats.health < hp1, 'сквозняк в коридоре вредит');
+  assert.ok(home.stats.health >= hp2, 'за задраенной дверью — нет');
+  game.admin('climateClear', {});
+  assert.equal(game.playerView(out).here.climate, null);
+});
+
+test('звук в доме: только тем, кто в сети, по цели', () => {
+  const { game } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  game.setOnline(b.id, false);
+  const heard = [];
+  game.on('sound', (e) => heard.push(e));
+  assert.equal(game.admin('sound', { target: { type: 'all' }, kind: 'cry' }).ok, true);
+  assert.deepEqual(heard.map((e) => e.to), [a.id]);
+  assert.match(heard[0].text, /плачет/);
+  assert.equal(game.admin('sound', { target: { type: 'all' }, kind: 'nope' }).ok, false);
+});

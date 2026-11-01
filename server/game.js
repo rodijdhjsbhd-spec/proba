@@ -109,6 +109,7 @@ function freshState() {
       honor: null, // доска почёта прошлой недели { week, workers, generous }
       puppets: {}, // марионетки ЖЭК { id: { id, name, preset, lookId, scene, x, y, d, path } }
       pried: {}, // вскрытые служебные двери: id двери → { by, at }
+      climate: [], // микроклимат этажей { id, from, to, kind, until, harm }
     },
     players: {},
     trades: {},
@@ -190,6 +191,7 @@ class Game extends EventEmitter {
     s.world.scars = s.world.scars || {};
     s.world.barygaClients = s.world.barygaClients || {};
     s.world.pried = s.world.pried || {};
+    s.world.climate = Array.isArray(s.world.climate) ? s.world.climate : [];
     s.world.puppets = s.world.puppets && typeof s.world.puppets === 'object' ? s.world.puppets : {};
     s.assignments = Array.isArray(s.assignments) ? s.assignments : [];
     s.petitions = Array.isArray(s.petitions) ? s.petitions : [];
@@ -846,6 +848,13 @@ class Game extends EventEmitter {
     return { ok: true, message: 'Стало светлее.' };
   }
 
+  /** Микроклимат на этаже (последний наложенный) или null. */
+  climateAt(floor) {
+    const list = this.world.climate;
+    for (let i = list.length - 1; i >= 0; i--) if (floor >= list[i].from && floor <= list[i].to) return list[i];
+    return null;
+  }
+
   isDark(floor) {
     const pw = this.world.power;
     return !!pw && floor >= pw.from && floor <= pw.to;
@@ -1169,6 +1178,7 @@ class Game extends EventEmitter {
       actors: this.sceneActors(key),
       hazards: (this.world.hazards[key] || []).map((hz) => ({ id: hz.id, kind: hz.kind, x: hz.x, y: hz.y, fenced: !!hz.fenced })),
       scars: this.scarsView(key),
+      climate: floor != null && this.climateAt(floor) ? this.climateAt(floor).kind : null,
       lampsOut: scene.kind === 'corridor' ? this.world.lampsOut[floor] || [] : [],
       dark: floor != null && this.isDark(floor),
       fog: fog ? (apt ? (this.doorSealed(apt) ? 'window' : 'leak') : 'outside') : null,
@@ -1274,6 +1284,7 @@ class Game extends EventEmitter {
     this.dayCheck(now);
     if (this.state.assignments.length) this.closeAssignments(now);
     if (this.world.tick % 30 === 0 && this.state.petitions.length) this.expirePetitions(now);
+    if (this.world.climate.length) this.world.climate = this.world.climate.filter((c) => !c.until || c.until > now);
     this.elderWarnings(now);
   }
 
@@ -2308,6 +2319,7 @@ class Game extends EventEmitter {
     for (const e of this.state.schedule) e.at += ms;
     for (const list of Object.values(w.hazards)) for (const hz of list) if (hz.until) hz.until += ms;
     for (const a of this.state.assignments) if (!a.closed) a.until += ms;
+    for (const c of w.climate || []) if (c.until) c.until += ms;
     if (w.radio && w.radio.silenceUntil) w.radio.silenceUntil += ms;
     for (const p of this.players()) {
       for (const c of p.conditions) if (c.until) c.until += ms;
@@ -2383,6 +2395,16 @@ class Game extends EventEmitter {
       }
     }
 
+    // микроклимат вредит, только если ЖЭК включил множитель; дома за задраенной дверью — не достаёт
+    const clim = this.climateAt(floor);
+    const climHarm = !!(clim && clim.harm > 0 && !(atHome && this.doorSealed(this.currentApt(p))));
+    if (climHarm) {
+      for (const [k, v] of Object.entries(C.CLIMATES[clim.kind].harm)) {
+        delta[k] += v * clim.harm * dh;
+        if (k === 'health') hurt(`${C.CLIMATES[clim.kind].name} доконал`, v * clim.harm * dh);
+      }
+    }
+
     if (this.isDarkFor(p)) {
       if (this.torchWorks(p)) {
         p.flashCharge = Math.max(0, (p.flashCharge ?? 100) - B.flashDrainPerMin * dh);
@@ -2402,7 +2424,7 @@ class Game extends EventEmitter {
       const hp = B.starvationHpPerMin * d;
       delta.health += hp;
       hurt('Умер от голода', hp);
-    } else if (p.stats.hunger > 50 && p.conditions.length === 0 && !fogged) {
+    } else if (p.stats.hunger > 50 && p.conditions.length === 0 && !fogged && !climHarm) {
       delta.health += B.healthRegenPerMin * d;
     }
     if (p.stats.sanity <= 0 && online) {
@@ -4436,6 +4458,34 @@ const ADMIN_COMMANDS = {
     return { ok: true, message: `Снимок: ${snap.clock}` };
   },
 
+  /** Микроклимат на этажах: холод, сырость, жара, сквозняк. harm 0 — только вид и звук; 0.5–2 — вред в минуту. */
+  climate({ from, to, kind = 'cold', minutes = 0, harm = 0 }) {
+    if (!C.CLIMATES[kind]) throw new Error('Нет такой погоды');
+    const a = toInt(from, C.BUILDING.firstResidentialFloor);
+    const b = toInt(to, a);
+    const min = Math.max(0, Math.min(7 * 1440, Number(minutes) || 0));
+    const c = { id: newId('c'), from: Math.min(a, b), to: Math.max(a, b), kind, until: min ? this.timerNow() + min * 60000 : null, harm: Math.max(0, Math.min(3, Number(harm) || 0)) };
+    this.world.climate = [...this.world.climate.filter((x) => !(x.from === c.from && x.to === c.to)), c].slice(-20);
+    const affected = this.alivePlayers().filter((p) => p.location.floor >= c.from && p.location.floor <= c.to);
+    this.notify(affected, { title: C.CLIMATES[kind].name, text: C.CLIMATES[kind].text, style: 'info' });
+    this.log(`Микроклимат: ${C.CLIMATES[kind].name} на этажах ${c.from}–${c.to}${c.harm ? `, вред ×${c.harm}` : ''}`, 'event', null, { public: `${C.CLIMATES[kind].name.toLowerCase()} на этажах ${c.from}–${c.to}` });
+    return { ok: true, message: `${C.CLIMATES[kind].name}: ${c.from}–${c.to}` };
+  },
+
+  climateClear({ id }) {
+    this.world.climate = id ? this.world.climate.filter((x) => x.id !== id) : [];
+    return { ok: true, message: 'Погода в доме обычная' };
+  },
+
+  /** «Звук в доме»: удары, скрежет, плач за стеной, шаги сверху, шёпот — у выбранных жильцов. */
+  sound({ target, kind = 'bang' }) {
+    if (!C.HOUSE_SOUNDS[kind]) throw new Error('Нет такого звука');
+    const list = this.resolveTargets(target).filter((p) => this.isOnline(p.id));
+    for (const p of list) this.emit('sound', { to: p.id, kind, text: C.HOUSE_SOUNDS[kind] });
+    this.log(`Звук в доме «${kind}»: ${list.map((p) => p.name).join(', ') || 'никто не услышал'}`, 'admin');
+    return { ok: true, message: `Услышали: ${list.length}` };
+  },
+
   /** Поставить барыгу на технический этаж. */
   barygaPlace({ floor }) {
     const f = toInt(floor, 99);
@@ -4948,6 +4998,8 @@ Game.prototype.describePlace = function describePlace(p) {
   const here = { key: this.locationKey(p), place: l.place, floor: l.floor, title: this.placeTitle(p), text: '', people, shop: null, residents: null, closed: null };
   here.hazards = (this.world.hazards[here.key] || []).map((hz) => ({ id: hz.id, kind: hz.kind, name: C.HAZARDS[hz.kind].name, x: hz.x, y: hz.y, fenced: !!hz.fenced }));
   here.scars = this.scarsView(here.key);
+  const clim = l.floor != null ? this.climateAt(l.floor) : null;
+  here.climate = clim ? { kind: clim.kind, name: C.CLIMATES[clim.kind].name, harm: clim.harm > 0 } : null;
 
   switch (l.place) {
     case 'home': {
@@ -5028,6 +5080,7 @@ Game.prototype.describePlace = function describePlace(p) {
     default:
       here.text = '';
   }
+  if (here.climate && l.place !== 'lift' && l.place !== 'stairs') here.text += ` ${C.CLIMATES[here.climate.kind].text}`;
   return here;
 };
 
@@ -5049,6 +5102,7 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       lampsOutFloors: Object.keys(w.lampsOut).length,
       rent: this.rentAmount(),
       baryga: w.baryga ? { floor: w.baryga.floor, purse: w.baryga.purse } : null,
+      climate: w.climate.map((c) => ({ ...c, name: C.CLIMATES[c.kind].name, leftMin: c.until ? Math.max(0, Math.ceil((c.until - now) / 60000)) : null })),
       puppets: Object.values(w.puppets).map((pp) => ({ id: pp.id, name: pp.name, preset: pp.preset, scene: pp.scene, title: this.sceneTitle(pp.scene) })),
       plan: w.plan ? { done: w.plan.done, target: w.plan.target, week: w.plan.week + 1, participants: Object.keys(w.plan.participants).length } : null,
       stock: this.state.stock,
@@ -5135,6 +5189,7 @@ Game.prototype.adminContent = function adminContent() {
     breakdowns: pickNames(C.BREAKDOWNS),
     places: Object.fromEntries(MOVE_PLACES.map((k) => [k, C.PLACES[k].name])),
     hazards: Object.fromEntries(Object.entries(C.HAZARDS).map(([k, v]) => [k, v.name])),
+    climates: Object.fromEntries(Object.entries(C.CLIMATES).map(([k, v]) => [k, v.name])),
     palette: this.state.palette,
     world: WORLD_CONFIG,
   };

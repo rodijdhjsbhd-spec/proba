@@ -196,6 +196,11 @@
       case 'chat':
         addChat(msg.msg);
         break;
+      case 'sound':
+        // «звук в доме» от ЖЭК
+        ambient.play(msg.kind);
+        toast({ text: msg.text, style: 'whisper' });
+        break;
       case 'object_say':
         // одержимая вещь (мусоропровод) говорит голосом ЖЭК
         S.objectBubbles = { ...(S.objectBubbles || {}), [msg.object]: { text: msg.text, until: Date.now() + 8000, ghost: true } };
@@ -1580,6 +1585,7 @@
       scars: v.here.scars || [],
       radioBubble: S.radioBubble,
       objectBubbles: S.objectBubbles,
+      climate: v.here.climate ? v.here.climate.kind : null,
       marker: tutorialMarker(v),
       flashlight: has('flashlight') && you.flashCharge > 0,
       fog,
@@ -1961,8 +1967,38 @@
     S.sound = !S.sound;
     store.set('gh_sound', S.sound ? 'on' : 'off');
     syncSoundBtn();
+    // выключили — замолкает и фон
+    if (!S.sound && actx) actx.suspend();
+    else unlockAudio();
   });
   syncSoundBtn();
+
+  // ---- фон дома: гул ламп, капель, станки, ветер из-под двери, шаги соседей ----
+  const ambient = GHSound.create(() => (S.sound ? unlockAudio() : null));
+  function ambientState() {
+    const v = S.view;
+    if (!v || !v.you.alive || $('#app').hidden) return {};
+    const f = v.world.fog;
+    const fogHere = !!(f && f.phase === 'active' && f.affectsYou);
+    const steps = [...S.actors.values()].filter((a) => a.m && !a.away).length;
+    return {
+      place: v.you.travel ? v.you.travel.via : v.here.place,
+      technical: v.here.floorKind === 'technical',
+      dark: !!v.world.dark,
+      fogLeak: fogHere && v.here.place === 'home' && !v.you.sealed,
+      fogOutside: fogHere && v.here.place !== 'home',
+      steps: Math.min(3, steps),
+      climate: v.here.climate ? v.here.climate.kind : null,
+      night: isNight(v),
+    };
+  }
+  setInterval(() => {
+    try {
+      ambient.update(ambientState());
+    } catch (err) {
+      console.error(err);
+    }
+  }, 700);
 
   // ---------------------------------------------------------------------------
   // Работа: мини-игры (открываются панелью над станком)

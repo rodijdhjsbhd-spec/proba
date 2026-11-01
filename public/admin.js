@@ -740,6 +740,42 @@
     );
     withSchedule(grid.lastElementChild, { label: () => `Разнарядка: ${asgText.value.slice(0, 40)}`, cmd: 'assign', args: asgArgs });
 
+    // --- Микроклимат ---
+    const clFrom = num(firstFloor, { min: 1, max: 999 });
+    const clTo = num(firstFloor + 4, { min: 1, max: 999 });
+    const clKind = select(opts(C.climates || {}), 'cold');
+    const clMin = num(30, { min: 0, max: 10080 });
+    const clHarm = select([['0', 'без вреда (вид, звук, тексты)'], ['0.5', 'слабый вред'], ['1', 'вред'], ['2', 'сильный вред']], '0');
+    const clArgs = () => ({ from: clFrom.value, to: clTo.value, kind: clKind.value, minutes: clMin.value, harm: clHarm.value });
+    A.climateList = h('ul', { class: 'hazard-list' });
+    grid.append(
+      card(
+        'Микроклимат',
+        'Долгая «погода» на этажах: холод, сырость, жара, сквозняк. По умолчанию — только вид, звук и тексты. Вред включается множителем (дома за задраенной дверью не достаёт).',
+        'fog-card',
+        h('div', { class: 'grid3' }, field('С этажа', clFrom), field('По этаж', clTo), field('Что', clKind)),
+        h('div', { class: 'grid2' }, field('Минут (0 — пока не уберёте)', clMin), field('Вред', clHarm)),
+        actions(button('Наслать', () => cmd('climate', clArgs()), 'primary'), button('Убрать всё', () => cmd('climateClear', {}))),
+        A.climateList,
+      ),
+    );
+    withSchedule(grid.lastElementChild, { label: () => `Микроклимат: ${(C.climates || {})[clKind.value]}`, cmd: 'climate', args: clArgs });
+
+    // --- Звук в доме ---
+    const sndTarget = targetPicker('floors');
+    const sndKind = select([['bang', 'Удары'], ['scrape', 'Скрежет'], ['cry', 'Плач за стеной'], ['steps', 'Шаги над головой'], ['whisper', 'Шёпот']], 'bang');
+    grid.append(
+      card(
+        'Звук в доме',
+        'Только звук (и строчка для тех, у кого он выключен). Ничего не происходит — пока вы не решите иначе.',
+        'whisper-card',
+        sndTarget.el,
+        field('Что услышат', sndKind),
+        actions(button('Пусть услышат', () => cmd('sound', { target: sndTarget.get(), kind: sndKind.value }), 'primary')),
+      ),
+    );
+    withSchedule(grid.lastElementChild, { label: () => `Звук: ${sndKind.selectedOptions[0].text}`, cmd: 'sound', args: () => ({ target: sndTarget.get(), kind: sndKind.value }) });
+
     // --- Одержимые вещи ---
     const ovFloor = num(firstFloor, { min: 1, max: 999 });
     const ovObj = select([['chute', 'Мусоропровод (слышат в коридоре)'], ['board', 'Доска (листок от любого имени)']], 'chute');
@@ -916,6 +952,16 @@
     renderHazards();
     renderRadio();
     renderAssignments();
+    if (A.climateList) {
+      const cl = s.world.climate || [];
+      memo('climate', cl.map((c) => [c.id, c.leftMin]), () => {
+        A.climateList.replaceChildren(
+          ...(cl.length
+            ? cl.map((c) => h('li', null, h('span', { class: 'txt' }, h('b', { text: c.name }), ` · ${c.from}–${c.to}${c.harm ? ` · вред ×${c.harm}` : ''}${c.leftMin != null ? ` · ещё ${c.leftMin} мин` : ''}`), button('✕', () => cmd('climateClear', { id: c.id }), 'small')))
+            : [h('li', { class: 'calm', text: 'Погода в доме обычная.' })]),
+        );
+      });
+    }
     renderSnapshots();
     if (A.barygaInfo) {
       const b = s.world.baryga;
@@ -1717,6 +1763,7 @@
         lampsOut: sc ? sc.lampsOut : [],
         hazards: sc ? sc.hazards : [],
         scars: sc ? sc.scars || [] : [],
+        climate: sc ? sc.climate : null,
         fog: sc ? sc.fog : null,
         fogOutside: !!(sc && sc.fog),
         liftBroken: !!(sc && sc.liftBroken),

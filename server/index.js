@@ -377,6 +377,8 @@ game.on('restored', () => {
 
 // Одержимые вещи: мусоропровод говорит с теми, кто рядом
 game.on('object_say', ({ to, object, text }) => sendToPlayer(to, { t: 'object_say', object, text }));
+// «Звук в доме» из Пульта
+game.on('sound', ({ to, kind, text }) => sendToPlayer(to, { t: 'sound', kind, text }));
 
 // Удалённое сообщение исчезает у всех
 game.on('chat_delete', ({ id }) => {
