@@ -128,6 +128,8 @@ function freshState() {
     ious: [], // долговые расписки { id, debtorId, holderId, bundle, dueDay, createdAt, status }
     admins: {}, // личные учётки богов: логин → { login, salt, hash, role, createdAt } (root — пароль из ADMIN_PASSWORD)
     godLog: [], // журнал богов: кто что нажал { ts, who, cmd, args, ok, error }
+    scenarios: {}, // свои сценарии ЖЭК { id: { name, steps } } (встроенные — в content.js)
+    scenarioRuns: [], // идущие сценарии { id, scenarioId, name, step, nextAt, startedAt }
     palette: { conditions: {}, accidents: {}, items: {} }, // беды и предметы, придуманные в Пульте
     stock: null, // запасы столовой и медпункта на сегодня: { canteen: { ключ: штук } } — заполняется при загрузке
     bannedIps: {}, // адрес → { until, reason }
@@ -199,6 +201,8 @@ class Game extends EventEmitter {
     s.ious = Array.isArray(s.ious) ? s.ious : [];
     s.admins = s.admins && typeof s.admins === 'object' ? s.admins : {};
     s.godLog = Array.isArray(s.godLog) ? s.godLog : [];
+    s.scenarios = s.scenarios && typeof s.scenarios === 'object' ? s.scenarios : {};
+    s.scenarioRuns = Array.isArray(s.scenarioRuns) ? s.scenarioRuns : [];
     s.world.radio = { ...fresh.world.radio, ...(s.world.radio || {}) };
     s.world.breakdowns = { ...fresh.world.breakdowns, ...((state.world || {}).breakdowns || {}) };
     for (const p of Object.values(s.players || {})) {
@@ -1336,6 +1340,7 @@ class Game extends EventEmitter {
     if (this.world.tick % 30 === 0 && this.state.petitions.length) this.expirePetitions(now);
     if (this.world.climate.length) this.world.climate = this.world.climate.filter((c) => !c.until || c.until > now);
     this.elderWarnings(now);
+    if (this.state.scenarioRuns.length) this.runScenarios(now);
   }
 
   // =========================================================================
@@ -2028,6 +2033,111 @@ class Game extends EventEmitter {
   }
 
   // =========================================================================
+  // Сценарии-цепочки: «подождать — сделать — проверить»
+  // =========================================================================
+  scenarioDef(id) {
+    return Object.hasOwn(this.state.scenarios, id) ? this.state.scenarios[id] : Object.hasOwn(C.SCENARIOS, id) ? C.SCENARIOS[id] : null;
+  }
+
+  /** Подходит ли жилец под фильтр шага. */
+  matchFilter(p, f = {}) {
+    if (f.stat && STAT_KEYS.includes(f.stat)) {
+      const v = Number(p.stats[f.stat]);
+      if (f.op === '<' ? !(v < Number(f.value)) : !(v > Number(f.value))) return false;
+    }
+    if (f.condition && !this.hasCondition(p, f.condition)) return false;
+    if (f.item && ((p.inventory[f.item] || 0) > 0) !== (f.has !== false)) return false;
+    if (f.sealed != null && this.doorSealed(p.apartment.number) !== !!f.sealed) return false;
+    if (f.atHome != null && this.isOwnHome(p) !== !!f.atHome) return false;
+    if (f.online != null && this.isOnline(p.id) !== !!f.online) return false;
+    return true;
+  }
+
+  /** Кого касается шаг: его цель (или цель из аргументов команды), отфильтрованная условием. */
+  stepTargets(step) {
+    const target = step.target || (step.args && step.args.target) || { type: 'all' };
+    const list = this.resolveTargets(target);
+    return step.filter ? list.filter((p) => this.matchFilter(p, step.filter)) : list;
+  }
+
+  runScenarios(now) {
+    if (this.world.paused) return;
+    for (const run of this.state.scenarioRuns.slice()) {
+      if (now < run.nextAt) continue;
+      const def = this.scenarioDef(run.scenarioId) || run.def;
+      const who = { who: `сценарий: ${run.name}`, role: 'god' };
+      let guard = 0;
+      while (run.step < def.steps.length && guard++ < 20) {
+        const step = def.steps[run.step];
+        if (step.kind === 'wait') {
+          run.step++;
+          run.nextAt = now + Math.max(0, Number(step.minutes) || 0) * 60000;
+          if (run.nextAt > now) break;
+          continue;
+        }
+        if (step.kind === 'stopIfNone') {
+          if (!this.stepTargets(step).length) {
+            this.log(`Сценарий «${run.name}» остановлен на шаге ${run.step + 1}: никто не подходит под условие`, 'schedule');
+            run.step = def.steps.length;
+            break;
+          }
+          run.step++;
+          continue;
+        }
+        // do: команда Пульта; с фильтром — только подходящим жильцам
+        const args = JSON.parse(JSON.stringify(step.args || {}));
+        if (step.filter || step.target) {
+          const ids = this.stepTargets(step).map((p) => p.id);
+          args.target = { type: 'ids', ids };
+        }
+        const res = this.admin(step.cmd, args, who);
+        this.log(`Сценарий «${run.name}», шаг ${run.step + 1}: ${step.cmd}${res.ok ? (res.message ? ` — ${res.message}` : '') : ` — не вышло: ${res.error}`}`, 'schedule');
+        run.step++;
+      }
+      if (run.step >= def.steps.length) {
+        this.state.scenarioRuns = this.state.scenarioRuns.filter((x) => x !== run);
+        this.log(`Сценарий «${run.name}» завершён`, 'schedule');
+      }
+    }
+  }
+
+  /** Проверить сценарий из Пульта: шаги, команды, фильтры. Бросает понятную ошибку. */
+  cleanScenario(raw = {}) {
+    const name = sanitizeText(raw.name, 60);
+    if (!name) throw new Error('Нужно название сценария');
+    const steps = Array.isArray(raw.steps) ? raw.steps.slice(0, 30) : [];
+    if (!steps.length) throw new Error('В сценарии нет шагов');
+    const cleanFilter = (f) => {
+      if (!f || typeof f !== 'object') return undefined;
+      const out = {};
+      if (STAT_KEYS.includes(f.stat)) Object.assign(out, { stat: f.stat, op: f.op === '>' ? '>' : '<', value: toInt(f.value, 50) });
+      if (typeof f.condition === 'string' && Object.hasOwn(C.CONDITIONS, f.condition)) out.condition = f.condition;
+      if (typeof f.item === 'string' && Object.hasOwn(C.ITEMS, f.item)) Object.assign(out, { item: f.item, has: f.has !== false });
+      for (const k of ['sealed', 'atHome', 'online']) if (f[k] != null) out[k] = !!f[k];
+      return Object.keys(out).length ? out : undefined;
+    };
+    const cleanTarget = (t) => (t && typeof t === 'object' && typeof t.type === 'string' ? JSON.parse(JSON.stringify(t)) : undefined);
+    return {
+      name,
+      steps: steps.map((st, i) => {
+        if (!st || typeof st !== 'object') throw new Error(`Шаг ${i + 1}: пусто`);
+        if (st.kind === 'wait') return { kind: 'wait', minutes: Math.max(0, Math.min(1440, Number(st.minutes) || 0)) };
+        if (st.kind === 'stopIfNone') return { kind: 'stopIfNone', target: cleanTarget(st.target), filter: cleanFilter(st.filter) };
+        if (st.kind !== 'do' || !SCENARIO_CMDS.includes(st.cmd)) throw new Error(`Шаг ${i + 1}: такую команду в сценарий не поставить`);
+        return { kind: 'do', cmd: st.cmd, args: st.args && typeof st.args === 'object' ? JSON.parse(JSON.stringify(st.args)) : {}, target: cleanTarget(st.target), filter: cleanFilter(st.filter) };
+      }),
+    };
+  }
+
+  scenarioRunsView() {
+    const now = this.now();
+    return this.state.scenarioRuns.map((r) => {
+      const def = this.scenarioDef(r.scenarioId) || r.def;
+      return { id: r.id, name: r.name, step: r.step + 1, steps: def ? def.steps.length : 0, inSec: Math.max(0, Math.round((r.nextAt - now) / 1000)) };
+    });
+  }
+
+  // =========================================================================
   // Коллективная жалоба в ЖЭК
   // =========================================================================
   petitionsNeeded() {
@@ -2450,6 +2560,7 @@ class Game extends EventEmitter {
     for (const list of Object.values(w.hazards)) for (const hz of list) if (hz.until) hz.until += ms;
     for (const a of this.state.assignments) if (!a.closed) a.until += ms;
     for (const c of w.climate || []) if (c.until) c.until += ms;
+    for (const r of this.state.scenarioRuns) r.nextAt += ms;
     if (w.radio && w.radio.silenceUntil) w.radio.silenceUntil += ms;
     for (const p of this.players()) {
       for (const c of p.conditions) if (c.until) c.until += ms;
@@ -3757,6 +3868,10 @@ class Game extends EventEmitter {
         const inRange = alive.filter((p) => p.apartment.floor >= a.from && p.apartment.floor <= a.to);
         return inRange.filter((p) => !!a.done[p.apartment.number] === (target.type === 'assignmentDone'));
       }
+      case 'ids': {
+        const ids = new Set((Array.isArray(target.ids) ? target.ids : []).map(String));
+        return alive.filter((p) => ids.has(p.id));
+      }
       case 'hasFurniture':
         return alive.filter((p) => (p.furniture || {})[target.item]);
       case 'techVisitors': {
@@ -4085,6 +4200,8 @@ class Game extends EventEmitter {
 // Команды админки. this — экземпляр Game.
 // ---------------------------------------------------------------------------
 const PALETTE_TYPES = ['conditions', 'accidents', 'items'];
+// Что можно ставить шагом сценария (без опасного: убийства, стирания, отката, учёток)
+const SCENARIO_CMDS = ['announce', 'whisper', 'custom', 'fog', 'fogEnd', 'radio', 'radioSilence', 'sound', 'infect', 'accident', 'aid', 'breakdown', 'power', 'hazard', 'hazardClear', 'climate', 'climateClear', 'objectVoice', 'ask', 'lamps', 'supply', 'cutlery', 'assign', 'puppetSay'];
 
 // Вещи с зарядом: заряд хранится у жильца (одна такая вещь на человека имеет смысл), но переходит с вещью
 const CHARGE_KEYS = Object.assign(Object.create(null), { gasmask: 'gasmaskCharge', flashlight: 'flashCharge' });
@@ -4121,7 +4238,7 @@ const ADMIN_COMMANDS = {
    *   repeat: 'none' | 'every' (каждые repeatMin минут) | 'daily' (каждые игровые сутки)
    */
   schedule({ cmd, args = {}, label, mode = 'in', value, repeat = 'none', repeatMin }) {
-    if (!ADMIN_COMMANDS[cmd] || ['schedule', 'unschedule', 'pause', 'erase', 'restoreHouse', 'restorePlayer', 'adminAdd', 'adminRemove', 'snapshot'].includes(cmd)) throw new Error('Эту команду нельзя поставить в расписание');
+    if (!ADMIN_COMMANDS[cmd] || ['schedule', 'unschedule', 'pause', 'erase', 'restoreHouse', 'restorePlayer', 'adminAdd', 'adminRemove', 'snapshot', 'scenarioSave', 'scenarioDelete'].includes(cmd)) throw new Error('Эту команду нельзя поставить в расписание');
     const now = this.timerNow();
     const gameMinMs = 1000; // каждый тик добавляет tickMs/1000 игровых минут: 1 игровая минута = 1 реальная секунда
     let at;
@@ -4654,6 +4771,43 @@ const ADMIN_COMMANDS = {
     for (const p of list) this.emit('sound', { to: p.id, kind, text: C.HOUSE_SOUNDS[kind] });
     this.log(`Звук в доме «${kind}»: ${list.map((p) => p.name).join(', ') || 'никто не услышал'}`, 'admin');
     return { ok: true, message: `Услышали: ${list.length}` };
+  },
+
+  /** Сохранить свой сценарий в библиотеку (id — новый или существующий свой). */
+  scenarioSave({ id, def }) {
+    const clean = this.cleanScenario(def);
+    const key = id && Object.hasOwn(this.state.scenarios, id) ? id : newId('sc');
+    if (!Object.hasOwn(this.state.scenarios, key) && Object.keys(this.state.scenarios).length >= 50) throw new Error('В библиотеке уже 50 сценариев');
+    this.state.scenarios[key] = clean;
+    this.emit('content_changed'); // шаги своих сценариев Пульт берёт из описания
+    return { ok: true, message: `Сценарий «${clean.name}» сохранён`, scenarioId: key };
+  },
+
+  scenarioDelete({ id }) {
+    if (!Object.hasOwn(this.state.scenarios, id)) throw new Error('Такого своего сценария нет');
+    delete this.state.scenarios[id];
+    this.emit('content_changed');
+    return { ok: true, message: 'Сценарий удалён' };
+  },
+
+  /** Запустить сценарий из библиотеки (или разовый — def без сохранения). */
+  scenarioStart({ id, def }) {
+    let scen = id ? this.scenarioDef(id) : null;
+    if (!scen && def) scen = this.cleanScenario(def);
+    if (!scen) throw new Error('Нет такого сценария');
+    if (this.state.scenarioRuns.length >= 10) throw new Error('Уже идёт 10 сценариев');
+    const run = { id: newId('sr'), scenarioId: id || null, def: id ? null : scen, name: scen.name, step: 0, nextAt: this.timerNow(), startedAt: this.now() };
+    this.state.scenarioRuns.push(run);
+    this.log(`Запущен сценарий «${scen.name}»`, 'schedule');
+    this.runScenarios(this.now());
+    return { ok: true, message: `Сценарий «${scen.name}» пошёл` };
+  },
+
+  scenarioStop({ id }) {
+    const before = this.state.scenarioRuns.length;
+    this.state.scenarioRuns = this.state.scenarioRuns.filter((r) => r.id !== id);
+    if (before === this.state.scenarioRuns.length) throw new Error('Такого идущего сценария нет');
+    return { ok: true, message: 'Сценарий остановлен' };
   },
 
   /** Поставить барыгу на технический этаж. */
@@ -5289,6 +5443,11 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
     archived: this.state.archive.length,
     director: this.director(),
     snapshots: this.snapshotsMeta(),
+    scenarioRuns: this.scenarioRunsView(),
+    scenarios: [
+      ...Object.entries(C.SCENARIOS).map(([id, d]) => ({ id, name: d.name, steps: d.steps.length, builtin: true })),
+      ...Object.entries(this.state.scenarios).map(([id, d]) => ({ id, name: d.name, steps: d.steps.length, builtin: false })),
+    ],
     assignments: this.state.assignments.map((a) => ({ ...this.assignmentView(a, null), closed: !!a.closed, failed: a.failed || [] })),
     petitions: this.state.petitions.filter((x) => x.status !== 'expired').map((x) => ({ ...this.petitionView(x, null), floor: x.floor })),
     hazards: Object.entries(this.world.hazards).flatMap(([key, list]) => list.map((hz) => ({ ...hz, scene: key, title: this.sceneTitle(key), name: C.HAZARDS[hz.kind].name }))),
@@ -5367,6 +5526,9 @@ Game.prototype.adminContent = function adminContent() {
     places: Object.fromEntries(MOVE_PLACES.map((k) => [k, C.PLACES[k].name])),
     hazards: Object.fromEntries(Object.entries(C.HAZARDS).map(([k, v]) => [k, v.name])),
     climates: Object.fromEntries(Object.entries(C.CLIMATES).map(([k, v]) => [k, v.name])),
+    presets: C.CUSTOM_PRESETS,
+    scenarios: { ...C.SCENARIOS, ...this.state.scenarios },
+    scenarioCmds: SCENARIO_CMDS,
     shopNames: Object.fromEntries(Object.keys(C.SHOPS).flatMap((shop) => this.shopEntries(shop).map((e) => [e.key, e.name]))),
     palette: this.state.palette,
     world: WORLD_CONFIG,

@@ -58,6 +58,7 @@
       <button class="tab" data-tab="events">События дома</button>
       <button class="tab" data-tab="eye">Глазок</button>
       <button class="tab" data-tab="schedule">Расписание</button>
+      <button class="tab" data-tab="scenarios">Сценарии</button>
       <button class="tab" data-tab="log">Журнал</button>
       <button class="tab" data-tab="radio">Чаты</button>
       <button class="tab" data-tab="palette">Палитра бед</button>
@@ -202,6 +203,19 @@
           </div>
         </div>
       </section>
+      <section class="tab-page" id="tab-scenarios" hidden>
+        <div class="gods-layout">
+          <div class="panel">
+            <h2>Библиотека</h2>
+            <p class="hint">Сценарий — цепочка «подождать — сделать — проверить». Шаг «сделать» — любая команда Пульта, с фильтром: только тем, у кого мало здоровья, кто болен, у кого открыта дверь… Встроенные можно открыть, изменить и сохранить как свои.</p>
+            <ul class="hazard-list" id="scen-list"></ul>
+            <h2>Идут сейчас</h2>
+            <ul class="hazard-list" id="scen-runs"></ul>
+          </div>
+          <div class="panel" id="scen-editor"></div>
+        </div>
+      </section>
+
       <section class="tab-page" id="tab-gods" hidden>
         <div class="gods-layout">
           <div class="panel">

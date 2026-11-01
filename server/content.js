@@ -214,6 +214,55 @@ const HOUSE_SOUNDS = {
   whisper: 'Шёпот. Слов не разобрать.',
 };
 
+// Заготовки «своего события» для Пульта (переехали сюда из admin.js)
+const CUSTOM_PRESETS = {
+  pipe: { title: 'Прорвало трубу', text: 'Из стены с рёвом бьёт кипяток. Пар заполняет коридор.', style: 'danger', target: 'floors', effect: { health: -10, sanity: -5 } },
+  parcel: { title: 'Посылка', text: 'Под дверью стоит коробка без обратного адреса. Внутри — банка тушёнки.', style: 'good', target: 'random', effect: {}, item: ['stew', 1] },
+  fee: { title: 'Сбор на ремонт лифта', text: 'ЖЭК удержал взнос на ремонт лифта. Лифт, разумеется, не починят.', style: 'announce', target: 'all', effect: { money: -2 } },
+  silence: { title: 'Тишина', text: 'На целую минуту все звуки в доме исчезли. Даже ваше дыхание.', style: 'whisper', target: 'online', effect: { sanity: -15 } },
+  feast: { title: 'Праздничный обед', text: 'В честь годовщины корпуса всем выдали по пирожку с капустой.', style: 'good', target: 'all', effect: { hunger: 30, sanity: 10 } },
+  mold: { title: 'Чёрная плесень', text: 'Стены покрылись чёрными пятнами. Дышать тяжело, в горле першит.', style: 'danger', target: 'floors', effect: { health: -5 }, condition: 'cough' },
+};
+
+/**
+ * Сценарии-цепочки: шаги «ждать» (wait), «сделать» (do: команда Пульта, можно с фильтром жильцов) и
+ * «остановить, если никого» (stopIfNone). Фильтр: stat/op/value, condition, item+has, sealed, atHome, online.
+ * Это встроенная библиотека; свои сценарии ЖЭК хранит в мире.
+ */
+const SCENARIOS = {
+  doorCheck: {
+    name: 'Проверка гермодверей',
+    steps: [
+      { kind: 'do', cmd: 'announce', args: { title: 'Объявление ЖЭК', text: 'Через три минуты ЖЭК проверит гермодвери жилых этажей. Двери держать задраенными.' } },
+      { kind: 'wait', minutes: 3 },
+      { kind: 'do', cmd: 'custom', target: { type: 'homeFloors', from: 101, to: 999 }, filter: { atHome: true, sealed: false }, args: { title: 'Штраф ЖЭК', text: 'При проверке ваша гермодверь была открыта. Штраф.', style: 'warn', effect: { money: -2 } } },
+    ],
+  },
+  quietFog: {
+    name: 'Тихий туман',
+    steps: [
+      { kind: 'do', cmd: 'radioSilence', args: { minutes: 6 } },
+      { kind: 'wait', minutes: 2 },
+      { kind: 'do', cmd: 'sound', args: { target: { type: 'floors', from: 101, to: 105 }, kind: 'cry' } },
+      { kind: 'wait', minutes: 1 },
+      { kind: 'do', cmd: 'fog', args: { from: 101, to: 105, warnSec: 20, durationMin: 3, intensity: 1 } },
+      { kind: 'wait', minutes: 4 },
+      { kind: 'do', cmd: 'aid', target: { type: 'floors', from: 101, to: 105 }, filter: { stat: 'health', op: '<', value: 60 }, args: { title: 'Обход фельдшера', text: 'После тумана фельдшер обошёл этажи и оставил бинт.', money: 0, items: { bandage: 1 } } },
+    ],
+  },
+  epidemic: {
+    name: 'Эпидемия и помощь',
+    steps: [
+      { kind: 'do', cmd: 'infect', args: { target: { type: 'random', count: 2, online: true }, condition: 'flu' } },
+      { kind: 'wait', minutes: 5 },
+      { kind: 'stopIfNone', target: { type: 'all' }, filter: { condition: 'flu' } },
+      { kind: 'do', cmd: 'announce', args: { title: 'Объявление ЖЭК', text: 'В доме грипп. Таблетки — в медпункте. Больных просят не выходить на смену.' } },
+      { kind: 'wait', minutes: 10 },
+      { kind: 'do', cmd: 'aid', target: { type: 'all' }, filter: { condition: 'flu' }, args: { title: 'Таблетки от ЖЭК', text: 'Больным гриппом выдали таблетки.', money: 0, items: { pills: 1 } } },
+    ],
+  },
+};
+
 // Порча еды: за ночь (в полночь) свежее становится несвежим. Сухари и тушёнка вечны.
 // «Туманной» еда становится только от тумана, который наслал бог (если лежала за окном).
 const SPOIL = { bread: 'stale_bread', kissel: 'sour_kissel' };
@@ -452,4 +501,5 @@ module.exports = {
   BUILDING, FACILITIES, BALANCE, ITEMS, SHOPS, CONDITIONS, ACCIDENTS, PLACES, BREAKDOWNS, HALLUCINATIONS,
   HALLUCINATION_VOICES, RESERVED_NAMES, ARCHIVE_DEAD_AFTER_H, NOTES, RANKS, TUTORIAL, ECHO_PHRASES, HAZARDS,
   LORE, RADIO, DEEDS, SPOIL, FOGGED, SIDE_JOBS, BARYGA_PRICES, STASH_LOOT, CLIMATES, HOUSE_SOUNDS, BARYGA_SELLS,
+  CUSTOM_PRESETS, SCENARIOS,
 };

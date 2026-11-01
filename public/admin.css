@@ -185,3 +185,13 @@ table.players tbody tr.down td { background: rgba(221,90,79,0.14); }
 #god-log .args { color: var(--muted); font-family: var(--mono); font-size: 11px; word-break: break-all; }
 #admin-add input, #admin-add select { flex: 1; min-width: 90px; }
 @media (max-width: 900px) { .gods-layout { grid-template-columns: 1fr; } }
+
+/* Сценарии */
+.scen-steps { margin: 6px 0 12px 18px; padding: 0; display: grid; gap: 4px; font-size: 13px; }
+.scen-steps li { padding: 4px 6px; background: var(--panel-2); border-radius: var(--radius); }
+.scen-steps li .txt { margin-right: 6px; }
+.scen-add { border-top: 1px dashed var(--line); padding-top: 8px; margin-top: 8px; }
+.scen-add h3 { font-size: 12px; text-transform: uppercase; color: var(--muted); letter-spacing: .05em; }
+.scen-add .row input[type=number] { width: 70px; flex: 0 0 70px; }
+.scen-json { font-family: var(--mono); font-size: 12px; }
+#scen-editor label.f { display: grid; gap: 3px; font-size: 12px; color: var(--muted); margin-bottom: 8px; }

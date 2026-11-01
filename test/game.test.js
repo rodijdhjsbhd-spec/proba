@@ -2288,3 +2288,46 @@ test('барыга продаёт мебель и монтировку — по 
   assert.equal(game.barygaBuy(p, 'gasmask').ok, false, 'такого не держит');
   assert.ok(game.barygaOffer(p).sells.some((x) => x.id === 'torchere'));
 });
+
+test('сценарий «Проверка гермодверей»: объявление, ожидание, штраф только тем, у кого дома дверь открыта', () => {
+  const { game, advance } = makeWorld();
+  const open = join(game, 'Иван');
+  const closed = join(game, 'Мария');
+  const away = join(game, 'Пётр');
+  for (const p of [open, closed, away]) p.money = 10;
+  game.admin('teleport', { id: away.id, place: 'canteen' });
+  walkTo(game, closed, type('hermodoor'));
+  game.seal(closed, true);
+  assert.equal(game.admin('scenarioStart', { id: 'doorCheck' }).ok, true);
+  assert.equal(game.adminSnapshot().scenarioRuns[0].step, 3, 'объявление прошло, ждём перед третьим шагом');
+  advance(3 * 60 * 1000 + 1000);
+  assert.equal(open.money, 8, 'штраф');
+  assert.equal(closed.money, 10, 'дверь задраена');
+  assert.equal(away.money, 10, 'не дома');
+  assert.equal(game.state.scenarioRuns.length, 0, 'сценарий закончился');
+});
+
+test('сценарий: остановиться, если никто не подходит; свой сценарий — проверка и библиотека', () => {
+  const { game, advance } = makeWorld();
+  const p = join(game, 'Иван');
+  const r = game.admin('scenarioSave', {
+    def: { name: 'Проверка', steps: [{ kind: 'stopIfNone', filter: { condition: 'flu' } }, { kind: 'do', cmd: 'announce', args: { text: 'Грипп!' } }] },
+  });
+  assert.equal(r.ok, true, r.error);
+  const chat = [];
+  game.on('chat', (m) => chat.push(m.text));
+  game.admin('scenarioStart', { id: r.scenarioId });
+  assert.equal(chat.some((t) => /Грипп/.test(t)), false, 'никто не болен — стоп');
+  game.admin('infect', { target: { type: 'player', id: p.id }, condition: 'flu' });
+  game.admin('scenarioStart', { id: r.scenarioId });
+  assert.ok(chat.some((t) => /Грипп/.test(t)));
+  assert.equal(game.admin('scenarioSave', { def: { name: 'Плохой', steps: [{ kind: 'do', cmd: 'kill', args: {} }] } }).ok, false, 'убийство в сценарий не ставится');
+  assert.ok(game.adminSnapshot().scenarios.some((x) => x.name === 'Проверка' && !x.builtin));
+  // остановка идущего
+  game.admin('scenarioStart', { id: 'quietFog' });
+  const run = game.state.scenarioRuns[0];
+  assert.equal(game.admin('scenarioStop', { id: run.id }).ok, true);
+  advance(1000);
+  assert.equal(game.state.scenarioRuns.length, 0);
+  assert.ok(C.CUSTOM_PRESETS.pipe, 'заготовки — в content.js');
+});

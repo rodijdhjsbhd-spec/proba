@@ -390,6 +390,7 @@
     buildPalette();
     initEye();
     initGods();
+    initScenarios();
   }
 
   function switchTab(name) {
@@ -873,17 +874,9 @@
   }
 
   // Заготовки для произвольного события
-  const PRESETS = {
-    pipe: { title: 'Прорвало трубу', text: 'Из стены с рёвом бьёт кипяток. Пар заполняет коридор.', style: 'danger', target: 'floors', effect: { health: -10, sanity: -5 } },
-    parcel: { title: 'Посылка', text: 'Под дверью стоит коробка без обратного адреса. Внутри — банка тушёнки.', style: 'good', target: 'random', effect: {}, item: ['stew', 1] },
-    fee: { title: 'Сбор на ремонт лифта', text: 'ЖЭК удержал взнос на ремонт лифта. Лифт, разумеется, не починят.', style: 'announce', target: 'all', effect: { money: -2 } },
-    silence: { title: 'Тишина', text: 'На целую минуту все звуки в доме исчезли. Даже ваше дыхание.', style: 'whisper', target: 'online', effect: { sanity: -15 } },
-    feast: { title: 'Праздничный обед', text: 'В честь годовщины корпуса всем выдали по пирожку с капустой.', style: 'good', target: 'all', effect: { hunger: 30, sanity: 10 } },
-    mold: { title: 'Чёрная плесень', text: 'Стены покрылись чёрными пятнами. Дышать тяжело, в горле першит.', style: 'danger', target: 'floors', effect: { health: -5 }, condition: 'cough' },
-  };
-
   function buildCustomEvent() {
     const C = A.content;
+    const PRESETS = C.presets || {}; // заготовки живут в server/content.js
     const preset = select([['', '— заготовки —'], ...Object.entries(PRESETS).map(([k, v]) => [k, v.title])]);
     const target = targetPicker('all');
     const title = h('input', { placeholder: 'Название', maxlength: '80' });
@@ -986,6 +979,7 @@
       });
     }
     renderSnapshots();
+    renderScenarios();
     if (A.barygaInfo) {
       const b = s.world.baryga;
       const pl = s.world.plan;
@@ -1919,6 +1913,250 @@
         }),
       );
     });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Сценарии-цепочки: библиотека, идущие, редактор шагов
+  // ---------------------------------------------------------------------------
+  const SC = { editing: null, name: 'Новый сценарий', steps: [] };
+  const STEP_KINDS = [
+    ['wait', 'Ждать'],
+    ['announce', 'Объявление'],
+    ['whisper', 'Шёпот'],
+    ['custom', 'Своё событие'],
+    ['aid', 'Помощь'],
+    ['infect', 'Болезнь'],
+    ['fog', 'Туман'],
+    ['radio', 'Радиоточка в эфир'],
+    ['radioSilence', 'Тишина в эфире'],
+    ['sound', 'Звук в доме'],
+    ['stopIfNone', 'Остановить, если никто не подходит'],
+  ];
+  const FILTERS = [
+    ['', 'всем'],
+    ['hp', 'у кого здоровье ниже…'],
+    ['cond', 'кто болен…'],
+    ['noitem', 'у кого нет предмета…'],
+    ['item', 'у кого есть предмет…'],
+    ['open', 'кто дома с открытой дверью'],
+    ['home', 'кто дома'],
+    ['online', 'кто в сети'],
+  ];
+
+  function filterText(f) {
+    if (!f) return '';
+    const C = A.content;
+    const parts = [];
+    if (f.stat) parts.push(`${{ health: 'здоровье', hunger: 'сытость', energy: 'силы', sanity: 'рассудок' }[f.stat]} ${f.op} ${f.value}`);
+    if (f.condition) parts.push(`болен: ${C.conditions[f.condition]?.name || f.condition}`);
+    if (f.item) parts.push(`${f.has === false ? 'нет' : 'есть'}: ${C.items[f.item]?.name || f.item}`);
+    if (f.sealed === false) parts.push('дверь открыта');
+    if (f.atHome) parts.push('дома');
+    if (f.online) parts.push('в сети');
+    return parts.length ? ` · только: ${parts.join(', ')}` : '';
+  }
+
+  function targetText(t) {
+    if (!t) return '';
+    return ` · ${{ all: 'все', online: 'в сети', floors: `на этажах ${t.from}–${t.to}`, homeFloors: `живут на ${t.from}–${t.to}`, random: `случайные ${t.count}`, player: 'жилец', ids: 'выбранные' }[t.type] || t.type}`;
+  }
+
+  function stepText(st) {
+    if (st.kind === 'wait') return `⏱ ждать ${st.minutes} мин`;
+    if (st.kind === 'stopIfNone') return `⛔ остановить, если никто не подходит${targetText(st.target)}${filterText(st.filter)}`;
+    const a = st.args || {};
+    const name = (STEP_KINDS.find(([k]) => k === st.cmd) || [st.cmd, st.cmd])[1];
+    const detail = a.text || a.title || (st.cmd === 'fog' ? `этажи ${a.from}–${a.to}, ${a.durationMin} мин` : st.cmd === 'infect' ? A.content.conditions[a.condition]?.name : st.cmd === 'sound' ? a.kind : st.cmd === 'radioSilence' ? `${a.minutes} мин` : '');
+    return `▶ ${name}${detail ? `: ${String(detail).slice(0, 60)}` : ''}${targetText(st.target || a.target)}${filterText(st.filter)}`;
+  }
+
+  function initScenarios() {
+    renderScenarioEditor();
+  }
+
+  function renderScenarios() {
+    const lib = A.snap.scenarios || [];
+    memo('scenLib', lib, () => {
+      $('#scen-list').replaceChildren(
+        ...lib.map((x) =>
+          h(
+            'li',
+            null,
+            h('span', { class: 'txt' }, h('b', { text: x.name }), ` · шагов: ${x.steps}${x.builtin ? ' · встроенный' : ''}`),
+            button('Запустить', () => cmd('scenarioStart', { id: x.id }), 'small primary'),
+            button('В редактор', () => loadScenario(x), 'small'),
+            x.builtin ? null : button('✕', () => confirm(`Удалить сценарий «${x.name}»?`) && cmd('scenarioDelete', { id: x.id }), 'small'),
+          ),
+        ),
+      );
+    });
+    const runs = A.snap.scenarioRuns || [];
+    memo('scenRuns', runs.map((r) => [r.id, r.step, Math.ceil(r.inSec / 5)]), () => {
+      $('#scen-runs').replaceChildren(
+        ...(runs.length
+          ? runs.map((r) => h('li', null, h('span', { class: 'txt' }, h('b', { text: r.name }), ` · шаг ${Math.min(r.step, r.steps)} из ${r.steps}${r.inSec ? ` · через ${fmtSec(r.inSec)}` : ''}`), button('Остановить', () => cmd('scenarioStop', { id: r.id }), 'small')))
+          : [h('li', { class: 'calm', text: 'Сценарии не идут.' })]),
+      );
+    });
+  }
+
+  /** Шаги сценария приходят в описании Пульта (встроенные — из content.js, свои — из мира). */
+  function loadScenario(x) {
+    const def = (A.content.scenarios || {})[x.id];
+    if (!def) return toast('Шаги этого сценария недоступны', 'error');
+    SC.editing = x.builtin ? null : x.id;
+    SC.name = x.builtin ? `${def.name} (копия)` : def.name;
+    SC.steps = JSON.parse(JSON.stringify(def.steps));
+    renderScenarioEditor();
+    return undefined;
+  }
+
+  function renderScenarioEditor() {
+    const C = A.content;
+    const box = $('#scen-editor');
+    const nameInp = h('input', { maxlength: '60', value: SC.name, oninput: () => (SC.name = nameInp.value) });
+    const list = h(
+      'ol',
+      { class: 'scen-steps' },
+      SC.steps.map((st, i) =>
+        h(
+          'li',
+          null,
+          h('span', { class: 'txt', text: stepText(st) }),
+          i ? button('↑', () => { [SC.steps[i - 1], SC.steps[i]] = [SC.steps[i], SC.steps[i - 1]]; renderScenarioEditor(); }, 'small') : null,
+          button('✕', () => { SC.steps.splice(i, 1); renderScenarioEditor(); }, 'small'),
+        ),
+      ),
+    );
+    const kind = select(STEP_KINDS, 'wait');
+    const minutes = num(3, { min: 0, max: 1440 });
+    const title = h('input', { maxlength: '80', placeholder: 'Заголовок' });
+    const text = h('textarea', { maxlength: '300', placeholder: 'Текст' });
+    const preset = select([['', '— заготовка —'], ...Object.entries(C.presets || {}).map(([k, v]) => [k, v.title])]);
+    const tType = select([['all', 'все'], ['online', 'кто в сети'], ['floors', 'кто сейчас на этажах'], ['homeFloors', 'кто живёт на этажах'], ['random', 'случайные']], 'all');
+    const tFrom = num(C.building.firstResidentialFloor, { min: 1, max: 999 });
+    const tTo = num(C.building.firstResidentialFloor + 4, { min: 1, max: 999 });
+    const tCount = num(2, { min: 1, max: 99 });
+    const fType = select(FILTERS, '');
+    const fVal = num(50, { min: 0, max: 100 });
+    const fCond = select(opts(C.conditions));
+    const fItem = select(opts(C.items));
+    const eHealth = num(0), eSanity = num(0), eMoney = num(0);
+    const aidItem = select(opts(C.items, '— без предмета —'));
+    const cond = select(opts(C.conditions));
+    const sound = select([['bang', 'Удары'], ['scrape', 'Скрежет'], ['cry', 'Плач за стеной'], ['steps', 'Шаги над головой'], ['whisper', 'Шёпот']], 'cry');
+    const fogFrom = num(C.building.firstResidentialFloor, { min: 1, max: 999 });
+    const fogTo = num(C.building.firstResidentialFloor + 4, { min: 1, max: 999 });
+    const fogWarn = num(30, { min: 0, max: 600 }), fogDur = num(3, { min: 0.5, max: 120 });
+    preset.addEventListener('change', () => {
+      const pr = (C.presets || {})[preset.value];
+      if (!pr) return;
+      title.value = pr.title;
+      text.value = pr.text;
+      eHealth.value = pr.effect.health || 0;
+      eSanity.value = pr.effect.sanity || 0;
+      eMoney.value = pr.effect.money || 0;
+    });
+    const rows = {
+      minutes: field('Минут', minutes),
+      preset: field('Заготовка', preset),
+      title: field('Заголовок (для шёпота — от кого)', title),
+      text: field('Текст', text),
+      target: h('div', { class: 'row' }, 'Кому:', tType, 'этажи', tFrom, tTo, 'сколько', tCount),
+      filter: h('div', { class: 'row' }, 'Только:', fType, fVal, fCond, fItem),
+      effect: h('div', { class: 'row' }, '❤', eHealth, '🧠', eSanity, '₸', eMoney),
+      aid: h('div', { class: 'row' }, 'предмет', aidItem),
+      cond: field('Болезнь', cond),
+      sound: field('Звук', sound),
+      fog: h('div', { class: 'row' }, 'этажи', fogFrom, fogTo, 'сирена, с', fogWarn, 'мин', fogDur),
+    };
+    const USES = {
+      wait: ['minutes'],
+      announce: ['title', 'text'],
+      whisper: ['target', 'filter', 'title', 'text'],
+      custom: ['preset', 'target', 'filter', 'title', 'text', 'effect'],
+      aid: ['target', 'filter', 'title', 'text', 'effect', 'aid'],
+      infect: ['target', 'filter', 'cond'],
+      fog: ['fog'],
+      radio: ['text'],
+      radioSilence: ['minutes'],
+      sound: ['target', 'filter', 'sound'],
+      stopIfNone: ['target', 'filter'],
+    };
+    const sync = () => {
+      const use = USES[kind.value] || [];
+      for (const [k, el] of Object.entries(rows)) el.hidden = !use.includes(k);
+      fVal.hidden = fType.value !== 'hp';
+      fCond.hidden = fType.value !== 'cond';
+      fItem.hidden = !['item', 'noitem'].includes(fType.value);
+    };
+    kind.addEventListener('change', sync);
+    fType.addEventListener('change', sync);
+    sync();
+    const target = () => ({ type: tType.value, ...(['floors', 'homeFloors'].includes(tType.value) ? { from: tFrom.value, to: tTo.value } : {}), ...(tType.value === 'random' ? { count: tCount.value } : {}) });
+    const filter = () => {
+      switch (fType.value) {
+        case 'hp': return { stat: 'health', op: '<', value: fVal.value };
+        case 'cond': return { condition: fCond.value };
+        case 'item': return { item: fItem.value, has: true };
+        case 'noitem': return { item: fItem.value, has: false };
+        case 'open': return { atHome: true, sealed: false };
+        case 'home': return { atHome: true };
+        case 'online': return { online: true };
+        default: return undefined;
+      }
+    };
+    const addStep = () => {
+      const k = kind.value;
+      const withWho = (st) => {
+        st.target = target();
+        const f = filter();
+        if (f) st.filter = f;
+        return st;
+      };
+      let st;
+      if (k === 'wait') st = { kind: 'wait', minutes: Number(minutes.value) || 0 };
+      else if (k === 'stopIfNone') st = withWho({ kind: 'stopIfNone' });
+      else if (k === 'announce') st = { kind: 'do', cmd: 'announce', args: { title: title.value || 'Объявление ЖЭК', text: text.value } };
+      else if (k === 'radio') st = { kind: 'do', cmd: 'radio', args: { text: text.value, now: true } };
+      else if (k === 'radioSilence') st = { kind: 'do', cmd: 'radioSilence', args: { minutes: Number(minutes.value) || 5 } };
+      else if (k === 'fog') st = { kind: 'do', cmd: 'fog', args: { from: fogFrom.value, to: fogTo.value, warnSec: fogWarn.value, durationMin: fogDur.value, intensity: 1 } };
+      else if (k === 'whisper') st = withWho({ kind: 'do', cmd: 'whisper', args: { from: title.value || 'Голос за стеной', text: text.value } });
+      else if (k === 'custom') st = withWho({ kind: 'do', cmd: 'custom', args: { title: title.value || 'Происшествие', text: text.value, style: 'danger', effect: { health: Number(eHealth.value) || 0, sanity: Number(eSanity.value) || 0, money: Number(eMoney.value) || 0 } } });
+      else if (k === 'aid') st = withWho({ kind: 'do', cmd: 'aid', args: { title: title.value || 'Помощь ЖЭК', text: text.value || 'ЖЭК выдал помощь.', money: Number(eMoney.value) || 0, items: aidItem.value ? { [aidItem.value]: 1 } : {} } });
+      else if (k === 'infect') st = withWho({ kind: 'do', cmd: 'infect', args: { condition: cond.value } });
+      else if (k === 'sound') st = withWho({ kind: 'do', cmd: 'sound', args: { kind: sound.value } });
+      if (!st) return;
+      SC.steps.push(st);
+      SC.name = nameInp.value;
+      renderScenarioEditor();
+    };
+    const json = h('textarea', { rows: '8', class: 'scen-json' });
+    json.value = JSON.stringify(SC.steps, null, 1);
+    box.replaceChildren(
+      h('h2', { text: SC.editing ? 'Свой сценарий' : 'Новый сценарий' }),
+      field('Название', nameInp),
+      SC.steps.length ? list : h('p', { class: 'hint', text: 'Пока ни одного шага. Добавьте их ниже.' }),
+      h('div', { class: 'scen-add' }, h('h3', { text: 'Добавить шаг' }), field('Что', kind), ...Object.values(rows), actions(button('Добавить шаг', addStep, 'small'))),
+      actions(
+        button('Сохранить в библиотеку', async () => {
+          const r = await cmd('scenarioSave', { id: SC.editing, def: { name: nameInp.value, steps: SC.steps } });
+          if (r.ok && r.scenarioId) SC.editing = r.scenarioId;
+        }, 'primary'),
+        button('Запустить без сохранения', () => cmd('scenarioStart', { def: { name: nameInp.value, steps: SC.steps } })),
+        button('Новый', () => { SC.editing = null; SC.name = 'Новый сценарий'; SC.steps = []; renderScenarioEditor(); }),
+      ),
+      h('details', { class: 'sched' }, h('summary', { text: 'Шаги в JSON (для тонкой правки)' }), json, actions(button('Применить JSON', () => {
+        try {
+          const steps = JSON.parse(json.value);
+          if (!Array.isArray(steps)) throw new Error('нужен массив шагов');
+          SC.steps = steps;
+          renderScenarioEditor();
+        } catch (err) {
+          toast(`JSON: ${err.message}`, 'error');
+        }
+      }, 'small'))),
+    );
   }
 
   // ---------------------------------------------------------------------------
