@@ -822,6 +822,7 @@ test('без сознания: не помогли — смерть; обшар�
   for (const p of [victim, thief, saver]) game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
   victim.money = 9;
   game.addItem(victim, 'stew', 3);
+  victim.createdAt -= (C.BALANCE.newbieProtectionH + 1) * 3600 * 1000; // уже не новосёл
   assert.equal(game.rob(thief, victim.id).ok, false, 'в сознании не обшарить');
   game.admin('custom', { target: { type: 'player', id: victim.id }, title: 'Обвал', effect: { health: -200 } });
   assert.ok(victim.down);
@@ -1036,4 +1037,82 @@ test('воскрешение всегда даёт уникальное имя',
   game.admin('revive', { id: a.id });
   const names = game.alivePlayers().map((p) => p.name);
   assert.equal(new Set(names).size, names.length, names.join(' | '));
+});
+
+test('лимит смен за реальный час', () => {
+  const { game, clock } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'factory' });
+  walkTo(game, p, (o) => o.type === 'station' && o.game === 'sort');
+  for (let i = 0; i < C.BALANCE.shiftsPerHour; i++) {
+    p.stats.energy = 100;
+    const r = game.workStart(p, 'sort');
+    assert.equal(r.ok, true, `смена ${i + 1}`);
+    game.workCancel(p);
+  }
+  p.stats.energy = 100;
+  const over = game.workStart(p, 'sort');
+  assert.equal(over.ok, false);
+  assert.match(over.error, /Норму на этот час/);
+  clock.t += 3600 * 1000 + 1000;
+  assert.equal(game.workStart(p, 'sort').ok, true, 'через час снова можно');
+});
+
+test('карманник в темноте: только без света, не у новосёла, неудача выдаёт вора', () => {
+  const { game, clock } = makeWorld({ random: () => 0.9 }); // 0.9 ≥ шанса — неудача
+  const thief = join(game, 'Пётр');
+  const victim = join(game, 'Иван');
+  for (const p of [thief, victim]) game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  victim.money = 5;
+  assert.equal(game.pickpocket(thief, victim.id).ok, false, 'светло');
+  game.admin('power', { on: false, from: 101, to: 101 });
+  assert.equal(game.pickpocket(thief, victim.id).ok, false, 'новосёл под защитой');
+  victim.createdAt -= (C.BALANCE.newbieProtectionH + 1) * 3600 * 1000;
+  const notes = [];
+  game.on('notify', (n) => notes.push(n));
+  const fail = game.pickpocket(thief, victim.id);
+  assert.match(fail.message, /схватил вас за руку/);
+  assert.match(notes.find((n) => n.to.includes(victim.id)).text, /Пётр/);
+  assert.equal(victim.money, 5);
+  assert.equal(game.pickpocket(thief, victim.id).ok, false, 'не так часто');
+  clock.t += 61000;
+  game.random = () => 0.1; // удача
+  const ok = game.pickpocket(thief, victim.id);
+  assert.match(ok.message, /Добыча/);
+  assert.ok(victim.money < 5);
+});
+
+test('дилемма ЖЭК: вопрос с вариантами, ответ — в журнал Пульта', () => {
+  const { game } = makeWorld();
+  const p = join(game, 'Иван');
+  assert.equal(game.admin('ask', { target: { type: 'player', id: p.id }, question: 'Сдать соседа?', options: ['Да'] }).ok, false, 'нужно два варианта');
+  const notes = [];
+  game.on('notify', (n) => notes.push(n));
+  assert.equal(game.admin('ask', { target: { type: 'player', id: p.id }, question: 'Сдать соседа?', options: ['Да', 'Нет', 'Промолчать'] }).ok, true);
+  const ask = notes[0].ask;
+  assert.deepEqual(ask.options, ['Да', 'Нет', 'Промолчать']);
+  assert.equal(game.playerView(p).you.asks.length, 1);
+  assert.equal(game.answer(p, ask.id, 1).ok, true);
+  assert.ok(game.state.log.some((e) => e.kind === 'answer' && /ответил: «Нет»/.test(e.text)));
+  assert.equal(game.answer(p, ask.id, 0).ok, false, 'второй раз — нет');
+});
+
+test('счётчик бед за час в Пульте и пометка смертельных случаев', () => {
+  const { game } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('accident', { id: p.id, accident: 'slip' });
+  game.admin('infect', { target: { type: 'player', id: p.id }, condition: 'flu' });
+  assert.equal(game.adminSnapshot().players[0].harmsHour, 2);
+  assert.match(game.adminContent().accidents.liftShaft.name, /смертельно/);
+});
+
+test('смена, прерванная перезапуском сервера, возвращает силы', () => {
+  const { game } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'factory' });
+  walkTo(game, p, (o) => o.type === 'station' && o.game === 'sort');
+  const before = p.stats.energy;
+  game.workStart(p, 'sort');
+  const g2 = new (require('../server/game').Game)(JSON.parse(JSON.stringify(game.state)));
+  assert.equal(Math.round(g2.getPlayer(p.id).stats.energy), Math.round(before));
 });

@@ -484,6 +484,28 @@
       args: () => (whText.value.trim() ? { target: whTarget.get(), from: whFrom.value, text: whText.value } : (toast('Сначала напишите, что шепнуть', 'error'), null)),
     });
 
+    // --- Дилемма ---
+    const askTarget = targetPicker('player');
+    const askFrom = h('input', { value: 'ЖЭК', maxlength: '40' });
+    const askQ = h('textarea', { maxlength: '300', placeholder: 'Ваш сосед из 10103 нарушает режим. Сообщить?' });
+    const askOpts = h('textarea', { maxlength: '200', rows: '3', placeholder: 'Да, сообщу\nНет\nПромолчу' });
+    const askTimeout = num(5, { min: 1, max: 600 });
+    const askArgs = () => ({ target: askTarget.get(), from: askFrom.value, question: askQ.value, options: askOpts.value.split('\n'), timeoutMin: askTimeout.value });
+    grid.append(
+      card(
+        'Дилемма',
+        'Вопрос жильцу с 2–3 вариантами (по строке на вариант). Ответы — в журнале, фильтр «Ответы». Последствия решаете вы.',
+        'whisper-card',
+        askTarget.el,
+        field('От кого', askFrom),
+        field('Вопрос', askQ),
+        field('Варианты ответа (по строке)', askOpts),
+        field('Сколько минут вопрос ждёт ответа', askTimeout),
+        actions(button('Спросить', () => cmd('ask', askArgs()), 'primary')),
+      ),
+    );
+    withSchedule(grid.lastElementChild, { label: () => `Дилемма: ${askQ.value.slice(0, 40)}`, cmd: 'ask', args: askArgs });
+
     // --- Произвольное событие ---
     grid.append(buildCustomEvent());
     withSchedule(grid.lastElementChild, { label: () => A.customEvent.label(), cmd: 'custom', args: () => A.customEvent.args() });
@@ -758,7 +780,7 @@
     const id = p.id;
     A.card = {};
     A.memo.cardDyn = null;
-    const header = h('div', null, (A.card.title = h('h2')), (A.card.meta = h('div', { class: 'card-meta' })));
+    const header = h('div', null, (A.card.title = h('h2')), (A.card.meta = h('div', { class: 'card-meta' })), (A.card.harm = h('div', { class: 'card-meta' })));
     const dyn = (A.card.dyn = h('div'));
 
     if (!p.alive) {
@@ -923,7 +945,9 @@
   function fillCard(p) {
     if (!A.card) return;
     A.card.title.textContent = p.name;
-    A.card.meta.textContent = `кв. ${p.apartment.number} · ${p.online ? 'в сети' : 'не в сети'} · смен отработано: ${p.shifts} · ${p.account ? `паспорт «${p.account}»` : 'без паспорта'}${p.mutedMin ? ` · заглушён ещё ${p.mutedMin} мин` : ''}${p.banned ? ' · ЗАБАНЕН' : ''}`;
+    A.card.meta.textContent = `кв. ${p.apartment.number} · ${p.online ? 'в сети' : 'не в сети'} · смен отработано: ${p.shifts} · ${p.account ? `паспорт «${p.account}»` : 'без паспорта'}${p.newbie ? ' · новосёл' : ''}${p.mutedMin ? ` · заглушён ещё ${p.mutedMin} мин` : ''}${p.banned ? ' · ЗАБАНЕН' : ''}`;
+    A.card.harm.textContent = p.harmsHour ? `Бед от ЖЭК за час: ${p.harmsHour}${p.harmsHour >= 3 ? ' — не слишком ли часто одному?' : ''}` : '';
+    A.card.harm.className = `card-meta${p.harmsHour >= 3 ? ' harm-warn' : ''}`;
     A.card.dyn.replaceChildren(
       h('p', { class: 'card-meta', text: `Где: ${whereText(p)}` }),
       ...(p.alive

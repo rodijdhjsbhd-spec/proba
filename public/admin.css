@@ -108,3 +108,5 @@ textarea { width: 100%; resize: vertical; min-height: 60px; }
 .hint { color: var(--muted); font-size: 13px; }
 .chat-log .mod-tools { margin-left: 8px; display: inline-flex; gap: 4px; }
 .admin-log .report { border-color: #ff8a5c; color: #ffc9b0; }
+.card-meta.harm-warn { color: #ffb3ab; font-weight: 700; }
+.admin-log .answer { border-color: var(--violet); }

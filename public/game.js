@@ -71,6 +71,8 @@
     job: null,
     sound: store.get('gh_sound') !== 'off',
     retry: 0,
+    shownAsks: new Set(), // вопросы ЖЭК, которые уже показаны
+    lastHourBucket: null, // для сигналов радиоточки в 06:00 и 22:00
     regMode: 'new', // 'new' — новый жилец с паспортом, 'login' — вход по паспорту, 'newlife' — новая жизнь на том же паспорте
     ignored: new Set((() => {
       try { return JSON.parse(store.get('gh_ignored') || '[]'); } catch { return []; }
@@ -918,6 +920,8 @@
 
     renderBanners(v);
     $('#passport-panel').hidden = !!you.account;
+    for (const a of you.asks || []) openAsk(a);
+    radioSignals(v);
     memo('stats', [you.stats, you.conditions.map((c) => [c.id, c.remainingSec == null ? null : Math.ceil(c.remainingSec / 10)])], () => renderStats(you));
     memo('inv', [you.inventory, you.gasmaskCharge], () => renderInventory(you));
     memo('head', [v.here.title, v.here.text, v.here.floor, v.here.place], () => {
@@ -934,6 +938,25 @@
     document.body.classList.toggle('sanity-critical', you.stats.sanity < 10);
     document.body.classList.toggle('sanity-low', you.stats.sanity >= 10 && you.stats.sanity < 25);
     syncWork(v);
+  }
+
+  function isNight(v) {
+    const h = v.world.clock.hour;
+    return h >= 22 || h < 6;
+  }
+
+  /** Радиоточка даёт сигнал в 06:00 и 22:00 (только у жильца, без сообщений в общий чат). */
+  function radioSignals(v) {
+    const bucket = isNight(v) ? 'night' : 'day';
+    if (S.lastHourBucket && S.lastHourBucket !== bucket) {
+      for (let i = 0; i < 3; i++) playTone(i === 2 ? 1046 : 784, 0.18, 'sine', 0.05, i * 0.35);
+      toast({
+        title: 'Радиоточка',
+        text: bucket === 'night' ? 'Двадцать два ноль-ноль. Ночной режим: свет в коридорах приглушён.' : 'Шесть ноль-ноль. Подъём! Цех №4 ждёт.',
+        style: 'info',
+      });
+    }
+    S.lastHourBucket = bucket;
   }
 
   function renderBanners(v) {
@@ -1142,6 +1165,7 @@
       now: Date.now(),
       gameMinutes: hh * 60 + mm,
       dark: v.world.dark,
+      night: isNight(v),
       flashlight: has('flashlight'),
       fog,
       fogOutside: !!(f && f.phase === 'active' && f.affectsYou),
@@ -1273,7 +1297,24 @@
   const modalQueue = [];
   let modalOpen = false;
 
+  /** Вопрос ЖЭК с вариантами ответа. */
+  function openAsk(ask) {
+    if (S.shownAsks.has(ask.id)) return;
+    S.shownAsks.add(ask.id);
+    playDrone();
+    openModal({
+      title: ask.from || 'ЖЭК',
+      body: ask.question,
+      style: 'announce',
+      actions: ask.options.map((label, i) => ({ label, primary: i === 0, onClick: async () => (await act('answer', { id: ask.id, option: i })).ok })),
+    });
+  }
+
   function notify(n) {
+    if (n.ask) {
+      openAsk(n.ask);
+      return;
+    }
     if (n.style === 'death') {
       playTone(80, 1.6, 'sawtooth', 0.12);
       return;
@@ -1390,6 +1431,9 @@
       actions: [
         { label: 'Отмена' },
         { label: 'Помочь предметом', onClick: () => { setTimeout(() => openAid(person, false), 0); return true; } },
+        ...(S.view.world.dark
+          ? [{ label: 'Пошарить по карманам', onClick: async () => { const r = await act('pickpocket', { target: person.id }); if (r.ok) say(r.message); return true; } }]
+          : []),
         { label: 'Подарить', onClick: async () => (await act('trade_offer', { to: person.id, give: collect(giveMoney, giveItems), want: {} })).ok },
         {
           label: 'Предложить обмен',

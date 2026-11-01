@@ -148,7 +148,12 @@ class Game extends EventEmitter {
       p.conditions = p.conditions || [];
       p.journal = p.journal || [];
       p.gasmaskCharge = p.gasmaskCharge ?? 100;
-      p.job = null; // незаконченные смены после перезапуска сервера сгорают
+      if (p.job) {
+        // смену прервал перезапуск сервера — силы и сытость, потраченные на неё, возвращаются
+        p.stats.energy = Math.min(100, (p.stats.energy || 0) + B.workEnergyCost);
+        p.stats.hunger = Math.min(100, (p.stats.hunger || 0) + B.workHungerCost);
+      }
+      p.job = null;
       if (p.sealed && p.apartment) s.doors[p.apartment.number] = { sealed: true };
       delete p.sealed;
       if (p.location && p.location.place === 'home' && !p.location.apt && p.apartment) p.location.apt = p.apartment.number;
@@ -379,10 +384,10 @@ class Game extends EventEmitter {
   }
 
   /** Уведомление (всплывашка) + запись в личный журнал. */
-  notify(players, { title, text, style = 'info', journal = true, action = null }) {
+  notify(players, { title, text, style = 'info', journal = true, action = null, ask = null }) {
     const list = players.filter(Boolean);
     for (const p of list) if (journal) this.journal(p, title ? `${title}. ${text}` : text, style);
-    this.emit('notify', { to: list.map((p) => p.id), title, text, style, action });
+    this.emit('notify', { to: list.map((p) => p.id), title, text, style, action, ask });
     this.dirty(list.map((p) => p.id));
   }
 
@@ -756,6 +761,18 @@ class Game extends EventEmitter {
     if (account && active(account.banned)) return account.banned;
     if (ip && active(this.state.bannedIps[ip])) return this.state.bannedIps[ip];
     return null;
+  }
+
+  /** Ответ жильца на дилемму ЖЭК. */
+  answer(p, askId, option) {
+    const ask = (p.asks || []).find((a) => a.id === askId);
+    if (!ask) return { ok: false, error: 'Вопрос уже снят.' };
+    const i = toInt(option, -1);
+    if (i < 0 || i >= ask.options.length) return { ok: false, error: 'Нет такого ответа.' };
+    p.asks = p.asks.filter((a) => a !== ask);
+    this.journal(p, `Вы ответили ЖЭК: «${ask.options[i]}».`);
+    this.log(`Дилемма «${ask.question}» — ${p.name} ответил: «${ask.options[i]}»`, 'answer', p.id);
+    return { ok: true };
   }
 
   /** Жалоба на сообщение в чате — уходит в журнал Пульта. */
@@ -1252,12 +1269,61 @@ class Game extends EventEmitter {
     return { ok: true, message: t.down ? '' : `${t.name} приходит в себя.` };
   }
 
+  /** Новосёл: первые часы его нельзя обокрасть (злые механики сначала бьют по новичкам). */
+  isNewbie(p) {
+    return this.now() - (p.createdAt || 0) < B.newbieProtectionH * 3600 * 1000;
+  }
+
+  /**
+   * Карманник в темноте: без света на этаже можно попробовать обшарить соседа.
+   * Удача — забирает до 3 талонов или одну вещь. Вора узнают, если фонарик есть у жертвы
+   * или у кого-то рядом. Неудача выдаёт вора всегда.
+   */
+  pickpocket(p, targetId) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    const t = this.getPlayer(targetId);
+    if (!this.canTouch(p, t)) return { ok: false, error: 'Подойдите ближе.' };
+    if (t.down) return { ok: false, error: 'Он без сознания — тут и так всё видно.' };
+    if (!this.isDark(p.location.floor) || p.location.place === 'lift' || p.location.place === 'stairs') return { ok: false, error: 'Светло — сразу заметят.' };
+    if (this.isNewbie(t)) return { ok: false, error: 'Новосёла трогать — себе дороже: ЖЭК присматривает за новенькими.' };
+    const now = this.now();
+    if (now - (p.lastPickAt || 0) < B.pickpocketCooldownSec * 1000) return { ok: false, error: 'Слишком подозрительно — подождите.' };
+    p.lastPickAt = now;
+    const lit = [t, ...this.othersAt(p).filter((q) => q.id !== t.id)].some((q) => this.hasItem(q, 'flashlight'));
+    if (this.random() >= B.pickpocketChance) {
+      this.notify([t], { title: 'Чужая рука', text: `В темноте вы схватили за руку ${p.name}. Он лез к вам в карман.`, style: 'warn' });
+      this.log(`${p.name} попался на попытке обшарить ${t.name} в темноте`, 'social', p.id);
+      return { ok: true, message: `${t.name} схватил вас за руку!` };
+    }
+    let what;
+    const units = [];
+    for (const [id, n] of Object.entries(t.inventory)) for (let i = 0; i < n; i++) units.push(id);
+    if (t.money > 0 && (this.random() < 0.5 || !units.length)) {
+      const m = Math.min(3, t.money);
+      t.money -= m;
+      p.money += m;
+      what = talons(m);
+    } else if (units.length) {
+      const id = units[Math.floor(this.random() * units.length)];
+      this.removeItem(t, id, 1);
+      this.addItem(p, id, 1);
+      what = C.ITEMS[id].name;
+    } else {
+      return { ok: true, message: 'Карманы пустые. Только крошки.' };
+    }
+    this.notify([t], { title: 'Карманы', text: lit ? `В свете фонарика видно, кто это был: ${p.name}. Пропало: ${what}.` : `В темноте кто-то обшарил ваши карманы. Пропало: ${what}.`, style: 'warn' });
+    this.log(`${p.name} обшарил в темноте ${t.name}: ${what}${lit ? ' (его видели)' : ''}`, 'social', p.id);
+    this.dirty([p.id, t.id]);
+    return { ok: true, message: `Добыча: ${what}.${lit ? ' Кажется, вас видели.' : ''}` };
+  }
+
   /** Обшарить карманы лежащего без сознания: все талоны и до двух вещей. */
   rob(p, targetId) {
     if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
     if (p.down) return { ok: false, error: 'Вы без сознания.' };
     const t = this.getPlayer(targetId);
     if (!this.canTouch(p, t)) return { ok: false, error: 'Подойдите ближе.' };
+    if (this.isNewbie(t)) return { ok: false, error: 'Новосёла трогать — себе дороже: ЖЭК присматривает за новенькими.' };
     if (!t.down) return { ok: false, error: `${t.name} в сознании — так просто в карманы не залезть.` };
     if (t.down.robbedBy.includes(p.name)) return { ok: false, error: 'Вы уже всё забрали.' };
     const taken = { money: t.money, items: {} };
@@ -1591,6 +1657,13 @@ class Game extends EventEmitter {
     if (!this.nearTo(p, (o) => o.type === 'station' && o.game === gameId)) return { ok: false, error: 'Подойдите к рабочему месту.' };
     if (this.hasBlock(p, 'work')) return { ok: false, error: 'С такой травмой мастер к станку не допустит.' };
     if (p.stats.energy < B.workEnergyCost) return { ok: false, error: 'Нет сил работать. Поспите.' };
+    const hourAgo = this.now() - 3600 * 1000;
+    p.shiftLog = (p.shiftLog || []).filter((t) => t > hourAgo);
+    if (p.shiftLog.length >= B.shiftsPerHour) {
+      const waitMin = Math.ceil((p.shiftLog[0] + 3600 * 1000 - this.now()) / 60000);
+      return { ok: false, error: `Мастер: «Норму на этот час вы выработали. Приходите через ${waitMin} мин.»` };
+    }
+    p.shiftLog.push(this.now());
     const job = MG.createJob(gameId);
     if (!job) return { ok: false, error: 'Такой работы нет.' };
     job.id = newId('j');
@@ -1846,7 +1919,14 @@ class Game extends EventEmitter {
   }
 
   /** Применить эффект к жильцу. Возвращает список изменений текстом. */
+  /** Отметить, что беда от ЖЭК досталась жильцу (для счётчика «бед за час» в Пульте). */
+  markHarm(p) {
+    const now = this.now();
+    p.harmLog = [...(p.harmLog || []).filter((t) => now - t < 3600 * 1000), now].slice(-50);
+  }
+
   applyEffect(p, effect = {}, cause = 'Несчастный случай') {
+    if (Number(effect.health) < 0 || Number(effect.sanity) < 0 || effect.condition || effect.kill || effect.money === 'all' || Number(effect.money) < 0) this.markHarm(p);
     const parts = [];
     for (const k of STAT_KEYS) {
       const v = Number(effect[k]);
@@ -2119,6 +2199,7 @@ const ADMIN_COMMANDS = {
     if (!def) throw new Error('Нет такой болезни/травмы');
     const victims = this.resolveTargets(target);
     for (const p of victims) {
+      this.markHarm(p);
       this.addCondition(p, condition, { silent: true });
       if (!silent) this.notify([p], { title: 'Самочувствие', text: `Вам нехорошо: ${def.name}.`, style: 'danger' });
     }
@@ -2210,6 +2291,22 @@ const ADMIN_COMMANDS = {
     this.byToken.delete(p.token);
     this.onlineSet.delete(p.id);
     this.log(`Жилец ${p.name} стёрт из домовой книги`, 'admin');
+  },
+
+  /** Дилемма: вопрос жильцам с 2–3 вариантами. Ответы приходят в журнал Пульта (фильтр «Ответы»). */
+  ask({ target, question, options, timeoutMin = 5, from = 'ЖЭК' }) {
+    const q = sanitizeText(question, 300);
+    const opts = (Array.isArray(options) ? options : String(options || '').split('\n')).map((o) => sanitizeText(o, 60)).filter(Boolean).slice(0, 3);
+    if (!q || opts.length < 2) throw new Error('Нужен вопрос и хотя бы два варианта ответа');
+    const victims = this.resolveTargets(target);
+    const now = this.now();
+    for (const p of victims) {
+      const askObj = { id: newId('a'), question: q, options: opts, from: sanitizeText(from, 40) || 'ЖЭК', until: now + Math.max(1, Number(timeoutMin) || 5) * 60000 };
+      p.asks = [...(p.asks || []).filter((a) => a.until > now), askObj].slice(-3);
+      this.notify([p], { title: askObj.from, text: q, style: 'ask', journal: true, ask: askObj });
+    }
+    this.log(`Дилемма «${q}» → ${victims.map((p) => p.name).join(', ') || 'никто'}`, 'admin');
+    return { ok: true, message: `Спросили: ${victims.length}` };
   },
 
   // ---- модерация ----
@@ -2404,6 +2501,7 @@ Game.prototype.playerView = function playerView(p) {
     sleeping: p.sleeping,
     account: p.account ? (this.state.accounts[p.account] || {}).login || p.account : null,
     mutedMin: this.mutedFor(p),
+    asks: (p.asks || []).filter((a) => a.until > now).map((a) => ({ id: a.id, question: a.question, options: a.options, from: a.from })),
     down: p.down ? { remainingSec: Math.max(0, Math.ceil((p.down.until - now) / 1000)), cause: p.down.cause } : null,
     knocker: (() => {
       const g = this.knockerFor(p);
@@ -2606,6 +2704,8 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       homeward: !!p.homeward,
       account: p.account ? (this.state.accounts[p.account] || {}).login || p.account : null,
       mutedMin: this.mutedFor(p),
+      harmsHour: (p.harmLog || []).filter((t) => now - t < 3600 * 1000).length,
+      newbie: this.isNewbie(p),
       banned: !!this.banInfo(p),
       down: p.down ? Math.max(0, Math.ceil((p.down.until - now) / 1000)) : null,
       working: !!p.job,
@@ -2623,7 +2723,7 @@ Game.prototype.adminContent = function adminContent() {
     facilities: C.FACILITIES,
     items: pickNames(C.ITEMS),
     conditions: pickNames(C.CONDITIONS),
-    accidents: Object.fromEntries(Object.entries(C.ACCIDENTS).map(([k, v]) => [k, { name: v.name, text: v.text }])),
+    accidents: Object.fromEntries(Object.entries(C.ACCIDENTS).map(([k, v]) => [k, { name: v.effect && v.effect.kill ? `${v.name} — смертельно` : v.name, text: v.text }])),
     breakdowns: pickNames(C.BREAKDOWNS),
     places: Object.fromEntries(MOVE_PLACES.map((k) => [k, C.PLACES[k].name])),
   };

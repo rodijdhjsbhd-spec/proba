@@ -873,6 +873,10 @@
           b.line(cx, cy, cx + Math.cos(ma) * 0.24, cy + Math.sin(ma) * 0.24, '#222', 0.025);
         } else if (o.type === 'window' && s.fogOutside) {
           b.rect(o.x + 0.14, o.y - 0.64, 0.72, 1.08, `rgba(215,222,218,${0.75 + Math.sin(t + o.x) * 0.1})`);
+        } else if (o.type === 'window' && s.night) {
+          // ночью окна дома напротив гаснут — горит одно-два
+          b.rect(o.x + 0.14, o.y - 0.64, 0.72, 1.08, 'rgba(8,10,14,0.72)');
+          b.rect(o.x + 0.42, o.y - 0.33, 0.12, 0.14, '#d9b45a');
         } else if (o.type === 'radio') {
           b.circle(o.x + 0.66, o.y - 0.28, 0.025, Math.sin(t * 3) > 0 ? '#e3a13b' : '#5a4020');
         } else if (o.type === 'station' && o.game === 'gauge') {
@@ -894,7 +898,8 @@
       const scene = this.scene;
       const g = this.light.getContext('2d');
       const vw = this.light.width, vh = this.light.height;
-      const ambient = s.dark ? 0.93 : scene.style.ambient;
+      // ночью (22:00–06:00) в коридорах горит каждая вторая лампа и всё чуть темнее
+      const ambient = s.dark ? 0.93 : Math.min(0.85, scene.style.ambient + (s.night ? 0.12 : 0));
       g.globalCompositeOperation = 'source-over';
       g.clearRect(0, 0, vw, vh);
       g.fillStyle = `rgba(3,4,7,${ambient})`;
@@ -909,7 +914,7 @@
         g.fillStyle = grad;
         g.fillRect(x - r * TD, y - r * TD, r * TD * 2, r * TD * 2);
       };
-      const lamps = s.dark ? [] : scene.lamps;
+      const lamps = s.dark ? [] : s.night && scene.kind === 'corridor' ? scene.lamps.filter((_, i) => i % 2 === 0) : scene.lamps;
       const broken = scene.kind === 'corridor' || scene.style.technical ? scene.seed % Math.max(1, lamps.length) : -1;
       const intensities = lamps.map((_, i) => {
         if (i === broken || (scene.style.technical && i % 2 === 0)) {
