@@ -98,6 +98,8 @@ const BALANCE = {
   repairMinutes: 2,
   repairReward: 2,
   repairCooldownSec: 90,
+  // Шкаф-тайник: сколько вещей влезает
+  stashCapacity: 20,
 
   hungerPerMin: -3, // сытость падает: 100 → 0 примерно за 33 минуты
   starvationHpPerMin: -6, // урон здоровью при сытости 0
@@ -173,7 +175,15 @@ const ITEMS = {
   sour_kissel: { name: 'Прокисший кисель', desc: 'Пахнет так себе. Но съедобно.', use: { hunger: 3 } },
   fog_bread: { name: 'Хлеб с серым налётом', desc: 'Лежал за окном, пока шёл туман.', use: { hunger: 8, sanity: -6 } },
   crowbar: { name: 'Монтировка', desc: 'Вскрывает служебные двери на технических этажах. Пока лежит в кармане.' },
+  // Мебель: ставится у себя дома (кнопка «Поставить»), каждая вещь бережёт от одного события ЖЭК
+  torchere: { name: 'Торшер', desc: 'Свой свет: если на этаже отключат электричество, дома не темно.', furniture: true },
+  door_seal: { name: 'Уплотнитель для двери', desc: 'Резиновый. Не успели задраить — тумана в квартиру попадёт вдвое меньше.', furniture: true },
+  stash_box: { name: 'Шкаф-тайник с замком', desc: 'Вещи в тайнике не найдут ни воры, ни беды.', furniture: true },
+  heater: { name: 'Обогреватель', desc: 'Дома не страшны холод и сырость.', furniture: true },
 };
+
+// Что продаёт барыга (по одной штуке каждого в сутки) и почём
+const BARYGA_SELLS = { crowbar: 8, torchere: 12, door_seal: 10, stash_box: 15, heater: 12 };
 
 // Подсобки за служебными дверями технических этажей: у каждой двери своя постоянная добыча.
 const STASH_LOOT = ['bulb', 'rusk', 'battery', 'filter', 'paper', 'fork', 'bandage', 'stew', 'rusk', 'bulb'];
@@ -436,10 +446,10 @@ const NOTES = {
 };
 
 // Справочники без прототипа: ключи приходят от клиентов и из Пульта, а C.ITEMS['constructor'] не должен «находиться»
-for (const map of [ITEMS, SHOPS, CONDITIONS, ACCIDENTS, PLACES, BREAKDOWNS, HAZARDS, DEEDS, SPOIL, FOGGED, SIDE_JOBS, BARYGA_PRICES, CLIMATES, HOUSE_SOUNDS, FACILITIES]) Object.setPrototypeOf(map, null);
+for (const map of [ITEMS, SHOPS, CONDITIONS, ACCIDENTS, PLACES, BREAKDOWNS, HAZARDS, DEEDS, SPOIL, FOGGED, SIDE_JOBS, BARYGA_PRICES, CLIMATES, HOUSE_SOUNDS, FACILITIES, BARYGA_SELLS]) Object.setPrototypeOf(map, null);
 
 module.exports = {
   BUILDING, FACILITIES, BALANCE, ITEMS, SHOPS, CONDITIONS, ACCIDENTS, PLACES, BREAKDOWNS, HALLUCINATIONS,
   HALLUCINATION_VOICES, RESERVED_NAMES, ARCHIVE_DEAD_AFTER_H, NOTES, RANKS, TUTORIAL, ECHO_PHRASES, HAZARDS,
-  LORE, RADIO, DEEDS, SPOIL, FOGGED, SIDE_JOBS, BARYGA_PRICES, STASH_LOOT, CLIMATES, HOUSE_SOUNDS,
+  LORE, RADIO, DEEDS, SPOIL, FOGGED, SIDE_JOBS, BARYGA_PRICES, STASH_LOOT, CLIMATES, HOUSE_SOUNDS, BARYGA_SELLS,
 };

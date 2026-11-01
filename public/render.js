@@ -69,6 +69,47 @@
   }
 
   /** Кисть в клеточных координатах: всё рисуем в долях клетки. */
+  /** Мебель жильца: торшер у кровати, обогреватель под окном, замок на шкафу, уплотнитель на двери. */
+  function drawFurniture(b, scene, list, t, dark) {
+    const has = (id) => list.includes(id);
+    if (has('torchere')) {
+      const x = 1.55, y = 4.8;
+      b.circle(x, y, 0.13, 'rgba(0,0,0,0.3)');
+      b.rect(x - 0.03, y - 0.9, 0.06, 0.9, '#2b2620');
+      b.g.fillStyle = '#c9a25a';
+      b.g.beginPath();
+      b.g.moveTo((x - 0.22) * b.T, (y - 0.85) * b.T);
+      b.g.lineTo((x + 0.22) * b.T, (y - 0.85) * b.T);
+      b.g.lineTo((x + 0.14) * b.T, (y - 1.15) * b.T);
+      b.g.lineTo((x - 0.14) * b.T, (y - 1.15) * b.T);
+      b.g.closePath();
+      b.g.fill();
+      if (dark) b.circle(x, y - 0.9, 0.5, 'rgba(255,214,140,0.18)');
+    }
+    if (has('heater')) {
+      const x = 3.1, y = 2.25;
+      b.rect(x, y, 0.8, 0.32, '#8b8f8a');
+      for (let i = 0; i < 6; i++) b.rect(x + 0.06 + i * 0.12, y + 0.04, 0.06, 0.24, '#6c706b');
+      b.rect(x + 0.3, y + 0.33, 0.2, 0.04, `rgba(255,120,40,${0.4 + Math.sin(t * 2) * 0.2})`);
+    }
+    const wardrobe = scene.objects.find((o) => o.type === 'wardrobe');
+    if (has('stash_box') && wardrobe) {
+      const x = wardrobe.x + wardrobe.w / 2, y = wardrobe.y + 0.55;
+      b.g.strokeStyle = '#d9b45a';
+      b.g.lineWidth = Math.max(1, 0.025 * b.T);
+      b.g.beginPath();
+      b.g.arc(x * b.T, (y - 0.08) * b.T, 0.06 * b.T, Math.PI, 0);
+      b.g.stroke();
+      b.rect(x - 0.08, y - 0.08, 0.16, 0.13, '#d9b45a');
+    }
+    const door = scene.objects.find((o) => o.type === 'hermodoor');
+    if (has('door_seal') && door) {
+      b.g.strokeStyle = 'rgba(20,20,20,0.85)';
+      b.g.lineWidth = Math.max(1, 0.05 * b.T);
+      b.g.strokeRect((door.x + 0.05) * b.T, (door.y + 0.05) * b.T, (door.w - 0.1) * b.T, (door.h - 0.1) * b.T);
+    }
+  }
+
   /** Шрамы дома: копоть, ржавые потёки, трещины, погрызы, налёт после тумана, мел, последняя запись. */
   function drawScar(b, sc) {
     const x = sc.x, y = sc.y;
@@ -1092,6 +1133,7 @@
         for (let k = 0; k < 5; k++) b.rect(l[0] - 0.2 + ((k * 37) % 40) / 100, l[1] - 0.12 + ((k * 23) % 25) / 100, 0.06, 0.03, 'rgba(210,230,235,0.8)');
         b.g.restore();
       }
+      if (s.furniture && scene.kind === 'home') drawFurniture(b, scene, s.furniture, t, s.dark);
       for (const sc of s.scars || []) drawScar(b, sc);
       for (const hz of s.hazards || []) drawHazard(b, hz, t);
       if (s.marker) {
@@ -1193,6 +1235,8 @@
         return 0.95 + Math.sin(t * 50 + i) * 0.03;
       });
       lamps.forEach(([lx, ly], i) => hole(lx, ly, 3.6, intensities[i]));
+      // свой торшер светит и тогда, когда на этаже нет электричества
+      if (s.furniture && s.furniture.includes('torchere') && scene.kind === 'home') hole(1.55, 3.9, 3.2, 0.9);
       if (s.you) {
         hole(s.you.x, s.you.y - 0.5, s.dark ? 1.1 : 1.4, s.dark ? 0.55 : 0.35);
         if (s.flashlight && (s.dark || dim)) {

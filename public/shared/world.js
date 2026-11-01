@@ -78,7 +78,7 @@
         b: { type: 'bed', label: 'Кровать' },
         s: { type: 'sink', label: 'Раковина', decor: true },
         k: { type: 'stove', label: 'Плитка', decor: true },
-        W: { type: 'wardrobe', label: 'Шкаф', decor: true },
+        W: { type: 'wardrobe', label: 'Шкаф' },
         t: { type: 'table', label: 'Стол', decor: true },
         D: { type: 'hermodoor', label: 'Гермодверь', wall: true, bottom: true },
       },

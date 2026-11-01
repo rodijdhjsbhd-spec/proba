@@ -864,6 +864,8 @@ class Game extends EventEmitter {
 
   /** Темно ли там, где стоит жилец: нет света на этаже или в коридоре погасла половина ламп. */
   isDarkFor(p) {
+    // свой торшер: дома светло, даже когда на этаже нет электричества
+    if (p.location.place === 'home' && this.furnitureAt(this.currentApt(p)).torchere) return false;
     if (this.isDark(p.location.floor)) return true;
     if (p.location.place !== 'corridor') return false;
     const out = (this.world.lampsOut[p.location.floor] || []).length;
@@ -1699,7 +1701,9 @@ class Game extends EventEmitter {
     const items = Object.entries(p.inventory)
       .map(([id, n]) => ({ id, name: C.ITEMS[id]?.name || id, have: n, price: this.barygaPrice(id) }))
       .filter((x) => x.price);
-    return { ok: true, purse: this.barygaPurse(), items, wants: Object.keys(C.BARYGA_PRICES).map((id) => `${C.ITEMS[id].name} — ${this.barygaPrice(id)} ₸`).concat(['бумаги — 1 ₸']) };
+    const b = this.world.baryga;
+    const sells = Object.entries(C.BARYGA_SELLS).map(([id, price]) => ({ id, name: C.ITEMS[id].name, desc: C.ITEMS[id].desc, price, left: !(b.soldDay && b.soldDay[id] === this.gameDay()) }));
+    return { ok: true, purse: this.barygaPurse(), items, sells, wants: Object.keys(C.BARYGA_PRICES).map((id) => `${C.ITEMS[id].name} — ${this.barygaPrice(id)} ₸`).concat(['бумаги — 1 ₸']) };
   }
 
   barygaSell(p, itemId, count = 1) {
@@ -1894,19 +1898,78 @@ class Game extends EventEmitter {
     return { ok: true, message: `В подсобке нашлось: ${C.ITEMS[item].name}.` };
   }
 
-  /** Барыга продаёт монтировку — одну в сутки. */
-  barygaBuyCrowbar(p) {
+  /** Барыга продаёт монтировку и мебель — каждой вещи по одной в сутки. */
+  barygaBuy(p, itemId = 'crowbar') {
     if (!this.barygaNear(p)) return { ok: false, error: 'Тут никого нет.' };
+    const price = C.BARYGA_SELLS[itemId];
+    if (!price) return { ok: false, error: '«Такого не держу».' };
     const b = this.world.baryga;
-    if (b.crowbarDay === this.gameDay()) return { ok: false, error: '«Монтировок больше нет. Завтра».' };
-    if (p.money < B.crowbarPrice) return { ok: false, error: `«${B.crowbarPrice} талонов, и не меньше».` };
-    p.money -= B.crowbarPrice;
-    b.purse = (b.purse || 0) + B.crowbarPrice;
-    b.crowbarDay = this.gameDay();
-    this.addItem(p, 'crowbar', 1);
+    b.soldDay = b.soldDay || {};
+    if (b.soldDay[itemId] === this.gameDay()) return { ok: false, error: '«Кончилось. Завтра».' };
+    if (p.money < price) return { ok: false, error: `«${price} талонов, и не меньше».` };
+    p.money -= price;
+    b.purse = (b.purse || 0) + price;
+    b.soldDay[itemId] = this.gameDay();
+    this.addItem(p, itemId, 1);
     this.world.barygaClients[p.id] = this.now();
-    this.log(`${p.name} купил у барыги монтировку`, 'trade', p.id);
-    return { ok: true, message: '«Держи. Ты её не у меня взял».' };
+    this.log(`${p.name} купил у барыги: ${C.ITEMS[itemId].name}`, 'trade', p.id);
+    return { ok: true, message: '«Держи. Ты это не у меня взял».' };
+  }
+
+  // =========================================================================
+  // Обустройство квартиры: мебель бережёт от одного события ЖЭК
+  // =========================================================================
+  /** Мебель квартиры (у хозяина). Гости тоже под её защитой. */
+  furnitureAt(apt) {
+    const owner = apt ? this.ownerOf(apt) : null;
+    return (owner && owner.furniture) || {};
+  }
+
+  /** Поставить мебель у себя дома. */
+  installFurniture(p, itemId) {
+    if (!this.isOwnHome(p)) return { ok: false, error: 'Мебель ставят у себя дома.' };
+    p.furniture = p.furniture || {};
+    if (p.furniture[itemId]) return { ok: false, error: 'Такое уже стоит.' };
+    this.removeItem(p, itemId, 1);
+    p.furniture[itemId] = true;
+    this.journal(p, `Дома теперь есть: ${C.ITEMS[itemId].name}.`, 'good');
+    this.log(`${p.name} поставил дома: ${C.ITEMS[itemId].name}`, 'social', p.id);
+    this.dirty([p.id, ...this.othersAt(p).map((q) => q.id)]);
+    return { ok: true, message: `Поставлено: ${C.ITEMS[itemId].name}.` };
+  }
+
+  /** Убрать мебель обратно в карманы (например, чтобы продать или отдать). */
+  removeFurniture(p, itemId) {
+    if (!this.isOwnHome(p)) return { ok: false, error: 'Только у себя дома.' };
+    if (!(p.furniture || {})[itemId]) return { ok: false, error: 'Такого нет.' };
+    if (itemId === 'stash_box' && Object.keys(p.stash || {}).length) return { ok: false, error: 'Сначала освободите тайник.' };
+    delete p.furniture[itemId];
+    this.addItem(p, itemId, 1);
+    this.dirty([p.id, ...this.othersAt(p).map((q) => q.id)]);
+    return { ok: true, message: `${C.ITEMS[itemId].name} — снова в карманах.` };
+  }
+
+  /** Шкаф-тайник: положить и взять. Вещи в нём не крадут и не портятся. */
+  stashMove(p, itemId, count, put) {
+    if (!this.isOwnHome(p) || !(p.furniture || {}).stash_box) return { ok: false, error: 'Тайник — в вашей квартире, если он есть.' };
+    if (!this.nearTo(p, (o) => o.type === 'wardrobe')) return { ok: false, error: 'Подойдите к шкафу.' };
+    const n = Math.max(1, toInt(count, 1));
+    p.stash = p.stash || {};
+    if (put) {
+      if (!C.ITEMS[itemId] || (p.inventory[itemId] || 0) < n) return { ok: false, error: 'У вас этого нет.' };
+      if (CHARGE_KEYS[itemId] || C.ITEMS[itemId].furniture) return { ok: false, error: 'Это в тайник не влезет.' };
+      if (Object.values(p.stash).reduce((a, b) => a + b, 0) + n > B.stashCapacity) return { ok: false, error: `В тайник влезает ${B.stashCapacity} вещей.` };
+      this.removeItem(p, itemId, n);
+      p.stash[itemId] = (p.stash[itemId] || 0) + n;
+      return { ok: true };
+    }
+    const have = p.stash[itemId] || 0;
+    if (!have) return { ok: false, error: 'В тайнике этого нет.' };
+    const k = Math.min(have, n);
+    p.stash[itemId] -= k;
+    if (!p.stash[itemId]) delete p.stash[itemId];
+    this.addItem(p, itemId, k);
+    return { ok: true };
   }
 
   // =========================================================================
@@ -2448,6 +2511,7 @@ class Game extends EventEmitter {
     const fogged = this.inFog(floor) && !(atHome && this.doorSealed(this.currentApt(p)));
     if (fogged) {
       let factor = this.world.fog.intensity || 1;
+      if (atHome && this.furnitureAt(this.currentApt(p)).door_seal) factor *= 0.5; // уплотнитель
       if (this.maskWorks(p)) {
         factor *= B.gasMaskFactor;
         this.wearGasmask(p, dh);
@@ -2464,7 +2528,8 @@ class Game extends EventEmitter {
 
     // микроклимат вредит, только если ЖЭК включил множитель; дома за задраенной дверью — не достаёт
     const clim = this.climateAt(floor);
-    const climHarm = !!(clim && clim.harm > 0 && !(atHome && this.doorSealed(this.currentApt(p))));
+    const heated = atHome && (clim && (clim.kind === 'cold' || clim.kind === 'damp')) && this.furnitureAt(this.currentApt(p)).heater;
+    const climHarm = !!(clim && clim.harm > 0 && !heated && !(atHome && this.doorSealed(this.currentApt(p))));
     if (climHarm) {
       for (const [k, v] of Object.entries(C.CLIMATES[clim.kind].harm)) {
         delta[k] += v * clim.harm * dh;
@@ -2773,6 +2838,7 @@ class Game extends EventEmitter {
     if (!def || !this.hasItem(p, itemId)) return { ok: false, error: 'У вас этого нет.' };
     if (def.equip) return { ok: false, error: 'Работает сам, пока лежит у вас в кармане.' };
     if (def.read) return { ok: true, read: { title: def.name, text: def.read } }; // бумага не тратится
+    if (def.furniture) return this.installFurniture(p, itemId);
     if (!def.use) return { ok: false, error: 'Это не используется. Зато можно обменять.' };
     if (!this.itemUseful(p, itemId)) {
       if (def.use.refill) return { ok: false, error: def.use.refill === 'gasmask' ? 'Нужен противогаз — или фильтр в нём ещё свежий.' : 'Нужен фонарик — или он и так заряжен.' };
@@ -3691,6 +3757,8 @@ class Game extends EventEmitter {
         const inRange = alive.filter((p) => p.apartment.floor >= a.from && p.apartment.floor <= a.to);
         return inRange.filter((p) => !!a.done[p.apartment.number] === (target.type === 'assignmentDone'));
       }
+      case 'hasFurniture':
+        return alive.filter((p) => (p.furniture || {})[target.item]);
       case 'techVisitors': {
         // кто спускался на технические этажи за последний час
         const since = this.now() - 3600 * 1000;
@@ -4972,6 +5040,7 @@ Game.prototype.playerView = function playerView(p) {
       desc: C.ITEMS[id]?.desc || '',
       usable: !!C.ITEMS[id]?.use,
       readable: !!C.ITEMS[id]?.read,
+      furniture: !!C.ITEMS[id]?.furniture,
       equip: !!C.ITEMS[id]?.equip,
     })),
     gasmaskCharge: Math.round(p.gasmaskCharge),
@@ -5057,6 +5126,8 @@ Game.prototype.playerView = function playerView(p) {
   };
   you.elderOf = this.elderOf(p.apartment.floor)?.id === p.id ? p.apartment.floor : null;
   you.rentDebt = p.rentDebt || 0;
+  you.furniture = Object.keys(p.furniture || {});
+  you.stash = Object.entries(p.stash || {}).map(([id, count]) => ({ id, count, name: C.ITEMS[id]?.name || id }));
   you.window = Object.entries(p.window || {}).map(([id, count]) => ({ id, count, name: C.ITEMS[id]?.name || id }));
   you.day = this.gameDay();
 
@@ -5102,6 +5173,7 @@ Game.prototype.describePlace = function describePlace(p) {
   const here = { key: this.locationKey(p), place: l.place, floor: l.floor, title: this.placeTitle(p), text: '', people, shop: null, residents: null, closed: null };
   here.hazards = (this.world.hazards[here.key] || []).map((hz) => ({ id: hz.id, kind: hz.kind, name: C.HAZARDS[hz.kind].name, x: hz.x, y: hz.y, fenced: !!hz.fenced }));
   here.scars = this.scarsView(here.key);
+  if (l.place === 'home') here.furniture = Object.keys(this.furnitureAt(this.currentApt(p)));
   const clim = l.floor != null ? this.climateAt(l.floor) : null;
   here.climate = clim ? { kind: clim.kind, name: C.CLIMATES[clim.kind].name, harm: clim.harm > 0 } : null;
 
@@ -5267,6 +5339,7 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       elder: this.elderOf(p.apartment.floor)?.id === p.id,
       rentDebt: p.rentDebt || 0,
       techVisit: (p.techVisits || []).length ? p.techVisits[p.techVisits.length - 1] : null,
+      furniture: Object.keys(p.furniture || {}).map((id) => C.ITEMS[id]?.name || id),
       suspicious: (p.sameIpGifts || 0) >= 2,
       debts: this.state.ious.filter((x) => x.debtorId === p.id && this.iouOverdue(x)).length,
       goodness: Math.round(this.goodness(p) * 10) / 10,

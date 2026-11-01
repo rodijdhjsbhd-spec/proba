@@ -2234,3 +2234,57 @@ test('дилемма: после срока ответить нельзя, ок�
   game.tutorialDrill(p);
   assert.equal(p.tutorial.drill, false, 'учения не в настоящую тревогу');
 });
+
+test('обустройство: мебель ставится дома и бережёт — торшер от темноты, уплотнитель от тумана, обогреватель от холода, тайник от воров', () => {
+  const { game, advance } = makeWorld();
+  const p = join(game, 'Иван');
+  for (const id of ['torchere', 'door_seal', 'stash_box', 'heater']) game.admin('give', { id: p.id, item: id, count: 1, silent: true });
+  // поставить можно только дома
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  assert.equal(game.useItem(p, 'torchere').ok, false);
+  game.admin('teleport', { id: p.id, place: 'home' });
+  for (const id of ['torchere', 'door_seal', 'stash_box', 'heater']) assert.equal(game.useItem(p, id).ok, true, id);
+  assert.deepEqual(game.playerView(p).here.furniture.sort(), ['door_seal', 'heater', 'stash_box', 'torchere']);
+  // торшер
+  game.admin('power', { on: false, from: 101, to: 101 });
+  assert.equal(game.isDarkFor(p), false);
+  game.admin('power', { on: true });
+  // обогреватель: холод с вредом дома не страшен (дверь открыта)
+  game.admin('climate', { from: 101, to: 101, kind: 'cold', harm: 2 });
+  const en = p.stats.energy;
+  advance(60 * 1000);
+  assert.ok(p.stats.energy >= en - 1, 'холод не тянет силы');
+  game.admin('climateClear', {});
+  // уплотнитель: туман через открытую дверь вдвое слабее
+  const q = join(game, 'Мария');
+  game.admin('fog', { from: 101, to: 101, warnSec: 0, durationMin: 3, intensity: 1 });
+  const h1 = p.stats.health, h2 = q.stats.health;
+  advance(60 * 1000);
+  const lossP = h1 - p.stats.health, lossQ = h2 - q.stats.health;
+  assert.ok(lossP > 0 && lossP < lossQ * 0.75, `уплотнитель: ${lossP} против ${lossQ}`);
+  // тайник
+  walkTo(game, p, type('wardrobe'));
+  game.admin('give', { id: p.id, item: 'stew', count: 2, silent: true });
+  assert.equal(game.stashMove(p, 'stew', 2, true).ok, true);
+  assert.equal(p.inventory.stew || 0, 0);
+  assert.equal(game.playerView(p).you.stash[0].count, 2);
+  assert.deepEqual(game.resolveTargets({ type: 'hasFurniture', item: 'stash_box' }).map((x) => x.id), [p.id]);
+  assert.equal(game.removeFurniture(p, 'stash_box').ok, false, 'сначала освободить');
+  assert.equal(game.stashMove(p, 'stew', 2, false).ok, true);
+  assert.equal(game.removeFurniture(p, 'stash_box').ok, true);
+  assert.equal(p.inventory.stash_box, 1);
+});
+
+test('барыга продаёт мебель и монтировку — по одной в сутки', () => {
+  const { game } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('barygaPlace', { floor: 99 });
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 99 });
+  p.pos = { x: game.world.baryga.x + 1, y: game.world.baryga.y, d: 'left' };
+  p.money = 50;
+  assert.equal(game.barygaBuy(p, 'heater').ok, true);
+  assert.equal(p.inventory.heater, 1);
+  assert.equal(game.barygaBuy(p, 'heater').ok, false, 'кончилось на сегодня');
+  assert.equal(game.barygaBuy(p, 'gasmask').ok, false, 'такого не держит');
+  assert.ok(game.barygaOffer(p).sells.some((x) => x.id === 'torchere'));
+});

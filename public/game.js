@@ -484,6 +484,11 @@
       }
       case 'board':
         return { label: 'Доска объявлений', actions: [{ label: 'Читать', run: () => openBoard(o) }] };
+      case 'wardrobe':
+        if (v.here.ownHome && (you.furniture || []).includes('stash_box')) {
+          return { label: 'Шкаф-тайник', sub: (you.stash || []).length ? `внутри: ${you.stash.map((x) => `${x.name} ×${x.count}`).join(', ')}` : 'пусто', actions: [{ label: 'Открыть тайник', run: () => openStash() }] };
+        }
+        return { label: 'Шкаф', actions: [{ label: 'Осмотреть', run: () => say('В шкафу пусто. Пахнет нафталином.') }] };
       case 'window':
         if (!v.here.ownHome) return { label: 'Окно', actions: [{ label: 'Посмотреть в окно', run: () => say(v.world.fog && v.world.fog.affectsYou ? 'За окном — серая муть.' : 'Окна дома напротив. Где-то горит свет.') }] };
         return { label: 'Окно', sub: (you.window || []).length ? `в авоське: ${you.window.map((x) => `${x.name} ×${x.count}`).join(', ')}` : 'авоська пуста', actions: [{ label: 'Авоська за окном', run: () => openWindowStash() }] };
@@ -563,6 +568,31 @@
   /** Бумага, записка, листок: текст в окне. */
   function showPaper(title, text) {
     openModal({ title, style: 'paper', body: h('div', { class: 'paper-text' }, String(text).split('\n').map((l) => h('p', { text: l }))), actions: [{ label: 'Отложить', primary: true }] });
+  }
+
+  /** Шкаф-тайник: вещи в нём не крадут и не портятся. */
+  function openStash() {
+    openSheet('stash', 'Шкаф-тайник');
+    S.memo.sheet = null;
+    renderStash();
+  }
+
+  function renderStash() {
+    const you = S.view.you;
+    memo('sheet', [you.stash, you.inventory], () => {
+      const pocket = you.inventory.filter((it) => !it.furniture && !['gasmask', 'flashlight'].includes(it.id));
+      $('#sheet-body').replaceChildren(
+        h('p', { class: 'hint', text: 'Под замком: ни карманник, ни «ограбление» до них не доберутся, и еда тут не портится.' }),
+        h('h4', { class: 'board-h', text: 'В тайнике' }),
+        (you.stash || []).length
+          ? h('ul', { class: 'inventory' }, you.stash.map((x) => h('li', null, h('span', { class: 'name', text: `${x.name} ×${x.count}` }), h('button', { class: 'btn small', text: 'Взять', onclick: () => act('stash_take', { item: x.id, count: 1 }) }))))
+          : h('p', { class: 'note', text: 'Пусто.' }),
+        h('h4', { class: 'board-h', text: 'В карманах' }),
+        pocket.length
+          ? h('ul', { class: 'inventory' }, pocket.map((x) => h('li', null, h('span', { class: 'name', text: `${x.name} ×${x.count}` }), h('button', { class: 'btn small', text: 'Спрятать', onclick: () => act('stash_put', { item: x.id, count: 1 }) }))))
+          : h('p', { class: 'note', text: 'Нечего прятать.' }),
+      );
+    });
   }
 
   /** Авоська за окном: еда там портится медленнее (но туман до неё добирается). */
@@ -803,6 +833,7 @@
     if (S.sheet.kind === 'shop') renderShop();
     else if (S.sheet.kind === 'travel') renderTravel();
     else if (S.sheet.kind === 'window') renderWindowStash();
+    else if (S.sheet.kind === 'stash') renderStash();
   }
 
   // ---- раздача и окошко фельдшера ----
@@ -1271,7 +1302,7 @@
     for (const a of you.asks || []) openAsk(a);
     radioSignals(v);
     memo('stats', [you.stats, you.conditions.map((c) => [c.id, c.remainingSec == null ? null : Math.ceil(c.remainingSec / 10)])], () => renderStats(you));
-    memo('inv', [you.inventory, you.gasmaskCharge, you.flashCharge], () => renderInventory(you));
+    memo('inv', [you.inventory, you.gasmaskCharge, you.flashCharge, you.furniture, v.here.ownHome], () => renderInventory(you, v));
     renderIous(v);
     $('#who-apt').textContent = `кв. ${you.apartment.number}${you.elderOf ? ' · ★ старший' : ''}`;
     memo('skills', you.skills, () => {
@@ -1419,13 +1450,19 @@
     });
   }
 
-  function renderInventory(you) {
+  function renderInventory(you, v) {
     const inv = $('#inventory');
+    // мебель, которая стоит дома (снять можно, только находясь у себя)
+    const FURN = { torchere: 'Торшер', door_seal: 'Уплотнитель', stash_box: 'Шкаф-тайник', heater: 'Обогреватель' };
+    const home = (you.furniture || []).map((id) =>
+      h('li', { class: 'home-furniture' }, h('span', { class: 'name', text: `Дома: ${FURN[id] || id}` }), v && v.here.ownHome ? h('button', { class: 'btn small', text: 'Снять', onclick: () => act('furniture_take', { item: id }) }) : null),
+    );
     if (!you.inventory.length) {
-      inv.replaceChildren(h('li', { class: 'empty', text: 'Пусто. Совсем.' }));
+      inv.replaceChildren(h('li', { class: 'empty', text: 'Пусто. Совсем.' }), ...home);
       return;
     }
     inv.replaceChildren(
+      ...home,
       ...you.inventory.map((it) =>
         h(
           'li',
@@ -1445,6 +1482,7 @@
           ),
           it.usable ? h('button', { class: 'btn small', text: 'Исп.', title: `Использовать: ${it.name}`, onclick: () => act('use', { item: it.id }) }) : null,
           it.readable ? h('button', { class: 'btn small', text: 'Читать', title: `Прочитать: ${it.name}`, onclick: () => act('use', { item: it.id }).then((r) => r.read && showPaper(r.read.title, r.read.text)) }) : null,
+          it.furniture ? h('button', { class: 'btn small', text: 'Поставить', title: `Поставить дома: ${it.name}`, onclick: () => act('use', { item: it.id }).then((r) => r.ok && say(r.message)) }) : null,
         ),
       ),
     );
@@ -1569,6 +1607,7 @@
       radioBubble: S.radioBubble,
       objectBubbles: S.objectBubbles,
       climate: v.here.climate ? v.here.climate.kind : null,
+      furniture: v.here.furniture || null,
       marker: tutorialMarker(v),
       flashlight: has('flashlight') && you.flashCharge > 0,
       fog,
@@ -2061,7 +2100,19 @@
             r.items.map((x) => h('li', null, h('span', { class: 'name', text: `${x.name} ×${x.have} — ${x.price} ₸` }), h('button', { class: 'btn small', text: 'Продать 1', onclick: async () => { const res = await act('baryga_sell', { item: x.id, count: 1 }); if (res.ok) { say(res.message); openBaryga(); } } }))),
           )
         : h('p', { class: 'note', text: '«Нечего тебе продать. Приходи с лампочками».' }),
-      h('div', { class: 'actions' }, h('button', { class: 'btn small', text: 'Купить монтировку', title: 'Вскрывает служебные двери на технических этажах', onclick: async () => { const res = await act('baryga_crowbar'); if (res.ok) { say(res.message); openBaryga(); } } })),
+      h('h4', { class: 'board-h', text: 'Из-под полы' }),
+      h(
+        'ul',
+        { class: 'inventory' },
+        (r.sells || []).map((x) =>
+          h(
+            'li',
+            { title: x.desc },
+            h('span', { class: 'name', text: `${x.name} — ${x.price} ₸${x.left ? '' : ' · кончилось'}` }),
+            h('button', { class: 'btn small', text: 'Купить', disabled: !x.left, onclick: async () => { const res = await act('baryga_buy', { item: x.id }); if (res.ok) { say(res.message); openBaryga(); } } }),
+          ),
+        ),
+      ),
     );
   }
 

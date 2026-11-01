@@ -228,6 +228,7 @@
         ['debtors', 'Должники (квартплата, расписки)'],
         ['barygaClients', 'Клиенты барыги (за сутки)'],
         ['techVisitors', 'Спускались на технические этажи (за час)'],
+        ['hasFurniture', 'У кого есть мебель…'],
         ['elders', 'Старшие по этажам'],
         ['petitionSigners', 'Подписавшие заявление…'],
       ],
@@ -252,6 +253,8 @@
       player: h('div', { class: 'row' }, player),
       random: h('div', { class: 'row' }, 'сколько:', count, h('label', { class: 'check' }, onlyOnline, 'только в сети')),
     };
+    const furn = select([['torchere', 'Торшер'], ['door_seal', 'Уплотнитель'], ['stash_box', 'Шкаф-тайник'], ['heater', 'Обогреватель']], 'stash_box');
+    rows.hasFurniture = h('div', { class: 'row' }, furn);
     rows.stingy = rows.generous; // одно поле «сколько» на обе цели
     rows.assignmentFailed = rows.assignmentDone;
     const petSel = h('select', { 'aria-label': 'Заявление' });
@@ -301,6 +304,7 @@
           case 'assignmentDone':
           case 'assignmentFailed': return { type: type.value, id: asg.value };
           case 'petitionSigners': return { type: 'petitionSigners', id: petSel.value };
+          case 'hasFurniture': return { type: 'hasFurniture', item: furn.value };
           case 'floors': return { type: 'floors', from: from.value, to: to.value };
           case 'place': return { type: 'place', place: place.value };
           case 'player': return { type: 'player', id: player.value };
@@ -1366,7 +1370,7 @@
     const DEED_NAMES = { gift: 'подарки', aid: 'помощь', rescue: 'спас лежачих', shelter: 'пускал переждать', care: 'берёг дом', assignment: 'разнарядки', theft: 'кражи', rob: 'обирал лежачих', cold: 'не открыл в туман' };
     const deeds = Object.entries(p.deeds || {}).map(([k, n]) => `${DEED_NAMES[k] || k}: ${n}`);
     A.card.rumor.textContent = p.alive
-      ? `${p.techVisit ? `был на техническом ${p.techVisit.floor} этаже ${Math.max(0, Math.round((Date.now() - p.techVisit.ts) / 60000))} мин назад · ` : ''}${p.suspicious ? '⚠ подозрительный: подарки жильцу с того же адреса · ' : ''}${p.elder ? '★ старший по этажу · ' : ''}${p.rentDebt ? `долг за квартиру: ${p.rentDebt} ₸ · ` : ''}${p.debts ? `просрочено расписок: ${p.debts} · ` : ''}Молва: ${p.rumor && p.rumor.length ? p.rumor.join(', ') : 'ничего не говорят'}${deeds.length ? ` · досье — ${deeds.join(', ')}` : ''}${p.goodness ? ` · за сутки ${p.goodness > 0 ? '+' : ''}${p.goodness}` : ''}`
+      ? `${(p.furniture || []).length ? `дома: ${p.furniture.join(', ')} · ` : ''}${p.techVisit ? `был на техническом ${p.techVisit.floor} этаже ${Math.max(0, Math.round((Date.now() - p.techVisit.ts) / 60000))} мин назад · ` : ''}${p.suspicious ? '⚠ подозрительный: подарки жильцу с того же адреса · ' : ''}${p.elder ? '★ старший по этажу · ' : ''}${p.rentDebt ? `долг за квартиру: ${p.rentDebt} ₸ · ` : ''}${p.debts ? `просрочено расписок: ${p.debts} · ` : ''}Молва: ${p.rumor && p.rumor.length ? p.rumor.join(', ') : 'ничего не говорят'}${deeds.length ? ` · досье — ${deeds.join(', ')}` : ''}${p.goodness ? ` · за сутки ${p.goodness > 0 ? '+' : ''}${p.goodness}` : ''}`
       : '';
     A.card.harm.textContent = p.harmsHour ? `Бед от ЖЭК за час: ${p.harmsHour}${p.harmsHour >= 3 ? ' — не слишком ли часто одному?' : ''}` : '';
     A.card.harm.className = `card-meta${p.harmsHour >= 3 ? ' harm-warn' : ''}`;
