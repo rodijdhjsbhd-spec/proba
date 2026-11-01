@@ -46,13 +46,13 @@ function sanitizeText(raw, max) {
 }
 
 // Буквы, которые выглядят одинаково в латинице и кириллице, — к одной (для сравнения имён)
-const HOMOGLYPHS = { a: 'а', b: 'в', c: 'с', e: 'е', h: 'н', k: 'к', m: 'м', o: 'о', p: 'р', t: 'т', x: 'х', y: 'у', ё: 'е', 3: 'з', 0: 'о', 6: 'б' };
+const HOMOGLYPHS = { a: 'а', b: 'в', c: 'с', e: 'е', h: 'н', k: 'к', m: 'м', o: 'о', p: 'р', t: 'т', x: 'х', y: 'у', ё: 'е', 3: 'з', 0: 'о', 6: 'б', i: 'і', l: 'і', 1: 'і', ї: 'і', є: 'е', ґ: 'г' };
 /** «Скелет» имени: без регистра, пробелов, знаков, с одинаковыми буквами-двойниками. */
 function nameSkeleton(name) {
   return String(name || '')
     .toLocaleLowerCase('ru')
     .replace(/[\s._\-]/g, '')
-    .replace(/[abcehkmoptxyё306]/g, (ch) => HOMOGLYPHS[ch] || ch);
+    .replace(/[abcehkmoptxyё306il1їєґ]/g, (ch) => HOMOGLYPHS[ch] || ch);
 }
 
 function sanitizeName(raw) {
@@ -368,7 +368,12 @@ class Game extends EventEmitter {
       h.nextAt = now + this.walkMs(p.pos, target && target.spot);
       return;
     }
-    if (target && target.spot) p.pos = { x: target.spot.x, y: target.spot.y, d: 'up' };
+    if (target && target.spot) {
+      const from = { x: p.pos.x, y: p.pos.y };
+      p.pos = { x: target.spot.x, y: target.spot.y, d: 'up' };
+      this.checkHazards(p, now, from); // тело идёт по тем же правилам: опасности на пути бьют и его
+      if (p.down || !p.alive) return;
+    }
     const res = this.startTravel(p, homeFloor, via);
     if (!res.ok) return wait(30000); // не хватает сил на лестницу, перелом, лифт сломался — ждём
     h.step = null;
@@ -385,11 +390,15 @@ class Game extends EventEmitter {
       if (rank > 1) skills[g] = C.RANKS[rank - 2];
     }
     heir.skills = skills;
-    const items = Object.keys(dead.inventory || {});
+    // наследство — одно: вещь забирается из опечатанной квартиры, второй наследник её уже не найдёт
+    const items = dead.inheritedBy ? [] : Object.keys(dead.inventory || {}).filter((id) => C.ITEMS[id] && dead.inventory[id] > 0);
+    dead.inheritedBy = dead.inheritedBy || heir.id;
     const parts = [];
     if (items.length) {
       const id = items[Math.floor(this.random() * items.length)];
-      this.addItem(heir, id, 1);
+      const charge = this.chargeOf(dead, id);
+      this.removeItem(dead, id, 1);
+      this.addItem(heir, id, 1, charge);
       parts.push(`из опечатанной квартиры вам досталась вещь: ${C.ITEMS[id].name}`);
     }
     if (Object.keys(skills).length) parts.push('трудовая книжка предшественника — на разряд ниже');
@@ -440,6 +449,9 @@ class Game extends EventEmitter {
   tutorialDrill(p) {
     const t = p.tutorial;
     if (!t || t.drill || !t.done.includes('eat') || !this.isOwnHome(p)) return;
+    // настоящая сирена или нет света — не время для учений (и «тумана нет» было бы ложью)
+    const f = this.world.fog;
+    if ((f && p.location.floor >= f.from && p.location.floor <= f.to) || this.isDark(p.location.floor)) return;
     t.drill = true;
     this.notify([p], {
       title: 'УЧЕБНАЯ ТРЕВОГА',
@@ -555,9 +567,21 @@ class Game extends EventEmitter {
     return (p.inventory[id] || 0) >= n;
   }
 
-  addItem(p, id, n = 1) {
+  /**
+   * charge — заряд противогаза/фонарика, который приходит вместе с вещью (новая — 100).
+   * Если у жильца такой вещи ещё не было, его заряд становится зарядом полученной вещи.
+   */
+  addItem(p, id, n = 1, charge = 100) {
     if (!C.ITEMS[id] || n <= 0) return;
+    const key = CHARGE_KEYS[id];
+    if (key && !(p.inventory[id] > 0)) p[key] = charge;
     p.inventory[id] = (p.inventory[id] || 0) + n;
+  }
+
+  /** Заряд вещи, которую жилец отдаёт (у противогаза и фонарика). */
+  chargeOf(p, id) {
+    const key = CHARGE_KEYS[id];
+    return key ? p[key] ?? 100 : 100;
   }
 
   removeItem(p, id, n = 1) {
@@ -616,6 +640,16 @@ class Game extends EventEmitter {
   setDoorSealed(apt, on) {
     if (on) this.state.doors[apt] = { sealed: true };
     else delete this.state.doors[apt];
+  }
+
+  /** Последний погибший жилец квартиры, пока на двери висит «†». */
+  lastDeadIn(apt) {
+    let best = null;
+    for (const q of this.players()) {
+      if (q.alive || q.apartment.number !== apt || !q.diedAt || this.now() - q.diedAt >= B.tombstoneMin * 60000) continue;
+      if (!best || q.diedAt > best.diedAt) best = q;
+    }
+    return best;
   }
 
   ownerOf(apt) {
@@ -702,21 +736,33 @@ class Game extends EventEmitter {
     const dist = Math.hypot(x - p.pos.x, y - p.pos.y);
     if (dist > p.moveBudget + 0.3 || !World.canStand(this.sceneOf(p), x, y)) return false;
     p.moveBudget = Math.max(0, p.moveBudget - dist);
+    const from = { x: p.pos.x, y: p.pos.y };
     p.pos = { x: Math.round(x * 100) / 100, y: Math.round(y * 100) / 100, d: ['up', 'down', 'left', 'right'].includes(dir) ? dir : p.pos.d };
     if (dist > 0.01) {
       p.movedAt = now;
       if (p.sleeping && dist > 0.1) p.sleeping = false;
-      this.checkHazards(p, now);
+      this.checkHazards(p, now, from);
     }
     return true;
   }
 
-  /** Наступил на опасность, которую поставил бог (если её не огородили). */
-  checkHazards(p, now) {
+  /**
+   * Наступил на опасность, которую поставил бог (если её не огородили). from — откуда шёл: проверяем
+   * весь отрезок пути, иначе опасность можно «перепрыгнуть» одним длинным шагом.
+   */
+  checkHazards(p, now, from = null) {
     const list = this.world.hazards[this.locationKey(p)];
     if (!list || !list.length) return;
+    const a = from || p.pos;
+    const b = p.pos;
+    const segDist = (hz) => {
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const len2 = dx * dx + dy * dy;
+      const k = len2 ? Math.max(0, Math.min(1, ((hz.x - a.x) * dx + (hz.y - a.y) * dy) / len2)) : 0;
+      return Math.hypot(a.x + dx * k - hz.x, a.y + dy * k - hz.y);
+    };
     for (const hz of list) {
-      if (hz.fenced || Math.hypot(p.pos.x - hz.x, p.pos.y - hz.y) > 0.45) continue;
+      if (hz.fenced || segDist(hz) > 0.45) continue;
       p.hazardHits = p.hazardHits || {};
       if (now - (p.hazardHits[hz.id] || 0) < 10000) continue;
       p.hazardHits[hz.id] = now;
@@ -724,7 +770,6 @@ class Game extends EventEmitter {
       const acc = C.ACCIDENTS[def.accident];
       this.accidentScar(p, def.accident, hz);
       this.notify([p], { title: def.name, text: acc.text, style: 'danger' });
-      this.markHarm(p);
       this.applyEffect(p, { ...acc.effect, condition: acc.condition }, acc.name);
       this.log(`${p.name} наступил: ${def.name} (${this.placeTitle(p)})`, 'accident', p.id);
     }
@@ -1091,7 +1136,10 @@ class Game extends EventEmitter {
   /** Ответ жильца на дилемму ЖЭК. */
   answer(p, askId, option) {
     const ask = (p.asks || []).find((a) => a.id === askId);
-    if (!ask) return { ok: false, error: 'Вопрос уже снят.' };
+    if (!ask || (ask.until && ask.until <= this.now())) {
+      p.asks = (p.asks || []).filter((a) => a !== ask);
+      return { ok: false, gone: true, error: 'Вопрос уже снят.' };
+    }
     const i = toInt(option, -1);
     if (i < 0 || i >= ask.options.length) return { ok: false, error: 'Нет такого ответа.' };
     p.asks = p.asks.filter((a) => a !== ask);
@@ -1167,7 +1215,7 @@ class Game extends EventEmitter {
         const r = this.ownerOf(o.number);
         if (r) residents[o.number] = { number: o.number, name: r.name, online: this.isOnline(r.id) };
         else {
-          const dead = this.players().find((q) => !q.alive && q.apartment.number === o.number && q.diedAt && this.now() - q.diedAt < B.tombstoneMin * 60000);
+          const dead = this.lastDeadIn(o.number);
           if (dead) residents[o.number] = { number: o.number, name: `† ${dead.name}`, dead: true };
         }
       }
@@ -1302,11 +1350,24 @@ class Game extends EventEmitter {
     return sc;
   }
 
+  /** Место для листка рядом с телом: не на подходах к дверям и предметам и не на другом листке. */
+  freeScarSpot(key, pos) {
+    const sc = this.map.scene(key);
+    const taken = (this.world.scars[key] || []).filter((x) => x.kind === 'lastword');
+    const cand = [[0.7, 0.3], [-0.7, 0.3], [0.7, -0.3], [-0.7, -0.3], [0, 0.8], [1.2, 0], [-1.2, 0]].map(([dx, dy]) => ({ x: pos.x + dx, y: pos.y + dy }));
+    const ok = (c) =>
+      World.canStand(sc, c.x, c.y, 0.1) &&
+      !sc.objects.some((o) => o.spot && Math.hypot(o.spot.x - c.x, o.spot.y - c.y) < 1.2) &&
+      !taken.some((x) => Math.hypot(x.x - c.x, x.y - c.y) < 0.6);
+    return cand.find(ok) || cand[0];
+  }
+
   /** Следы сцены для отрисовки: fade — насколько выцвел (0 — свежий, 1 — почти исчез). */
   scarsView(key) {
     const ttl = B.scarHours * 3600 * 1000;
     const now = this.now();
-    return (this.world.scars[key] || []).map((sc) => ({ id: sc.id, kind: sc.kind, x: sc.x, y: sc.y, fade: Math.min(1, Math.max(0, (now - sc.at) / ttl)), ...(sc.text ? { text: sc.text, by: sc.by } : {}) }));
+    // fade округляем: иначе Глазок слал бы кадр каждые 100 мс без видимых изменений
+    return (this.world.scars[key] || []).map((sc) => ({ id: sc.id, kind: sc.kind, x: sc.x, y: sc.y, fade: Math.round(Math.min(1, Math.max(0, (now - sc.at) / ttl)) * 50) / 50, ...(sc.text ? { text: sc.text, by: sc.by } : {}) }));
   }
 
   /** След от несчастного случая там, где стоит жилец. */
@@ -1561,6 +1622,7 @@ class Game extends EventEmitter {
 
   sideJobStart(p, kind) {
     if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (this.world.paused) return { ok: false, error: 'Время в доме остановилось.' };
     const def = C.SIDE_JOBS[kind];
     const here = this.sideJobHere(p);
     if (!def || !here || here.kind !== kind) return { ok: false, error: 'Здесь такой подработки нет.' };
@@ -1736,6 +1798,7 @@ class Game extends EventEmitter {
     if (!this.isOwnHome(p) || !this.nearTo(p, (o) => o.type === 'window')) return { ok: false, error: 'Авоська — за окном вашей квартиры.' };
     const n = Math.max(1, toInt(count, 1));
     if (!C.ITEMS[itemId] || (p.inventory[itemId] || 0) < n) return { ok: false, error: 'У вас этого нет.' };
+    if (!(C.ITEMS[itemId].use && C.ITEMS[itemId].use.hunger)) return { ok: false, error: 'В авоську за окном кладут еду.' };
     p.window = p.window || {};
     const inside = Object.values(p.window).reduce((a, b) => a + b, 0);
     if (inside + n > B.windowCapacity) return { ok: false, error: `В авоську влезает ${B.windowCapacity} штук.` };
@@ -1865,6 +1928,7 @@ class Game extends EventEmitter {
 
   repairStart(p) {
     if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (this.world.paused) return { ok: false, error: 'Время в доме остановилось.' };
     const key = this.repairHere(p);
     if (!key) return { ok: false, error: 'Тут нечего чинить (или ЖЭК не разрешает).' };
     if (p.job) return { ok: false, error: 'Вы уже заняты.' };
@@ -2226,7 +2290,10 @@ class Game extends EventEmitter {
 
   deliver(extra = false) {
     const w = this.world;
-    const need = Math.max(6, this.alivePlayers().length * B.supplyShiftsPerResident);
+    // норма — по тем, кто был в доме за прошлые игровые сутки (ушедшие навсегда не делают дефицит вечным)
+    const now = this.now();
+    const active = this.alivePlayers().filter((q) => this.isOnline(q.id) || now - (q.lastSeen || 0) < 24 * 60000).length;
+    const need = Math.max(6, active * B.supplyShiftsPerResident);
     const factor = extra ? 0.5 : (0.6 + 0.8 * Math.min(1, w.shiftsToday / need)) * (w.supplyNext ?? 1);
     const fresh = this.fullStock(factor);
     for (const [shop, items] of Object.entries(fresh)) {
@@ -2273,11 +2340,11 @@ class Game extends EventEmitter {
       };
     }
     if (type === 'accidents') {
-      const condition = raw.condition && C.CONDITIONS[raw.condition] ? raw.condition : undefined;
+      const condition = raw.condition && Object.hasOwn(C.CONDITIONS, raw.condition) ? raw.condition : undefined;
       return { name, text: sanitizeText(raw.text, 300) || name, effect: { ...stats(raw.effect, -200, 200), ...(raw.kill ? { kill: true } : {}) }, condition, custom: true };
     }
     if (type === 'items') {
-      const cure = (Array.isArray(raw.cure) ? raw.cure : []).filter((c) => C.CONDITIONS[c]);
+      const cure = (Array.isArray(raw.cure) ? raw.cure : []).filter((c) => typeof c === 'string' && Object.hasOwn(C.CONDITIONS, c));
       const use = { ...stats(raw.use, -100, 100), ...(cure.length ? { cure } : {}) };
       return { name, desc: sanitizeText(raw.desc, 120) || '', ...(Object.keys(use).length ? { use } : {}), custom: true };
     }
@@ -2424,7 +2491,7 @@ class Game extends EventEmitter {
       const hp = B.starvationHpPerMin * d;
       delta.health += hp;
       hurt('Умер от голода', hp);
-    } else if (p.stats.hunger > 50 && p.conditions.length === 0 && !fogged && !climHarm) {
+    } else if (p.stats.hunger > 50 && p.conditions.length === 0 && !fogged && !climHarm && !p.down) {
       delta.health += B.healthRegenPerMin * d;
     }
     if (p.stats.sanity <= 0 && online) {
@@ -2596,7 +2663,7 @@ class Game extends EventEmitter {
     }
     const witnesses = this.leaveScene(p);
     const sec = via === 'lift' ? B.liftBaseSec + diff * B.liftSecPerFloor : diff * B.stairsSecPerFloor;
-    const now = this.now();
+    const now = this.timerNow(); // на паузе поездка начнётся, когда время пойдёт
     p.travel = { via, toPlace: 'corridor', toFloor: floor, fromFloor: from, startedAt: now, arriveAt: now + sec * 1000 };
     this.relocate(p, { place: via, floor: from });
     this.dirty([...witnesses, ...this.othersAt(p)].map((q) => q.id));
@@ -2670,7 +2737,7 @@ class Game extends EventEmitter {
     if (u.refill === 'flashlight') return this.hasItem(target, 'flashlight') && (target.flashCharge ?? 100) < 100;
     const curable = (u.cure || []).some((id) => this.hasCondition(target, id));
     const shortenable = (u.shorten || []).some((id) => this.hasCondition(target, id));
-    const onlyCures = !u.hunger && !u.health && !u.sanity;
+    const onlyCures = !u.hunger && !u.health && !u.sanity && !u.energy;
     return !onlyCures || curable || shortenable;
   }
 
@@ -2693,7 +2760,7 @@ class Game extends EventEmitter {
     }
     for (const id of (u.shorten || []).filter((c) => this.hasCondition(target, c))) {
       const c = target.conditions.find((x) => x.id === id);
-      if (c && c.until) c.until = this.now() + (c.until - this.now()) / 2;
+      if (c && c.until) c.until = this.timerNow() + (c.until - this.timerNow()) / 2;
       parts.push(`${C.CONDITIONS[id].name} заживает быстрее`);
     }
     return parts;
@@ -2737,11 +2804,17 @@ class Game extends EventEmitter {
     p.stats.health = 0;
     p.sleeping = false;
     p.job = null;
-    // homeward не трогаем: пока жилец лежит, тело никуда не идёт, а очнувшись — побредёт дальше
-    if (p.travel && p.travel.via === 'stairs' && !p.travel.frozen) {
-      // на лестнице тело само не идёт: замираем на пролёте
-      p.travel.frozen = true;
-      p.travel.remainingMs = Math.max(0, p.travel.arriveAt - this.now());
+    // homeward не трогаем: пока жилец лежит, тело никуда не идёт, а очнувшись — побредёт дальше.
+    // Упал в пути — тело оказывается в коридоре ближайшего этажа (у лифта или лестницы): там его видно
+    // и можно помочь. В общей «сцене» лифта или лестницы до него не дотянуться.
+    if (p.travel) {
+      const t = p.travel;
+      const total = Math.max(1, t.arriveAt - t.startedAt);
+      const k = t.stuck ? Math.min(1, Math.max(0, 1 - (t.remainingMs || 0) / total)) : Math.min(1, Math.max(0, (this.now() - t.startedAt) / total));
+      const floor = Math.round(t.fromFloor + (t.toFloor - t.fromFloor) * k);
+      const via = t.via;
+      p.travel = null;
+      this.relocate(p, { place: 'corridor', floor }, via === 'lift' ? 'lift' : 'stairs');
     }
     this.notify([p], { title: 'Вы теряете сознание', text: 'В глазах темнеет. Может быть, кто-нибудь поможет…', style: 'danger' });
     this.log(`${p.name} без сознания: ${cause}`, 'accident', p.id);
@@ -2784,6 +2857,8 @@ class Game extends EventEmitter {
     const def = C.ITEMS[itemId];
     if (!def || !def.use || !this.hasItem(p, itemId)) return { ok: false, error: 'Этим не помочь.' };
     if (!t.down && !this.itemUseful(t, itemId)) return { ok: false, error: `${t.name} это сейчас не нужно.` };
+    const u = def.use;
+    if (t.down && !(u.health || u.hunger || u.sanity || u.cure)) return { ok: false, error: 'Этим в чувство не привести.' };
     const wasDown = !!t.down;
     this.removeItem(p, itemId, 1);
     const parts = this.applyItemUse(t, itemId);
@@ -2818,7 +2893,8 @@ class Game extends EventEmitter {
 
   /** Новосёл: первые часы его нельзя обокрасть (злые механики сначала бьют по новичкам). */
   isNewbie(p) {
-    return this.now() - (p.createdAt || 0) < B.newbieProtectionH * 3600 * 1000;
+    // наследник — не новосёл: иначе каждая новая жизнь давала бы два часа неуязвимости
+    return !p.heirOf && this.now() - (p.createdAt || 0) < B.newbieProtectionH * 3600 * 1000;
   }
 
   /**
@@ -2831,12 +2907,13 @@ class Game extends EventEmitter {
     const t = this.getPlayer(targetId);
     if (!this.canTouch(p, t)) return { ok: false, error: 'Подойдите ближе.' };
     if (t.down) return { ok: false, error: 'Он без сознания — тут и так всё видно.' };
+    if (this.isNewbie(p)) return { ok: false, error: 'Новосёлу не к лицу. ЖЭК присматривает и за вами.' };
     if (!this.isDark(p.location.floor) || p.location.place === 'lift' || p.location.place === 'stairs') return { ok: false, error: 'Светло — сразу заметят.' };
     if (this.isNewbie(t)) return { ok: false, error: 'Новосёла трогать — себе дороже: ЖЭК присматривает за новенькими.' };
     const now = this.now();
     if (now - (p.lastPickAt || 0) < B.pickpocketCooldownSec * 1000) return { ok: false, error: 'Слишком подозрительно — подождите.' };
     p.lastPickAt = now;
-    const lit = [t, ...this.othersAt(p).filter((q) => q.id !== t.id)].some((q) => this.hasItem(q, 'flashlight'));
+    const lit = [t, ...this.othersAt(p).filter((q) => q.id !== t.id)].some((q) => this.torchWorks(q));
     if (this.random() >= B.pickpocketChance) {
       this.notify([t], { title: 'Чужая рука', text: `В темноте вы схватили за руку ${p.name}. Он лез к вам в карман.`, style: 'warn' });
       this.log(`${p.name} попался на попытке обшарить ${t.name} в темноте`, 'social', p.id);
@@ -2853,8 +2930,9 @@ class Game extends EventEmitter {
       what = talons(m);
     } else if (units.length) {
       const id = units[Math.floor(this.random() * units.length)];
+      const charge = this.chargeOf(t, id);
       this.removeItem(t, id, 1);
-      this.addItem(p, id, 1);
+      this.addItem(p, id, 1, charge);
       what = C.ITEMS[id].name;
     } else {
       return { ok: true, message: 'Карманы пустые. Только крошки.' };
@@ -2873,6 +2951,7 @@ class Game extends EventEmitter {
     const t = this.getPlayer(targetId);
     if (!this.canTouch(p, t)) return { ok: false, error: 'Подойдите ближе.' };
     if (this.isNewbie(t)) return { ok: false, error: 'Новосёла трогать — себе дороже: ЖЭК присматривает за новенькими.' };
+    if (this.isNewbie(p)) return { ok: false, error: 'Новосёлу не к лицу. ЖЭК присматривает и за вами.' };
     if (!t.down) return { ok: false, error: `${t.name} в сознании — так просто в карманы не залезть.` };
     if (t.down.robbedBy.includes(p.name)) return { ok: false, error: 'Вы уже всё забрали.' };
     const taken = { money: t.money, items: {} };
@@ -3080,16 +3159,16 @@ class Game extends EventEmitter {
    * Передачки и записки погибшему: передачки — назад живым отправителям, записки — в мусоропровод.
    * Иначе их заберёт следующий жилец квартиры.
    */
-  returnDrops(apt, deadName) {
+  returnDrops(apt, deadName, reason = 'dead') {
     const drops = this.state.doorDrops[apt] || [];
     delete this.state.doorDrops[apt];
     for (const d of drops) {
       if (d.kind !== 'parcel') continue;
       const sender = this.getPlayer(d.fromId);
       if (!sender || !sender.alive) continue;
-      for (const [id, n] of Object.entries(d.bundle.items)) if (C.ITEMS[id]) this.addItem(sender, id, n);
+      for (const [id, n] of Object.entries(d.bundle.items)) if (C.ITEMS[id]) this.addItem(sender, id, n, (d.bundle.charges || {})[id] ?? 100);
       sender.money += d.bundle.money;
-      this.journal(sender, `Передачка для ${deadName} вернулась к вам: ${this.bundleText(d.bundle)}. Адресата больше нет.`, 'warn');
+      this.journal(sender, reason === 'zhek' ? `ЖЭК изъял вашу передачку у двери ${deadName} и вернул вам: ${this.bundleText(d.bundle)}.` : `Передачка для ${deadName} вернулась к вам: ${this.bundleText(d.bundle)}. Адресата больше нет.`, 'warn');
       this.dirty([sender.id]);
     }
   }
@@ -3154,6 +3233,8 @@ class Game extends EventEmitter {
     const limit = this.newbieGiftCheck(p, bundle.money);
     if (limit) return { ok: false, error: limit };
     p.money -= bundle.money;
+    bundle.charges = {};
+    for (const id of Object.keys(bundle.items)) if (CHARGE_KEYS[id]) bundle.charges[id] = this.chargeOf(p, id);
     for (const [id, n] of Object.entries(bundle.items)) this.removeItem(p, id, n);
     // заглушённый жилец передаёт вещи молча — приписка была лазейкой мимо запрета
     const text = this.mutedFor(p) ? '' : sanitizeText(rawText, C.NOTES.maxLength);
@@ -3177,7 +3258,7 @@ class Game extends EventEmitter {
       if (d.kind === 'note') {
         lines.push(`Записка ${who}: «${d.text}»`);
       } else {
-        for (const [id, n] of Object.entries(d.bundle.items)) this.addItem(p, id, n);
+        for (const [id, n] of Object.entries(d.bundle.items)) this.addItem(p, id, n, (d.bundle.charges || {})[id] ?? 100);
         p.money += d.bundle.money;
         lines.push(`Передачка ${who}: ${this.bundleText(d.bundle)}${d.text ? `. Приписка: «${d.text}»` : ''}`);
       }
@@ -3278,6 +3359,7 @@ class Game extends EventEmitter {
   // =========================================================================
   workStart(p, gameId) {
     if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    if (this.world.paused) return { ok: false, error: 'Время в доме остановилось. Мастер ушёл.' };
     if (p.location.place !== 'factory') return { ok: false, error: 'Работа — в цеху.' };
     const status = this.facilityStatus('factory');
     if (!status.open) return { ok: false, error: status.reason };
@@ -3371,7 +3453,8 @@ class Game extends EventEmitter {
     if (now - (this.lastChatAt.get(p.id) || 0) < 700) return { ok: false, error: 'Не так быстро.' };
     this.lastChatAt.set(p.id, now);
     const msg = { id: newId('m'), ts: now, channel, from: { id: p.id, name: p.name, apt: p.apartment.number }, text };
-    p.lastSaid = { text, ts: now };
+    // «последние слова» — только сказанное вслух рядом (не в общий чат)
+    if (channel !== 'global') p.lastSaid = { text, ts: now, id: msg.id, key: this.locationKey(p) };
     this.tutorialStep(p, 'talk');
     if (channel === 'global') {
       this.pushGlobal(msg);
@@ -3422,8 +3505,9 @@ class Game extends EventEmitter {
     from.money -= b.money;
     to.money += b.money;
     for (const [id, n] of Object.entries(b.items)) {
+      const charge = this.chargeOf(from, id);
       this.removeItem(from, id, n);
-      this.addItem(to, id, n);
+      this.addItem(to, id, n, charge); // отработанный противогаз переходит с забитым фильтром
     }
   }
 
@@ -3521,6 +3605,7 @@ class Game extends EventEmitter {
   // =========================================================================
   kill(p, cause) {
     if (!p.alive) return;
+    const wasTraveling = !!p.travel;
     p.alive = false;
     p.deathCause = cause;
     p.diedAt = this.now();
@@ -3545,12 +3630,19 @@ class Game extends EventEmitter {
       if (refusal.kind === 'ignored') this.markDeed(this.ownerOf(refusal.apt), 'cold');
     }
     this.refusals.delete(p.id);
-    // мел на полу, а рядом — последнее, что жилец успел сказать
-    if (p.pos && !p.travel) {
+    // мел на полу, а рядом — последнее, что жилец успел сказать здесь же (за последние 10 минут)
+    if (p.pos && !wasTraveling && !['lift', 'stairs'].includes(p.location.place)) {
       const key = this.locationKey(p);
       this.scar(key, 'chalk', p.pos.x, p.pos.y);
-      if (p.lastSaid && this.now() - p.lastSaid.ts < 6 * 3600 * 1000) this.scar(key, 'lastword', p.pos.x + 0.6, p.pos.y + 0.2, { text: p.lastSaid.text, by: p.name });
+      const ls = p.lastSaid;
+      if (ls && ls.key === key && this.now() - ls.ts < 10 * 60000) {
+        const spot = this.freeScarSpot(key, p.pos);
+        this.scar(key, 'lastword', spot.x, spot.y, { text: ls.text, by: p.name });
+      }
     }
+    p.lastSaid = null;
+    // опасность «под ногами» в квартире погибшего не должна достаться следующему жильцу
+    delete this.world.hazards[`home:${p.apartment.number}`];
     this.returnDrops(p.apartment.number, p.name);
     this.closeIousOf(p);
     this.evictAllGuests(p.apartment.number, p.apartment.floor);
@@ -3688,7 +3780,7 @@ class Game extends EventEmitter {
     }
     if (effect.kill) this.kill(p, cause);
     else if (p.stats.health <= 0) this.fall(p, cause);
-    else if (p.down) this.wake(p); // бог подлечил лежачего — он приходит в себя
+    else if (p.down && (Number(effect.health) > 0 || effect.cure)) this.wake(p); // бог подлечил лежачего — приходит в себя
     this.dirty([p.id]);
     return parts;
   }
@@ -3842,7 +3934,7 @@ class Game extends EventEmitter {
     const f = this.world.fog;
     this.world.fog = null;
     if (f.arrived) this.fogScars(f);
-    this.evictOrphanGuests();
+    if (!silent) this.evictOrphanGuests(); // при замене тумана новым — гости остаются внутри
     if (!silent) {
       this.notify(this.alivePlayers(), { title: 'Отбой', text: `Туман на этажах ${f.from}–${f.to} рассеялся.`, style: 'good' });
       this.systemChat(`Отбой тревоги. Туман на этажах ${f.from}–${f.to} рассеялся.`);
@@ -3924,6 +4016,11 @@ class Game extends EventEmitter {
 // ---------------------------------------------------------------------------
 // Команды админки. this — экземпляр Game.
 // ---------------------------------------------------------------------------
+const PALETTE_TYPES = ['conditions', 'accidents', 'items'];
+
+// Вещи с зарядом: заряд хранится у жильца (одна такая вещь на человека имеет смысл), но переходит с вещью
+const CHARGE_KEYS = Object.assign(Object.create(null), { gasmask: 'gasmaskCharge', flashlight: 'flashCharge' });
+
 // Роли богов: «модератор» следит за порядком, «наблюдатель» только смотрит. «Бог» может всё.
 const ROLE_NAMES = { god: 'бог', moderator: 'модератор', observer: 'наблюдатель' };
 const ROLE_COMMANDS = {
@@ -4148,6 +4245,7 @@ const ADMIN_COMMANDS = {
 
   /** Своя палитра: новая болезнь/травма, несчастный случай или предмет — без правки кода и перезапуска. */
   paletteAdd({ type, def }) {
+    if (!PALETTE_TYPES.includes(type)) throw new Error('Нет такого раздела палитры');
     const clean = this.cleanPaletteDef(type, def);
     const pal = this.state.palette;
     if (Object.keys(pal[type]).length >= 50) throw new Error('В этом разделе палитры уже 50 записей');
@@ -4161,7 +4259,7 @@ const ADMIN_COMMANDS = {
 
   paletteRemove({ type, id }) {
     const pal = this.state.palette;
-    if (!pal[type] || !pal[type][id]) throw new Error('В палитре такого нет');
+    if (!PALETTE_TYPES.includes(type) || !Object.hasOwn(pal[type] || {}, id)) throw new Error('В палитре такого нет');
     const name = pal[type][id].name;
     delete pal[type][id];
     if (type === 'conditions') {
@@ -4210,6 +4308,8 @@ const ADMIN_COMMANDS = {
       // клик в Глазке: ровно в эту клетку, а не куда попало
       const cx = Math.floor(Number(x)) + 0.5, cy = Math.floor(Number(y)) + 0.5;
       if (!Number.isFinite(cx) || !Number.isFinite(cy) || World.isSolidTile(sc, Math.floor(cx), Math.floor(cy))) throw new Error('Туда не поставить: стена или мебель');
+      const there = (this.world.hazards[key] || []).find((h) => h.x === cx && h.y === cy);
+      if (there) throw new Error(`Здесь уже: ${C.HAZARDS[there.kind].name}`);
       pos = { x: cx, y: cy };
     }
     if (!pos) {
@@ -4222,6 +4322,7 @@ const ADMIN_COMMANDS = {
           if (sc.objects.some((o) => o.spot && Math.hypot(o.spot.x - c.x, o.spot.y - c.y) < 0.9)) continue;
           if (near && Math.hypot(near.x - c.x, near.y - c.y) > 3) continue;
           if (near && Math.hypot(near.x - c.x, near.y - c.y) < 1) continue;
+          if ((this.world.hazards[key] || []).some((h) => h.x === c.x && h.y === c.y)) continue; // одна опасность — одна клетка
           free.push(c);
         }
       }
@@ -4271,6 +4372,7 @@ const ADMIN_COMMANDS = {
     const clean = sanitizeText(text, C.NOTES.maxLength);
     if (!clean) throw new Error('Пустая записка');
     const sign = sanitizeText(from, 40);
+    if (sign && this.alivePlayers().some((q) => nameSkeleton(q.name) === nameSkeleton(sign))) throw new Error('Нельзя подписывать записку именем живого жильца');
     const apt = p.apartment.number;
     if (!this.state.doorDrops[apt]) this.state.doorDrops[apt] = [];
     this.state.doorDrops[apt].push({ id: newId('d'), ts: this.now(), fromId: null, fromName: sign || '', fromApt: '—', kind: 'note', text: clean, anon: !sign, byZhek: true });
@@ -4603,7 +4705,7 @@ const ADMIN_COMMANDS = {
     const key = String(apt || '');
     if (!this.state.doorDrops[key]) return { ok: true, message: 'Под этой дверью пусто' };
     const n = this.state.doorDrops[key].length;
-    this.returnDrops(key, `кв. ${key}`);
+    this.returnDrops(key, `кв. ${key}`, 'zhek');
     this.log(`ЖЭК изъял из-под двери кв. ${key}: ${n}`, 'admin');
     return { ok: true, message: `Изъято: ${n}` };
   },
@@ -4678,6 +4780,7 @@ const ADMIN_COMMANDS = {
     const p = this.requirePlayer(id, { alive: false });
     const min = Math.max(1, Math.min(7 * 24 * 60, Number(minutes) || 30));
     p.mutedUntil = this.now() + min * 60000;
+    p.lastSaid = null;
     this.notify([p], { title: 'Вы сорвали голос', text: `ЖЭК запретил вам говорить и писать на ${min} мин.`, style: 'warn' });
     this.log(`${p.name} заглушён на ${min} мин`, 'admin', p.id);
     return { ok: true, message: `Заглушён на ${min} мин` };
@@ -4743,6 +4846,7 @@ const ADMIN_COMMANDS = {
       this.localChat.set(key, left);
     }
     if (!found) throw new Error('Сообщение уже удалено');
+    for (const q of this.players()) if (q.lastSaid && q.lastSaid.id === id) q.lastSaid = null; // удалённое не станет «последними словами»
     this.emit('chat_delete', { id });
     this.log('Сообщение удалено из чата', 'admin');
     return { ok: true, message: 'Удалено' };
@@ -5029,7 +5133,7 @@ Game.prototype.describePlace = function describePlace(p) {
         const number = `${l.floor}${String(i).padStart(2, '0')}`;
         const r = this.alivePlayers().find((q) => q.apartment.number === number);
         // недавно погибший: на двери «†», пока квартиру не займут
-        const dead = r ? null : this.players().find((q) => !q.alive && q.apartment.number === number && q.diedAt && this.now() - q.diedAt < B.tombstoneMin * 60000);
+        const dead = r ? null : this.lastDeadIn(number);
         residents.push({ number, name: r ? r.name : dead ? `† ${dead.name}` : null, online: r ? this.isOnline(r.id) : false, you: r?.id === p.id, dead: !!dead, rumor: r ? this.rumor(r) : [], elder: !!(r && elderHere && elderHere.id === r.id) });
       }
       if (kind === 'residential') here.residents = residents;
@@ -5190,6 +5294,7 @@ Game.prototype.adminContent = function adminContent() {
     places: Object.fromEntries(MOVE_PLACES.map((k) => [k, C.PLACES[k].name])),
     hazards: Object.fromEntries(Object.entries(C.HAZARDS).map(([k, v]) => [k, v.name])),
     climates: Object.fromEntries(Object.entries(C.CLIMATES).map(([k, v]) => [k, v.name])),
+    shopNames: Object.fromEntries(Object.keys(C.SHOPS).flatMap((shop) => this.shopEntries(shop).map((e) => [e.key, e.name]))),
     palette: this.state.palette,
     world: WORLD_CONFIG,
   };

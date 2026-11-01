@@ -102,6 +102,8 @@ try {
   process.exit(1);
 }
 const game = new Game(saved);
+// палитра попадает в справочник предметов только в конструкторе — каталог для клиентов считаем после
+ITEM_CATALOG = Object.fromEntries(Object.entries(ITEMS).map(([id, it]) => [id, it.name]));
 
 function makeBackup() {
   try {
@@ -630,6 +632,11 @@ function handleRest(ws, msg) {
       return;
     }
     const legacyRebirth = !account && current && !current.alive && !current.account;
+    // старый жилец без паспорта: новую жизнь по его ордеру дают один раз
+    if (legacyRebirth && current.inheritedBy) {
+      send(ws, { t: 'register_error', error: 'По этому ордеру уже заселён наследник. Новый жилец — с новым паспортом.' });
+      return;
+    }
     if (!account && !legacyRebirth) {
       const name = game.checkNewName(msg.name);
       if (!name.ok) {

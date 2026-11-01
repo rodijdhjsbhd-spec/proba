@@ -407,7 +407,7 @@ const TUTORIAL = [
   { id: 'corridor', text: 'Выйти в коридор (гермодверь внизу комнаты)' },
   { id: 'factory', text: 'Доехать на лифте до Цеха №4 (96 этаж) и войти' },
   { id: 'shift', text: 'Отработать смену у любого станка' },
-  { id: 'eat', text: 'Поесть: Столовая №3 (100 этаж) или хлеб из карманов' },
+  { id: 'eat', text: 'Поесть: Столовая №3 (100 этаж) — на талоны со смены' },
   { id: 'seal', text: 'Дома задраить гермодверь (учебная тревога)' },
   { id: 'talk', text: 'Заговорить с соседом (Enter — чат)' },
 ];
@@ -434,6 +434,9 @@ const NOTES = {
   boardTtlH: 12, // через сколько реальных часов листок снимают
   cooldownMs: 8000, // как часто один жилец может что-то подсовывать
 };
+
+// Справочники без прототипа: ключи приходят от клиентов и из Пульта, а C.ITEMS['constructor'] не должен «находиться»
+for (const map of [ITEMS, SHOPS, CONDITIONS, ACCIDENTS, PLACES, BREAKDOWNS, HAZARDS, DEEDS, SPOIL, FOGGED, SIDE_JOBS, BARYGA_PRICES, CLIMATES, HOUSE_SOUNDS, FACILITIES]) Object.setPrototypeOf(map, null);
 
 module.exports = {
   BUILDING, FACILITIES, BALANCE, ITEMS, SHOPS, CONDITIONS, ACCIDENTS, PLACES, BREAKDOWNS, HALLUCINATIONS,

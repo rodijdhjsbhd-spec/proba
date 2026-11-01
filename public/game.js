@@ -135,7 +135,10 @@
       case 'register_error': {
         // ошибка новой жизни — на экране смерти, а не в скрытой форме входа
         const onDeath = !$('#death').hidden;
-        if (onDeath) $('#rebirth-wait').textContent = msg.error;
+        if (onDeath) {
+          S.rebirthError = msg.error; // экран смерти обновляется каждую секунду — ошибку держим, пока не отправят снова
+          $('#rebirth-wait').textContent = msg.error;
+        }
         else $(S.regMode === 'login' ? '#login-error' : '#register-error').textContent = msg.error;
         toast({ title: onDeath ? 'Новый ордер не выдан' : S.regMode === 'login' ? 'Не вышло войти' : 'Ордер не выдан', text: msg.error, style: 'error' });
         break;
@@ -297,16 +300,10 @@
         fenceNear();
         return;
       }
-      if (S.lastWordNear) {
-        readLastWord(S.lastWordNear);
-        return;
-      }
-      if (S.lampNear != null) {
-        act('fix_lamp', { index: S.lampNear }).then((r) => r.ok && say(r.message));
-        return;
-      }
       const info = S.near && objectInfo(S.near);
-      if (info && info.actions[0]) info.actions[0].run();
+      if (info && info.actions[0]) return info.actions[0].run();
+      if (S.lastWordNear) return readLastWord(S.lastWordNear);
+      if (S.lampNear != null) act('fix_lamp', { index: S.lampNear }).then((r) => r.ok && say(r.message));
     } else if (e.code === 'Enter') {
       e.preventDefault();
       $('#chat-input').focus();
@@ -459,6 +456,8 @@
         const r = residents()[o.number];
         const knock = { label: 'Постучать', run: async () => { const res = await act('knock', { apt: o.number }); if (res.ok) say(res.message); } };
         if (!r || !r.name) return { label: `Кв. ${o.number}`, sub: 'пустует', actions: [knock] };
+        // дверь погибшего опечатана: записки и передачки некому
+        if (r.dead) return { label: `Кв. ${o.number}`, sub: `${r.name} · опечатано`, actions: [knock] };
         return {
           label: `Кв. ${o.number}`,
           sub: `${r.name}${r.rumor && r.rumor.length ? ` · говорят: ${r.rumor.join(', ')}` : ''}`,
@@ -669,25 +668,11 @@
       );
       return;
     }
-    const lw = busy ? null : nearestLastWord();
-    S.lastWordNear = lw;
-    if (lw && !nearestHazard()) {
-      S.near = null;
-      S.lampNear = null;
-      S.hazardNear = null;
-      const sig = `lw${lw.id}`;
-      if (S.memo.prompt === sig) return;
-      S.memo.prompt = sig;
-      $('#prompt').replaceChildren(
-        h('span', { class: 'label' }, 'Листок на полу', h('small', { text: ` · последние слова: ${lw.by}` })),
-        h('button', { class: 'btn small primary', onclick: () => readLastWord(lw) }, h('kbd', { text: 'E' }), 'Прочитать'),
-      );
-      return;
-    }
     const hz = busy ? null : nearestHazard();
     if (hz) {
       S.near = null;
       S.lampNear = null;
+      S.lastWordNear = null;
       S.hazardNear = hz.id;
       const sig = `hz${hz.id}`;
       if (S.memo.prompt === sig) return;
@@ -699,25 +684,22 @@
       return;
     }
     S.hazardNear = null;
-    const lamp = S.view && !S.view.you.travel && !S.view.you.down ? nearestDeadLamp() : null;
-    if (lamp != null) {
-      S.near = null;
-      const hasBulb = S.view.you.inventory.some((i) => i.id === 'bulb');
-      const sig = `lamp${lamp}${hasBulb}`;
-      if (S.memo.prompt === sig) return;
-      S.memo.prompt = sig;
-      $('#prompt').replaceChildren(
-        h('span', { class: 'label' }, 'Погасший плафон', h('small', { text: hasBulb ? ' · у вас есть лампочка' : ' · нужна лампочка (бывает в мусоропроводе)' })),
-        hasBulb ? h('button', { class: 'btn small primary', onclick: () => act('fix_lamp', { index: lamp }).then((r) => r.ok && say(r.message)) }, h('kbd', { text: 'E' }), 'Вкрутить лампочку') : null,
-      );
-      S.lampNear = hasBulb ? lamp : null;
-      return;
-    }
-    S.lampNear = null;
-    const o = S.view && (S.view.you.travel || S.view.you.down) ? null : nearestObject();
+    // дверь или предмет — главное; листок на полу и погасший плафон рядом не отнимают у них подсказку и E
+    const o = busy ? null : nearestObject();
+    const lw = busy ? null : nearestLastWord();
+    const lamp = busy || !S.view ? null : nearestDeadLamp();
+    const hasBulb = !!(S.view && S.view.you.inventory.some((i) => i.id === 'bulb'));
     S.near = o;
-    const info = o && objectInfo(o);
-    const sig = info ? `${o.id}|${info.label}|${info.sub}|${info.actions.map((a) => a.label).join('/')}` : 'none';
+    S.lastWordNear = lw && !o ? lw : null;
+    S.lampNear = lamp != null && hasBulb && !o && !lw ? lamp : null;
+    const extras = [];
+    if (lw) extras.push({ label: 'Прочитать листок', run: () => readLastWord(lw) });
+    if (lamp != null && hasBulb) extras.push({ label: 'Вкрутить лампочку', run: () => act('fix_lamp', { index: lamp }).then((r) => r.ok && say(r.message)) });
+    let info = o && objectInfo(o);
+    if (info) info = { ...info, actions: [...info.actions, ...extras] };
+    else if (lw) info = { label: 'Листок на полу', sub: `последние слова: ${lw.by}`, actions: extras };
+    else if (lamp != null) info = { label: 'Погасший плафон', sub: hasBulb ? 'у вас есть лампочка' : 'нужна лампочка (бывает в мусоропроводе)', actions: extras };
+    const sig = info ? `${o ? o.id : lw ? lw.id : `lamp${lamp}`}|${info.label}|${info.sub}|${info.actions.map((a) => a.label).join('/')}` : 'none';
     if (S.memo.prompt === sig) return;
     S.memo.prompt = sig;
     const box = $('#prompt');
@@ -1221,6 +1203,7 @@
 
   $('#rebirth-form').addEventListener('submit', (e) => {
     e.preventDefault();
+    S.rebirthError = null;
     closeSheet();
     send({ t: 'register', name: $('#rebirth-name').value });
   });
@@ -1233,7 +1216,7 @@
     if (ob) $('#obituary').textContent = `Прожил в доме: ${ob.lived}. Смен отработано: ${ob.shifts}. Помог соседям: ${ob.helped}.${ob.bestRank > 1 ? ` Лучший разряд: ${ob.bestRank}.` : ''}`;
     const wait = v.you.rebirthInSec || 0;
     $('#rebirth-submit').disabled = wait > 0;
-    $('#rebirth-wait').textContent = wait > 0 ? `Дом ещё не принял вашу смерть. Новый ордер — через ${fmtSec(wait)}.` : '';
+    $('#rebirth-wait').textContent = wait > 0 ? `Дом ещё не принял вашу смерть. Новый ордер — через ${fmtSec(wait)}.` : S.rebirthError || '';
     $('#echo-box').hidden = !!v.you.echoUsed || !v.you.echoPhrases;
     memo('echo', [v.you.echoUsed, v.you.echoPhrases], () => {
       $('#echo-phrases').replaceChildren(
@@ -1735,7 +1718,7 @@
       title: ask.from || 'ЖЭК',
       body: ask.question,
       style: 'announce',
-      actions: ask.options.map((label, i) => ({ label, primary: i === 0, onClick: async () => (await act('answer', { id: ask.id, option: i })).ok })),
+      actions: ask.options.map((label, i) => ({ label, primary: i === 0, onClick: async () => { const r = await act('answer', { id: ask.id, option: i }); return r.ok || !!r.gone; } })),
     });
   }
 
@@ -2179,7 +2162,7 @@
     const progress = h('div', { class: 'progress' });
     workShell(job, screen, progress);
     let i = 0;
-    const inputs = d.readings.map((_, n) => h('input', { maxlength: '5', inputmode: 'numeric', placeholder: `№${n + 1}`, 'aria-label': `Показание ${n + 1}` }));
+    const inputs = d.readings.map((r, n) => h('input', { maxlength: String(String(r).length), inputmode: 'numeric', placeholder: `№${n + 1}`, 'aria-label': `Показание ${n + 1}` }));
     const collect = () => inputs.map((inp) => inp.value);
     const askInputs = () => {
       screen.replaceWith(

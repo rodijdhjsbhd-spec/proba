@@ -112,10 +112,16 @@
         A.admins = msg.admins || [];
         $('#login').hidden = true;
         $('#app').hidden = false;
-        if (!A.built) build();
-        else {
-          // переподключились: палитра могла измениться, а Глазок — надо снова попросить
-          rebuildContent();
+        if (!A.built) {
+          A.contentSig = JSON.stringify(A.content);
+          build();
+        } else {
+          // переподключились: пересобираем, только если палитра правда изменилась; Глазок — попросить снова
+          const sig = JSON.stringify(A.content);
+          if (sig !== A.contentSig) {
+            A.contentSig = sig;
+            rebuildContent();
+          }
           if (!$('#tab-eye').hidden) send({ t: 'watch', key: E.key });
         }
         renderLog();
@@ -144,6 +150,7 @@
       case 'admin_content':
         // палитра изменилась — пересобираем списки
         A.content = msg.content;
+        A.contentSig = JSON.stringify(A.content);
         if (A.built) rebuildContent();
         break;
       case 'log':
@@ -390,6 +397,10 @@
 
   /** Палитра добавила или убрала болезнь/случай/предмет — пересобрать всё, где есть списки. */
   function rebuildContent() {
+    // то, что бог уже набрал в карточках, переживает пересборку (поля в том же порядке)
+    const fields = () => [...document.querySelectorAll('#event-grid input, #event-grid textarea, #event-grid select, #player-card input, #player-card textarea, #player-card select')];
+    const saved = fields().map((el) => (el.type === 'checkbox' ? el.checked : el.value));
+    const cardFor = A.selected;
     A.pickers = [];
     $('#event-grid').replaceChildren();
     buildEvents();
@@ -397,6 +408,14 @@
     fillEyeTools();
     A.memo.cardShell = null;
     renderSnapshot();
+    if (A.selected === cardFor) {
+      fields().forEach((el, i) => {
+        if (i >= saved.length) return;
+        if (el.type === 'checkbox') el.checked = saved[i];
+        else if (el.tagName !== 'SELECT' || [...el.options].some((o) => o.value === saved[i])) el.value = saved[i];
+        el.dispatchEvent(new Event('change'));
+      });
+    }
   }
 
   function buildEvents() {
@@ -943,7 +962,7 @@
     renderSchedule();
     if (A.supplyInfo) {
       const st = s.world.stock || {};
-      const short = Object.entries(st).flatMap(([shop, items]) => Object.entries(items).filter(([, n]) => n <= 2).map(([k, n]) => `${A.content.items[k]?.name || k}: ${n}`));
+      const short = Object.entries(st).flatMap(([shop, items]) => Object.entries(items).filter(([, n]) => n <= 2).map(([k, n]) => `${(A.content.shopNames || {})[k] || A.content.items[k]?.name || k}: ${n}`));
       A.supplyInfo.textContent = `Смен за сутки: ${s.world.shiftsToday}. Следующий завоз: ${Math.round((s.world.supplyNext ?? 1) * 100)}% от расчёта.${short.length ? ` Заканчивается: ${short.join(', ')}.` : ''}${s.world.lampsOutFloors ? ` Этажей с погасшими лампами: ${s.world.lampsOutFloors}.` : ''}`;
     }
     renderPlayers();
@@ -1493,15 +1512,20 @@
     const now = Date.now();
     for (const [id, until] of Object.entries(A.hiddenHints)) if (until < now) delete A.hiddenHints[id];
     const hints = d.hints.filter((x) => !A.hiddenHints[x.id]);
-    memo('director', hints.map((x) => [x.id, x.text]), () => {
+    // кнопки не пересоздаём каждую секунду (иначе нажатие теряется): только обновляем текст
+    A.hintText = A.hintText || new Map();
+    memo('director', hints.map((x) => x.id), () => {
+      A.hintText.clear();
       $('#director-hints').replaceChildren(
         ...(hints.length
           ? hints.map((x) => {
               const scene = x.scene || (x.playerId ? sceneOfPlayer(x.playerId) : null);
+              const txt = h('span', { class: 'txt', text: x.text });
+              A.hintText.set(x.id, txt);
               return h(
                 'li',
                 { class: `hint-${x.level}` },
-                h('span', { class: 'txt', text: x.text }),
+                txt,
                 x.playerId ? button('Жилец', () => openPlayer(x.playerId), 'small') : null,
                 scene ? button('Глазок', () => watchScene(scene), 'small') : null,
                 button('Скрыть', () => {
@@ -1515,6 +1539,10 @@
           : [h('li', { class: 'calm', text: 'Режиссёру нечего подсказать.' })]),
       );
     });
+    for (const x of hints) {
+      const el = A.hintText.get(x.id);
+      if (el && el.textContent !== x.text) el.textContent = x.text;
+    }
   }
 
   function renderPetitions() {

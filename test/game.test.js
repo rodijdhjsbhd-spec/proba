@@ -824,6 +824,7 @@ test('без сознания: не помогли — смерть; обшар�
   victim.money = 9;
   game.addItem(victim, 'stew', 3);
   victim.createdAt -= (C.BALANCE.newbieProtectionH + 1) * 3600 * 1000; // уже не новосёл
+  thief.createdAt -= (C.BALANCE.newbieProtectionH + 1) * 3600 * 1000; // новосёлам воровать нельзя
   assert.equal(game.rob(thief, victim.id).ok, false, 'в сознании не обшарить');
   game.admin('custom', { target: { type: 'player', id: victim.id }, title: 'Обвал', effect: { health: -200 } });
   assert.ok(victim.down);
@@ -1067,6 +1068,7 @@ test('карманник в темноте: только без света, не
   const victim = join(game, 'Иван');
   for (const p of [thief, victim]) game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
   victim.money = 5;
+  thief.createdAt -= (C.BALANCE.newbieProtectionH + 1) * 3600 * 1000; // новосёлам воровать нельзя
   assert.equal(game.pickpocket(thief, victim.id).ok, false, 'светло');
   game.admin('power', { on: false, from: 101, to: 101 });
   assert.equal(game.pickpocket(thief, victim.id).ok, false, 'новосёл под защитой');
@@ -1608,16 +1610,24 @@ test('без сознания: лечение от ЖЭК будит; помощ
   assert.equal(game.canTouch(b, a), false);
 });
 
-test('упал на лестнице — тело не идёт дальше, пока не помогут', () => {
-  const { game, advance } = makeWorld();
+test('упал на лестнице — тело в коридоре ближайшего этажа, где ему могут помочь', () => {
+  const { game, clock } = makeWorld();
   const p = join(game, 'Иван');
+  const q = join(game, 'Мария');
   game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
   walkTo(game, p, type('stairs'));
   assert.equal(game.startTravel(p, 96, 'stairs').ok, true);
+  clock.t += 1000;
   game.fall(p, 'тест');
-  advance(20 * 1000);
-  assert.ok(p.travel, 'всё ещё на лестнице');
-  assert.equal(p.travel.toFloor, 96);
+  assert.equal(p.travel, null);
+  assert.equal(p.location.place, 'corridor');
+  assert.ok(p.location.floor <= 101 && p.location.floor >= 96);
+  // соседка приходит на этот этаж и помогает
+  game.admin('teleport', { id: q.id, place: 'corridor', floor: p.location.floor });
+  q.pos = { ...p.pos };
+  game.admin('give', { id: q.id, item: 'bread', count: 1, silent: true });
+  assert.equal(game.aid(q, p.id, 'bread').ok, true);
+  assert.equal(p.down, null);
 });
 
 test('имена: греческие двойники и невидимые заполнители не проходят', () => {
@@ -1670,6 +1680,7 @@ test('квитанция: в гостях, талоны, кто рылся в к
   game.setOnline(a.id, false);
   game.markAway(a, game.now());
   const b = join(game, 'Мария');
+  b.createdAt -= (C.BALANCE.newbieProtectionH + 1) * 3600 * 1000;
   game.admin('teleport', { id: b.id, place: 'canteen' });
   game.admin('custom', { target: { type: 'player', id: a.id }, title: 'Удар', effect: { health: -200 } });
   b.pos = { ...a.pos };
@@ -2117,4 +2128,109 @@ test('звук в доме: только тем, кто в сети, по цел
   assert.deepEqual(heard.map((e) => e.to), [a.id]);
   assert.match(heard[0].text, /плачет/);
   assert.equal(game.admin('sound', { target: { type: 'all' }, kind: 'nope' }).ok, false);
+});
+
+// ---------------------------------------------------------------------------
+// Исправления по третьей проверке
+// ---------------------------------------------------------------------------
+test('заряд противогаза ходит вместе с вещью: новый — полный, отработанный — пустой', () => {
+  const { game } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  for (const p of [a, b]) game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  b.pos = { ...a.pos };
+  game.admin('give', { id: a.id, item: 'gasmask', count: 1, silent: true });
+  a.gasmaskCharge = 0;
+  assert.equal(game.tradeOffer(a, b.id, { money: 0, items: { gasmask: 1 } }, { money: 0, items: {} }).ok, true);
+  assert.equal(b.gasmaskCharge, 0, 'отработанный остаётся отработанным');
+  assert.equal(game.maskWorks(b), false);
+  game.admin('give', { id: a.id, item: 'gasmask', count: 1, silent: true });
+  assert.equal(a.gasmaskCharge, 100, 'новый — с полным фильтром');
+  assert.equal(game.windowPut(a, 'gasmask', 1).ok, false, 'в авоську — только еду');
+});
+
+test('наследство одно: вещь уходит из опечатанной квартиры, второй наследник её не получит', () => {
+  const { game, clock } = makeWorld();
+  const dead = join(game, 'Иван');
+  game.admin('give', { id: dead.id, item: 'gasmask', count: 1, silent: true });
+  game.kill(dead, 'тест');
+  clock.t += (C.BALANCE.rebirthDelayMin + 1) * 60000;
+  const h1 = game.register('Иван второй', { predecessor: dead }).player;
+  assert.equal(h1.inventory.gasmask, 1);
+  assert.equal(dead.inventory.gasmask || 0, 0, 'у покойника забрали');
+  const h2 = game.register('Иван третий', { predecessor: dead }).player;
+  assert.equal(h2.inventory.gasmask || 0, 0);
+  assert.equal(game.isNewbie(h1), false, 'наследник — не новосёл');
+});
+
+test('новый туман поверх старого не выгоняет гостей погибшего хозяина', () => {
+  const { game, guest, host } = knockScene();
+  game.knock(guest, host.apartment.number);
+  game.openDoor(host, guest.id);
+  game.seal(host, true);
+  game.admin('fog', { from: 101, to: 101, warnSec: 0, durationMin: 5 });
+  game.kill(host, 'тест');
+  game.admin('fog', { from: 101, to: 102, warnSec: 0, durationMin: 5 });
+  assert.equal(game.locationKey(guest), `home:${host.apartment.number}`);
+});
+
+test('опасность не перепрыгнуть длинным шагом; две опасности в одну клетку не встают', () => {
+  const { game, clock } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  const sc = game.map.scene('corridor:101');
+  const y = 3.5;
+  game.admin('hazard', { scene: 'corridor:101', kind: 'wire', x: 10.5, y });
+  assert.equal(game.admin('hazard', { scene: 'corridor:101', kind: 'steam', x: 10.5, y }).ok, false);
+  p.pos = { x: 9.3, y, d: 'right' };
+  clock.t += 2000;
+  const hp = p.stats.health;
+  assert.equal(game.setPos(p, 11.6, y, 'right'), true);
+  assert.ok(p.stats.health < hp, 'ударило по дороге');
+  assert.ok(sc);
+});
+
+test('палитра: прототипы не трогаются; имя с украинской і не выдаст себя за соседа', () => {
+  const { game } = makeWorld();
+  assert.equal(game.admin('paletteRemove', { type: 'constructor', id: 'keys' }).ok, false);
+  assert.equal(typeof Object.keys, 'function');
+  assert.equal(game.admin('paletteAdd', { type: '__proto__', def: { name: 'x' } }).ok, false);
+  const r = game.admin('paletteAdd', { type: 'accidents', def: { name: 'Тест', condition: 'constructor' } });
+  assert.equal(C.ACCIDENTS[r.id].condition, undefined);
+  game.admin('paletteRemove', { type: 'accidents', id: r.id });
+  join(game, 'Nikita');
+  assert.equal(game.register('Nіkіta').ok, false);
+});
+
+test('последние слова — только сказанное рядом и недавно; удалённое ЖЭК не всплывает', () => {
+  const { game, clock } = makeWorld();
+  const a = join(game, 'Иван');
+  game.admin('teleport', { id: a.id, place: 'corridor', floor: 101 });
+  game.chat(a, 'global', 'мой телефон 123');
+  clock.t += 1000;
+  game.kill(a, 'тест');
+  assert.ok(!(game.world.scars['corridor:101'] || []).some((x) => x.kind === 'lastword'), 'общий чат — не последние слова');
+  const b = join(game, 'Мария');
+  game.admin('teleport', { id: b.id, place: 'corridor', floor: 101 });
+  game.chat(b, 'local', 'гадость');
+  const id = [...game.localChat.get('corridor:101')].at(-1).id;
+  game.admin('deleteMessage', { id });
+  clock.t += 1000;
+  game.kill(b, 'тест');
+  assert.ok(!(game.world.scars['corridor:101'] || []).some((x) => x.kind === 'lastword' && x.text === 'гадость'));
+});
+
+test('дилемма: после срока ответить нельзя, окно закрывается; учебной тревоги нет в настоящую сирену', () => {
+  const { game, clock } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('ask', { target: { type: 'player', id: p.id }, question: 'Да?', options: ['Да', 'Нет'], timeoutMin: 1 });
+  const ask = p.asks[0];
+  clock.t += 2 * 60000;
+  const r = game.answer(p, ask.id, 0);
+  assert.equal(r.ok, false);
+  assert.equal(r.gone, true);
+  p.tutorial = { done: ['eat'], rewarded: false, drill: false };
+  game.admin('fog', { from: p.apartment.floor, to: p.apartment.floor, warnSec: 60, durationMin: 1 });
+  game.tutorialDrill(p);
+  assert.equal(p.tutorial.drill, false, 'учения не в настоящую тревогу');
 });
