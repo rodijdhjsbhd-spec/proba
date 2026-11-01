@@ -36,6 +36,7 @@
   const A = {
     ws: null,
     password: session.get('gh_admin'),
+    login: session.get('gh_admin_login') || '',
     content: null,
     snap: null,
     log: [],
@@ -59,7 +60,7 @@
     ws.onopen = () => {
       A.retry = 0;
       $('#conn').hidden = true;
-      if (A.password) send({ t: 'auth', password: A.password });
+      if (A.password) send({ t: 'auth', login: A.login || '', password: A.password });
     };
     ws.onmessage = (e) => {
       let msg;
@@ -106,6 +107,9 @@
         A.chat = (msg.chat || []).slice();
         A.snap = msg.snapshot;
         A.players = new Map(msg.snapshot.players.map((p) => [p.id, p]));
+        A.me = msg.me || { name: 'root', role: 'god', roleName: 'бог' };
+        A.godLog = msg.godLog || [];
+        A.admins = msg.admins || [];
         $('#login').hidden = true;
         $('#app').hidden = false;
         if (!A.built) build();
@@ -117,6 +121,7 @@
         renderLog();
         renderChat();
         renderSnapshot();
+        renderGods();
         break;
       case 'snapshot': {
         // сервер шлёт только изменившихся жильцов
@@ -129,6 +134,12 @@
       }
       case 'watch':
         onWatch(msg.scene);
+        break;
+      case 'godlog':
+        A.godLog.push(msg.entry);
+        if (A.godLog.length > 300) A.godLog.shift();
+        if (msg.admins) A.admins = msg.admins;
+        renderGods();
         break;
       case 'admin_content':
         // палитра изменилась — пересобираем списки
@@ -162,9 +173,11 @@
   $('#login-form').addEventListener('submit', (e) => {
     e.preventDefault();
     A.password = $('#password').value;
+    A.login = $('#admin-login').value.trim();
     session.set('gh_admin', A.password);
+    session.set('gh_admin_login', A.login);
     $('#login-error').textContent = '';
-    if (A.ws && A.ws.readyState === WebSocket.OPEN) send({ t: 'auth', password: A.password });
+    if (A.ws && A.ws.readyState === WebSocket.OPEN) send({ t: 'auth', login: A.login, password: A.password });
   });
 
   function toast(text, style = 'info') {
@@ -364,6 +377,7 @@
     buildEvents();
     buildPalette();
     initEye();
+    initGods();
   }
 
   function switchTab(name) {
@@ -900,6 +914,7 @@
     renderHazards();
     renderRadio();
     renderAssignments();
+    renderSnapshots();
     if (A.barygaInfo) {
       const b = s.world.baryga;
       const pl = s.world.plan;
@@ -1107,6 +1122,7 @@
             button('Стереть из домовой книги', () => confirm(`Стереть ${p.name} навсегда?`) && cmd('erase', { id }, 'Стёрт'), 'danger'),
           ),
         ),
+        rollbackRow(id) ? h('div', { class: 'card-section' }, h('h3', { text: 'Вернуть к снимку' }), rollbackRow(id)) : null,
         // бан паспорта переживает смерть жильца — снять его можно и отсюда
         p.account || p.banned
           ? h('div', { class: 'card-section' }, h('h3', { text: 'Модерация' }), actions(button('Разбанить паспорт и адрес', () => cmd('unban', { id }), 'small')))
@@ -1259,6 +1275,8 @@
         : null,
     );
 
+    // Откат жильца к снимку
+    const rollback = rollbackRow(id);
     // Смерть
     const cause = h('input', { placeholder: 'Причина смерти', maxlength: '120', 'aria-label': 'Причина смерти' });
     const deathSection = h(
@@ -1266,6 +1284,7 @@
       { class: 'card-section' },
       h('h3', { text: 'Жизнь и смерть' }),
       h('div', { class: 'row' }, cause, button('Убить', () => confirm(`Убить ${p.name}?`) && cmd('kill', { id, cause: cause.value }), 'small danger')),
+      rollback,
     );
 
     box.replaceChildren(header, dyn, statsSection, invSection, condSection, accSection, tpSection, whSection, modSection, deathSection);
@@ -1818,6 +1837,79 @@
           );
         }),
       );
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Боги: журнал «кто что нажал», снимки мира и откат, учётки
+  // ---------------------------------------------------------------------------
+  const ROLE_RU = { god: 'бог', moderator: 'модератор', observer: 'наблюдатель' };
+
+  function initGods() {
+    $('#snap-take').addEventListener('click', () => cmd('snapshot', { label: $('#snap-label').value }).then((r) => r.ok && ($('#snap-label').value = '')));
+    $('#admin-add').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const r = await cmd('adminAdd', { login: $('#adm-login').value, password: $('#adm-pass').value, role: $('#adm-role').value });
+      if (r.ok) {
+        $('#adm-login').value = '';
+        $('#adm-pass').value = '';
+      }
+    });
+    renderGods();
+  }
+
+  function renderGods() {
+    if (!A.built) return;
+    $('#me-line').textContent = `Вы вошли как ${A.me.name} — ${A.me.roleName}.${A.me.role === 'god' ? ' Модератор: заглушки, баны, имена, чаты, заявления. Наблюдатель: только смотрит.' : ' Управлять учётками может только бог.'}`;
+    $('#admin-add').hidden = A.me.role !== 'god';
+    $('#admin-list').replaceChildren(
+      h('li', { class: 'fenced' }, h('span', { class: 'txt' }, h('b', { text: 'root' }), ' — бог (общий пароль ЖЭК)')),
+      ...(A.admins || []).map((a) => h('li', null, h('span', { class: 'txt' }, h('b', { text: a.login }), ` — ${ROLE_RU[a.role] || a.role}`), A.me.role === 'god' ? button('Удалить', () => confirm(`Удалить учётку ${a.login}?`) && cmd('adminRemove', { login: a.login }), 'small') : null)),
+    );
+    const log = $('#god-log');
+    log.replaceChildren(
+      ...A.godLog
+        .slice()
+        .reverse()
+        .map((e) =>
+          h(
+            'li',
+            { class: e.ok ? 'admin' : 'death' },
+            h('span', { class: 'clock-s', text: new Date(e.ts).toLocaleString('ru-RU') }),
+            h('b', { text: e.who }),
+            ` · ${e.cmd}`,
+            e.ok ? null : h('span', { text: ` · ✕ ${e.error || ''}` }),
+            h('small', { class: 'args', text: ` ${e.args}` }),
+          ),
+        ),
+    );
+  }
+
+  /** Строка «вернуть жильца к снимку» для карточки (или null, если снимков нет). */
+  function rollbackRow(id) {
+    const list = (A.snap?.snapshots || []).slice().reverse();
+    if (!list.length) return null;
+    const sel = select(list.map((x) => [x.id, `${x.clock} · ${x.label}`]));
+    return h('div', { class: 'row' }, sel, button('Вернуть жильца', () => confirm('Вернуть жильца к этому снимку (здоровье, карманы, место)?') && cmd('restorePlayer', { snapshotId: sel.value, id }), 'small'));
+  }
+
+  function renderSnapshots() {
+    const list = (A.snap.snapshots || []).slice().reverse();
+    memo('snapshots', list.map((x) => x.id), () => {
+      $('#snap-list').replaceChildren(
+        ...(list.length
+          ? list.map((x) =>
+              h(
+                'li',
+                null,
+                h('span', { class: 'txt' }, h('b', { text: x.clock }), ` · ${x.label} · ${x.who} · ${Math.round(x.size / 1024)} КБ`),
+                button('Откатить дом', () => confirm(`Откатить ВЕСЬ дом к ${x.clock} («${x.label}»)? Жильцы, заселившиеся позже, исчезнут.`) && cmd('restoreHouse', { snapshotId: x.id }), 'small danger'),
+              ),
+            )
+          : [h('li', { class: 'calm', text: 'Снимков пока нет. Они появятся перед первой опасной командой.' })]),
+      );
+      // выбор снимка в карточке жильца
+      A.memo.cardShell = null;
     });
   }
 

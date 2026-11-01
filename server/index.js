@@ -26,7 +26,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
-const { Game, WORLD_CONFIG } = require('./game');
+const { Game, WORLD_CONFIG, ROLE_NAMES } = require('./game');
 const storage = require('./storage');
 const { BALANCE, ITEMS } = require('./content');
 
@@ -335,6 +335,46 @@ game.on('content_changed', () => {
 
 // Радиоточка: передача доходит только до тех, кто сейчас у радиоточки
 game.on('radio', ({ to, text, garbled, kind }) => sendToPlayer(to, { t: 'radio', text, garbled, kind }));
+// Журнал богов — всем открытым Пультам
+game.on('godlog', (entry) => {
+  for (const ws of admins) send(ws, { t: 'godlog', entry, admins: ws.adminRole === 'god' ? Object.values(game.state.admins).map((a) => ({ login: a.login, role: a.role, createdAt: a.createdAt })) : undefined });
+});
+// Учётку удалили — её Пульты закрываются
+game.on('admin_removed', (login) => {
+  for (const ws of admins) if (ws.adminName === login) {
+    send(ws, { t: 'auth_error', error: 'Ваша учётка удалена.' });
+    ws.close();
+  }
+});
+// Снимки мира — ещё и на диск (переживают перезапуск)
+const SNAP_DIR = path.join(path.dirname(DATA_FILE), 'snapshots');
+game.on('snapshot_taken', (snap) => {
+  try {
+    fs.mkdirSync(SNAP_DIR, { recursive: true });
+    fs.writeFileSync(path.join(SNAP_DIR, `${snap.ts}-${snap.id}.json`), JSON.stringify(snap));
+    const files = fs.readdirSync(SNAP_DIR).filter((f) => f.endsWith('.json')).sort();
+    for (const f of files.slice(0, Math.max(0, files.length - 8))) fs.unlinkSync(path.join(SNAP_DIR, f));
+  } catch (err) {
+    console.error('[snapshot]', err.message);
+  }
+});
+try {
+  game.snapshots = fs.readdirSync(SNAP_DIR).filter((f) => f.endsWith('.json')).sort().slice(-8).map((f) => JSON.parse(fs.readFileSync(path.join(SNAP_DIR, f), 'utf8')));
+} catch {
+  /* снимков ещё нет */
+}
+// Дом откатили — всем заново: жильцы, которых в снимке не было, заселяются снова
+game.on('restored', () => {
+  for (const [id, set] of socketsByPlayer) {
+    if (game.getPlayer(id)) continue;
+    for (const ws of [...set]) {
+      unbind(ws);
+      send(ws, { t: 'need_register' });
+    }
+  }
+  for (const ws of admins) ws.sentPlayers = null;
+});
+
 // Одержимые вещи: мусоропровод говорит с теми, кто рядом
 game.on('object_say', ({ to, object, text }) => sendToPlayer(to, { t: 'object_say', object, text }));
 
@@ -667,6 +707,28 @@ adminWss.on('connection', (ws, req) => {
   ws.on('close', () => admins.delete(ws));
 });
 
+/** Впустить бога в Пульт: роль ограничивает команды, имя — в журнал богов. */
+function admitAdmin(ws, ip, name, role) {
+  failedLogins.delete(ip);
+  adminIps.add(ip);
+  ws.isAdmin = true;
+  ws.adminName = name;
+  ws.adminRole = role;
+  admins.add(ws);
+  const snapshot = game.adminSnapshot();
+  ws.sentPlayers = new Map(snapshot.players.map((pl) => [pl.id, JSON.stringify(pl)]));
+  send(ws, {
+    t: 'admin_init',
+    content: game.adminContent(),
+    log: game.state.log.slice(-200),
+    chat: [...game.state.chatGlobal.slice(-100), ...game.state.noteFeed.slice(-100)].sort((a, b) => a.ts - b.ts),
+    snapshot,
+    me: { name, role, roleName: ROLE_NAMES[role] || role },
+    godLog: game.state.godLog.slice(-300),
+    admins: role === 'god' ? Object.values(game.state.admins).map((a) => ({ login: a.login, role: a.role, createdAt: a.createdAt })) : [],
+  });
+}
+
 function handleAdminMessage(ws, ip, raw) {
   let msg;
   try {
@@ -685,6 +747,31 @@ function handleAdminMessage(ws, ip, raw) {
       send(ws, { t: 'auth_error', error: 'Слишком много попыток. Подождите минуту.' });
       return;
     }
+    const login = String(msg.login || '').trim().toLowerCase();
+    if (login && login !== 'root') {
+      // личная учётка бога — пароль проверяем асинхронно
+      if (!heavyAllowed(ws)) return send(ws, { t: 'auth_error', error: BUSY });
+      heavyInFlight++;
+      game
+        .verifyAdminAsync(login, msg.password)
+        .then((acc) => {
+          if (ws.readyState !== ws.OPEN) return;
+          if (!acc) {
+            countFailure(ip);
+            const all = failedLogins.get('admin:*');
+            const fresh = all && Date.now() - all.since < 60000 ? all : { since: Date.now(), count: 0, until: 0 };
+            fresh.count++;
+            if (fresh.count >= 30) fresh.until = Date.now() + 60000;
+            failedLogins.set('admin:*', fresh);
+            send(ws, { t: 'auth_error', error: 'Неверный логин или пароль.' });
+            return;
+          }
+          admitAdmin(ws, ip, acc.login, acc.role);
+        })
+        .catch((err) => console.error('[admin login]', err))
+        .finally(() => heavyInFlight--);
+      return;
+    }
     const given = Buffer.from(String(msg.password || ''));
     const expected = Buffer.from(ADMIN_PASSWORD);
     const ok = given.length === expected.length && crypto.timingSafeEqual(given, expected);
@@ -700,19 +787,7 @@ function handleAdminMessage(ws, ip, raw) {
       send(ws, { t: 'auth_error', error: 'Неверный пароль.' });
       return;
     }
-    failedLogins.delete(ip);
-    adminIps.add(ip);
-    ws.isAdmin = true;
-    admins.add(ws);
-    const snapshot = game.adminSnapshot();
-    ws.sentPlayers = new Map(snapshot.players.map((pl) => [pl.id, JSON.stringify(pl)]));
-    send(ws, {
-      t: 'admin_init',
-      content: game.adminContent(),
-      log: game.state.log.slice(-200),
-      chat: [...game.state.chatGlobal.slice(-100), ...game.state.noteFeed.slice(-100)].sort((a, b) => a.ts - b.ts),
-      snapshot,
-    });
+    admitAdmin(ws, ip, 'root', 'god');
     return;
   }
 
@@ -729,7 +804,7 @@ function handleAdminMessage(ws, ip, raw) {
   }
 
   if (msg.t === 'cmd') {
-    const res = game.admin(String(msg.cmd), msg.args && typeof msg.args === 'object' ? msg.args : {});
+    const res = game.admin(String(msg.cmd), msg.args && typeof msg.args === 'object' ? msg.args : {}, { who: ws.adminName, role: ws.adminRole });
     send(ws, { t: 'res', ...res, id: msg.id }); // id запроса важнее: в res может быть свой id (созданной записи)
     sendSnapshot([ws], game.adminSnapshot());
     for (const [id] of socketsByPlayer) syncLocation(id);

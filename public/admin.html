@@ -19,6 +19,8 @@
       <h1 class="logo">ПУЛЬТ ЖЭК</h1>
       <p class="sub">Доступ только для ответственных лиц.</p>
       <form id="login-form" autocomplete="off">
+        <label for="admin-login">Логин <small>(пусто — общий пароль ЖЭК)</small></label>
+        <input id="admin-login" autocomplete="username" maxlength="20">
         <label for="password">Пароль</label>
         <input id="password" type="password" required autocomplete="current-password">
         <button class="btn primary" type="submit">Войти</button>
@@ -59,6 +61,7 @@
       <button class="tab" data-tab="log">Журнал</button>
       <button class="tab" data-tab="radio">Чаты</button>
       <button class="tab" data-tab="palette">Палитра бед</button>
+      <button class="tab" data-tab="gods">Боги</button>
     </nav>
 
     <main class="admin-main">
@@ -199,6 +202,32 @@
           </div>
         </div>
       </section>
+      <section class="tab-page" id="tab-gods" hidden>
+        <div class="gods-layout">
+          <div class="panel">
+            <h2>Снимки мира</h2>
+            <p class="hint">Перед опасными командами (убийство, стирание, массовые беды, большой туман, облава…) мир сохраняется сам. Откат дома возвращает жильцов, их карманы и места, туман и поломки; журналы и паспорта не трогает. Перед откатом текущий мир тоже сохраняется.</p>
+            <div class="row"><input id="snap-label" maxlength="60" placeholder="Подпись снимка"><button class="btn small" type="button" id="snap-take">Снимок сейчас</button></div>
+            <ul class="hazard-list" id="snap-list"></ul>
+          </div>
+          <div class="panel">
+            <h2>Учётки богов</h2>
+            <p class="hint" id="me-line"></p>
+            <ul class="hazard-list" id="admin-list"></ul>
+            <form class="row" id="admin-add" autocomplete="off">
+              <input id="adm-login" maxlength="20" placeholder="логин">
+              <input id="adm-pass" type="password" placeholder="пароль, от 8" autocomplete="new-password">
+              <select id="adm-role"><option value="moderator">модератор</option><option value="observer">наблюдатель</option><option value="god">бог</option></select>
+              <button class="btn small" type="submit">Добавить</button>
+            </form>
+          </div>
+          <div class="panel gods-log">
+            <h2>Журнал богов</h2>
+            <ul class="admin-log" id="god-log"></ul>
+          </div>
+        </div>
+      </section>
+
       <section class="tab-page" id="tab-palette" hidden>
         <p class="hint palette-hint">Свои болезни, несчастные случаи и предметы — без перезапуска сервера. Появляются во всех списках Пульта; предметы — и в карманах жильцов.</p>
         <div class="event-grid" id="palette-grid"></div>

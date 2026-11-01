@@ -1994,3 +1994,35 @@ test('одержимые вещи: мусоропровод шепчет тем,
   assert.equal(game.readBoard(p).pinned[0].name, 'Сосед сверху');
   assert.ok(far);
 });
+
+test('журнал богов, роли, снимок перед опасной командой и откат жильца и дома', () => {
+  const { game } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  // роли
+  assert.equal(game.admin('adminAdd', { login: 'moder', password: 'secret123', role: 'moderator' }).ok, true);
+  assert.equal(game.admin('kill', { id: a.id }, { who: 'moder', role: 'moderator' }).ok, false, 'модератору нельзя убивать');
+  assert.equal(game.admin('mute', { id: a.id, minutes: 5 }, { who: 'moder', role: 'moderator' }).ok, true);
+  assert.equal(game.admin('mute', { id: a.id }, { who: 'глаз', role: 'observer' }).ok, false);
+  assert.ok(game.state.godLog.some((e) => e.who === 'moder' && e.cmd === 'kill' && e.error === 'нет прав'));
+  assert.ok(!game.state.godLog.some((e) => e.args.includes('secret123')), 'пароль не попал в журнал');
+  // опасная команда — снимок
+  a.money = 42;
+  game.admin('kill', { id: a.id, cause: 'тест' }, { who: 'root', role: 'god' });
+  assert.equal(game.snapshots.length, 1);
+  assert.equal(game.snapshots[0].who, 'root');
+  // откат жильца: снова жив, талоны на месте
+  const snapId = game.snapshots[0].id;
+  assert.equal(game.admin('restorePlayer', { snapshotId: snapId, id: a.id }).ok, true);
+  assert.equal(a.alive, false, 'старый объект больше не в мире');
+  const a2 = game.getPlayer(a.id);
+  assert.equal(a2.alive, true);
+  assert.equal(a2.money, 42);
+  assert.equal(game.playerByToken(a2.token).id, a.id, 'токен тот же');
+  // откат дома: Мария погибла — откатили дом — жива
+  game.admin('kill', { id: b.id, cause: 'тест' });
+  const before = game.snapshots.at(-1).id;
+  game.admin('restoreHouse', { snapshotId: before });
+  assert.equal(game.getPlayer(b.id).alive, true);
+  assert.ok(game.snapshots.some((x) => x.label === 'перед откатом дома'), 'откат можно отменить');
+});

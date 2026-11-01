@@ -124,6 +124,8 @@ function freshState() {
     petitions: [], // коллективные жалобы { id, floor, text, authorId, signers: [{ id, name, apt }], status, createdAt }
     elders: {}, // этаж → { votes: { голосующий: кандидат } } — старший по этажу
     ious: [], // долговые расписки { id, debtorId, holderId, bundle, dueDay, createdAt, status }
+    admins: {}, // личные учётки богов: логин → { login, salt, hash, role, createdAt } (root — пароль из ADMIN_PASSWORD)
+    godLog: [], // журнал богов: кто что нажал { ts, who, cmd, args, ok, error }
     palette: { conditions: {}, accidents: {}, items: {} }, // беды и предметы, придуманные в Пульте
     stock: null, // запасы столовой и медпункта на сегодня: { canteen: { ключ: штук } } — заполняется при загрузке
     bannedIps: {}, // адрес → { until, reason }
@@ -160,6 +162,7 @@ class Game extends EventEmitter {
     this.groupSince = new Map(); // сцена → с какого момента там собралось 3+ жильцов (для режиссёра)
     this.refusals = new Map(); // гость → кто не открыл ему в туман или выставил { apt, owner, ts, kind }
     this.unsealedBy = new Map(); // кв. → гость, который открыл чужую гермодверь
+    this.snapshots = []; // снимки мира перед опасными командами (в памяти; сервер хранит их и на диске)
     // Сервер лежал: для мира это пауза. Таймеры (туман, поломки, болезни, «без сознания», расписание)
     // продолжаются с того же места — иначе лежачий умрёт на первом тике, пока помочь было некому.
     const downtime = this.state.savedAt ? this.now() - this.state.savedAt : 0;
@@ -190,6 +193,8 @@ class Game extends EventEmitter {
     s.petitions = Array.isArray(s.petitions) ? s.petitions : [];
     s.elders = s.elders && typeof s.elders === 'object' ? s.elders : {};
     s.ious = Array.isArray(s.ious) ? s.ious : [];
+    s.admins = s.admins && typeof s.admins === 'object' ? s.admins : {};
+    s.godLog = Array.isArray(s.godLog) ? s.godLog : [];
     s.world.radio = { ...fresh.world.radio, ...(s.world.radio || {}) };
     s.world.breakdowns = { ...fresh.world.breakdowns, ...((state.world || {}).breakdowns || {}) };
     for (const p of Object.values(s.players || {})) {
@@ -2169,7 +2174,7 @@ class Game extends EventEmitter {
           this.state.schedule = this.state.schedule.filter((x) => x !== e);
         }
         e.runs = (e.runs || 0) + 1;
-        const res = this.admin(e.cmd, JSON.parse(JSON.stringify(e.args || {})));
+        const res = this.admin(e.cmd, JSON.parse(JSON.stringify(e.args || {})), { who: `расписание: ${e.label}`, role: 'god' });
         this.log(`По расписанию: ${e.label}${res.ok ? (res.message ? ` — ${res.message}` : '') : ` — не вышло: ${res.error}`}`, 'schedule');
       }
     } finally {
@@ -3546,14 +3551,95 @@ class Game extends EventEmitter {
   }
 
   /** Точка входа для всех команд админки. */
-  admin(cmd, args = {}) {
+  /**
+   * Команда Пульта. ctx — кто нажал { who, role }: роль ограничивает команды, всё пишется в журнал богов,
+   * а перед опасными командами мир сохраняется в снимок (можно откатить).
+   */
+  admin(cmd, args = {}, ctx = { who: 'система', role: 'god' }) {
     const fn = ADMIN_COMMANDS[cmd];
     if (!fn) return { ok: false, error: `Неизвестная команда: ${cmd}` };
-    try {
-      return fn.call(this, args) || { ok: true };
-    } catch (err) {
-      return { ok: false, error: err.message };
+    const role = ctx.role || 'god';
+    if (role !== 'god' && !(ROLE_COMMANDS[role] || []).includes(cmd)) {
+      this.godLogAdd(ctx.who, cmd, args, { ok: false, error: 'нет прав' });
+      return { ok: false, error: `Роль «${ROLE_NAMES[role] || role}» не может это делать.` };
     }
+    const danger = this.dangerLabel(cmd, args);
+    if (danger) this.takeSnapshot(danger, ctx.who);
+    let res;
+    try {
+      res = fn.call(this, args, ctx) || { ok: true };
+    } catch (err) {
+      res = { ok: false, error: err.message };
+    }
+    if (!QUIET_COMMANDS.includes(cmd)) this.godLogAdd(ctx.who, cmd, args, res);
+    return res;
+  }
+
+  godLogAdd(who, cmd, args, res) {
+    let text;
+    try {
+      // пароли в журнал не пишем
+      text = JSON.stringify(args, (k, v) => (/pass/i.test(k) ? '***' : v));
+    } catch {
+      text = '';
+    }
+    const entry = { ts: this.now(), clock: this.gameClock().label, who: who || 'система', cmd, args: text.length > 300 ? `${text.slice(0, 300)}…` : text, ok: !!res.ok, error: res.ok ? null : res.error || null };
+    this.state.godLog.push(entry);
+    if (this.state.godLog.length > 3000) this.state.godLog.splice(0, this.state.godLog.length - 3000);
+    this.emit('godlog', entry);
+  }
+
+  /** Опасна ли команда — тогда перед ней снимок мира. Возвращает подпись снимка или null. */
+  dangerLabel(cmd, a = {}) {
+    const t = a.target && a.target.type;
+    const mass = t && t !== 'player';
+    switch (cmd) {
+      case 'kill': return 'перед убийством жильца';
+      case 'erase': return 'перед стиранием жильца';
+      case 'revive': return 'перед воскрешением';
+      case 'custom': return a.effect && a.effect.kill ? 'перед смертельным событием' : mass ? 'перед массовым событием' : null;
+      case 'accident':
+      case 'infect': return mass && !a.id ? `перед массовым: ${cmd === 'accident' ? 'несчастный случай' : 'болезнь'}` : null;
+      case 'fog': return Math.abs(toInt(a.to) - toInt(a.from)) >= 5 || Number(a.intensity) >= 2 ? 'перед большим туманом' : null;
+      case 'paletteRemove': return 'перед удалением из палитры';
+      case 'barygaRaid': return 'перед облавой';
+      case 'petitionResolve': return a.verdict === 'punished' ? 'перед наказанием подписавших' : null;
+      default: return null;
+    }
+  }
+
+  // =========================================================================
+  // Снимки мира и откат
+  // =========================================================================
+  /** Что откатывается: жильцы и мир. Журналы, паспорта и учётки богов — нет. */
+  snapshotData() {
+    const st = this.state;
+    return JSON.stringify({
+      players: st.players, world: st.world, doors: st.doors, doorDrops: st.doorDrops, boardNotes: st.boardNotes, trades: st.trades,
+      ious: st.ious, assignments: st.assignments, petitions: st.petitions, elders: st.elders, stock: st.stock, archive: st.archive, schedule: st.schedule,
+    });
+  }
+
+  takeSnapshot(label, who) {
+    const snap = { id: newId('w'), ts: this.now(), clock: this.gameClock().label, label: label || 'снимок', who: who || 'система', data: this.snapshotData() };
+    this.snapshots.push(snap);
+    while (this.snapshots.length > 8) this.snapshots.shift();
+    this.emit('snapshot_taken', snap);
+    return snap;
+  }
+
+  snapshotsMeta() {
+    return this.snapshots.map((x) => ({ id: x.id, ts: x.ts, clock: x.clock, label: x.label, who: x.who, size: x.data.length }));
+  }
+
+  /** Проверить пароль бога (личная учётка). */
+  async verifyAdminAsync(login, password) {
+    const acc = this.state.admins[String(login || '').trim().toLowerCase()];
+    if (!password || String(password).length > 200) return null;
+    const given = Buffer.from(await Game.hashPasswordAsync(password, acc ? acc.salt : '00000000000000000000000000000000'), 'hex');
+    if (!acc) return null;
+    const expected = Buffer.from(acc.hash, 'hex');
+    return given.length === expected.length && crypto.timingSafeEqual(given, expected) ? acc : null;
   }
 
   requirePlayer(id, { alive = true } = {}) {
@@ -3695,6 +3781,15 @@ class Game extends EventEmitter {
 // ---------------------------------------------------------------------------
 // Команды админки. this — экземпляр Game.
 // ---------------------------------------------------------------------------
+// Роли богов: «модератор» следит за порядком, «наблюдатель» только смотрит. «Бог» может всё.
+const ROLE_NAMES = { god: 'бог', moderator: 'модератор', observer: 'наблюдатель' };
+const ROLE_COMMANDS = {
+  moderator: ['mute', 'unmute', 'ban', 'unban', 'deleteMessage', 'unpin', 'rename', 'dropsClear', 'petitionResolve', 'chat', 'announce', 'whisper', 'plantNote', 'rentForgive'],
+  observer: [],
+};
+// Частые команды-движения не засоряют журнал богов
+const QUIET_COMMANDS = ['puppetMove'];
+
 const ADMIN_COMMANDS = {
   pause({ paused }) {
     const w = this.world;
@@ -3718,7 +3813,7 @@ const ADMIN_COMMANDS = {
    *   repeat: 'none' | 'every' (каждые repeatMin минут) | 'daily' (каждые игровые сутки)
    */
   schedule({ cmd, args = {}, label, mode = 'in', value, repeat = 'none', repeatMin }) {
-    if (!ADMIN_COMMANDS[cmd] || ['schedule', 'unschedule', 'pause', 'erase'].includes(cmd)) throw new Error('Эту команду нельзя поставить в расписание');
+    if (!ADMIN_COMMANDS[cmd] || ['schedule', 'unschedule', 'pause', 'erase', 'restoreHouse', 'restorePlayer', 'adminAdd', 'adminRemove', 'snapshot'].includes(cmd)) throw new Error('Эту команду нельзя поставить в расписание');
     const now = this.timerNow();
     const gameMinMs = 1000; // каждый тик добавляет tickMs/1000 игровых минут: 1 игровая минута = 1 реальная секунда
     let at;
@@ -4152,6 +4247,72 @@ const ADMIN_COMMANDS = {
     for (const p of listeners) this.emit('object_say', { to: p.id, object: 'chute', text: clean });
     this.log(`Мусоропровод ${f} этажа: «${clean}»`, 'admin');
     return { ok: true, message: `Услышали: ${listeners.length}` };
+  },
+
+  /** Откатить весь дом к снимку. Перед этим текущий мир тоже сохраняется — откат можно отменить. */
+  restoreHouse({ snapshotId }, ctx = {}) {
+    const snap = this.snapshots.find((x) => x.id === snapshotId);
+    if (!snap) throw new Error('Нет такого снимка');
+    this.takeSnapshot('перед откатом дома', ctx.who);
+    const data = JSON.parse(snap.data);
+    const fresh = Game.normalize({ ...this.state, ...data });
+    Object.assign(this.state, fresh);
+    this.applyPalette();
+    this.byToken = new Map(Object.values(this.state.players).map((p) => [p.token, p.id]));
+    for (const p of Object.values(this.state.players)) {
+      const scene = this.sceneOf(p);
+      if (!p.pos || !World.canStand(scene, p.pos.x, p.pos.y)) p.pos = { ...this.map.spawn(scene.key), d: 'down' };
+    }
+    this.log(`Дом откачен к снимку «${snap.label}» (${snap.clock})`, 'admin');
+    this.emit('restored');
+    return { ok: true, message: `Дом откачен к ${snap.clock}` };
+  },
+
+  /** Вернуть одного жильца к снимку (жив, здоровье, карманы, место). Паспорт и токен — текущие. */
+  restorePlayer({ snapshotId, id }, ctx = {}) {
+    const snap = this.snapshots.find((x) => x.id === snapshotId);
+    if (!snap) throw new Error('Нет такого снимка');
+    const cur = this.getPlayer(id);
+    if (!cur) throw new Error('Жилец не найден');
+    const old = JSON.parse(snap.data).players[id];
+    if (!old) throw new Error('В этом снимке такого жильца ещё не было');
+    if (old.alive && !cur.alive && this.alivePlayers().some((q) => q.id !== id && q.apartment.number === old.apartment.number)) throw new Error('Его квартиру уже заняли — сначала освободите');
+    this.takeSnapshot(`перед откатом жильца ${cur.name}`, ctx.who);
+    const keep = { token: cur.token, account: cur.account, journal: cur.journal };
+    this.state.players[id] = Object.assign(old, keep);
+    const p = this.state.players[id];
+    p.job = null;
+    const scene = this.sceneOf(p);
+    if (!p.pos || !World.canStand(scene, p.pos.x, p.pos.y)) p.pos = { ...this.map.spawn(scene.key), d: 'down' };
+    this.journal(p, 'Вы вдруг оказались там, где были раньше. Будто время для вас отмоталось назад.', 'whisper');
+    this.log(`${p.name} откачен к снимку «${snap.label}» (${snap.clock})`, 'admin', p.id);
+    this.dirty([p.id, ...this.othersAt(p).map((q) => q.id)]);
+    return { ok: true, message: `${p.name} — как было в ${snap.clock}` };
+  },
+
+  /** Личная учётка бога. role: god | moderator | observer. */
+  adminAdd({ login, password, role = 'moderator' }) {
+    const key = String(login || '').trim().toLowerCase();
+    if (!/^[a-zа-яё0-9_.-]{3,20}$/i.test(key) || key === 'root') throw new Error('Логин — 3–20 букв или цифр (не root)');
+    if (String(password || '').length < 8) throw new Error('Пароль — не короче 8 символов');
+    if (!ROLE_NAMES[role]) throw new Error('Роль — бог, модератор или наблюдатель');
+    const salt = crypto.randomBytes(16).toString('hex');
+    this.state.admins[key] = { login: key, salt, hash: Game.hashPassword(password, salt), role, createdAt: this.now() };
+    return { ok: true, message: `Учётка ${key}: ${ROLE_NAMES[role]}` };
+  },
+
+  adminRemove({ login }) {
+    const key = String(login || '').trim().toLowerCase();
+    if (!this.state.admins[key]) throw new Error('Нет такой учётки');
+    delete this.state.admins[key];
+    this.emit('admin_removed', key);
+    return { ok: true, message: `Учётка ${key} удалена` };
+  },
+
+  /** Снимок вручную — перед задуманным. */
+  snapshot({ label }, ctx = {}) {
+    const snap = this.takeSnapshot(sanitizeText(label, 60) || 'снимок вручную', ctx.who);
+    return { ok: true, message: `Снимок: ${snap.clock}` };
   },
 
   /** Поставить барыгу на технический этаж. */
@@ -4769,6 +4930,7 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
     online: this.onlineSet.size,
     archived: this.state.archive.length,
     director: this.director(),
+    snapshots: this.snapshotsMeta(),
     assignments: this.state.assignments.map((a) => ({ ...this.assignmentView(a, null), closed: !!a.closed, failed: a.failed || [] })),
     petitions: this.state.petitions.filter((x) => x.status !== 'expired').map((x) => ({ ...this.petitionView(x, null), floor: x.floor })),
     hazards: Object.entries(this.world.hazards).flatMap(([key, list]) => list.map((hz) => ({ ...hz, scene: key, title: this.sceneTitle(key), name: C.HAZARDS[hz.kind].name }))),
@@ -4849,4 +5011,4 @@ Game.prototype.adminContent = function adminContent() {
   };
 };
 
-module.exports = { Game, freshState, sanitizeName, sanitizeText, nameSkeleton, ADMIN_COMMANDS, WORLD_CONFIG };
+module.exports = { Game, freshState, sanitizeName, sanitizeText, nameSkeleton, ADMIN_COMMANDS, WORLD_CONFIG, ROLE_NAMES };
