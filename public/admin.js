@@ -198,8 +198,13 @@
         ['online', 'Только кто в сети'],
         ['floors', 'Кто сейчас на этажах…'],
         ['place', 'Кто сейчас в месте…'],
+        ['homeFloors', 'Кто живёт на этажах…'],
         ['player', 'Конкретный жилец…'],
         ['random', 'Случайные жильцы…'],
+        ['generous', 'Самые щедрые (по молве)…'],
+        ['stingy', 'Самые скупые…'],
+        ['assignmentDone', 'Сдавшие разнарядку…'],
+        ['assignmentFailed', 'Не сдавшие разнарядку…'],
       ],
       defaultType,
     );
@@ -209,19 +214,29 @@
     const player = h('select', { 'aria-label': 'Жилец' });
     const count = num(1, { min: 1, max: 999, 'aria-label': 'Сколько' });
     const onlyOnline = h('input', { type: 'checkbox' });
+    const hfFrom = num(101, { min: 1, max: 999, 'aria-label': 'С этажа' });
+    const hfTo = num(105, { min: 1, max: 999, 'aria-label': 'По этаж' });
+    const topN = num(3, { min: 1, max: 50, 'aria-label': 'Сколько' });
+    const asg = h('select', { 'aria-label': 'Разнарядка' });
     const rows = {
       floors: h('div', { class: 'row' }, 'с', from, 'по', to),
+      homeFloors: h('div', { class: 'row' }, 'квартиры на этажах с', hfFrom, 'по', hfTo),
+      generous: h('div', { class: 'row' }, 'сколько:', topN),
+      assignmentDone: h('div', { class: 'row' }, asg),
       place: h('div', { class: 'row' }, place),
       player: h('div', { class: 'row' }, player),
       random: h('div', { class: 'row' }, 'сколько:', count, h('label', { class: 'check' }, onlyOnline, 'только в сети')),
     };
+    rows.stingy = rows.generous; // одно поле «сколько» на обе цели
+    rows.assignmentFailed = rows.assignmentDone;
     const sync = () => {
-      for (const [k, r] of Object.entries(rows)) r.hidden = type.value !== k;
+      for (const [k, r] of Object.entries(rows)) if (r !== rows[type.value]) r.hidden = true;
+      if (rows[type.value]) rows[type.value].hidden = false;
     };
     type.addEventListener('change', sync);
     sync();
     const picker = {
-      el: h('div', { class: 'target' }, h('span', { class: 'target-title', text: 'Кого коснётся' }), type, Object.values(rows)),
+      el: h('div', { class: 'target' }, h('span', { class: 'target-title', text: 'Кого коснётся' }), type, [...new Set(Object.values(rows))]),
       sig: '',
       refresh() {
         const list = alivePlayers();
@@ -232,8 +247,22 @@
         player.replaceChildren(...list.map((p) => h('option', { value: p.id, text: `${p.name} · кв. ${p.apartment.number}` })));
         if (list.some((p) => p.id === keep)) player.value = keep;
       },
+      refreshAssignments() {
+        const list = A.snap?.assignments || [];
+        const sig = list.map((a) => a.id).join('|');
+        if (sig === picker.asgSig) return;
+        picker.asgSig = sig;
+        const keep = asg.value;
+        asg.replaceChildren(...(list.length ? list.map((a) => h('option', { value: a.id, text: `${a.text} (${a.floors})${a.closed ? ' — закрыта' : ''}` })) : [h('option', { value: '', text: '— разнарядок нет —' })]));
+        if (list.some((a) => a.id === keep)) asg.value = keep;
+      },
       get() {
         switch (type.value) {
+          case 'homeFloors': return { type: 'homeFloors', from: hfFrom.value, to: hfTo.value };
+          case 'generous':
+          case 'stingy': return { type: type.value, count: topN.value };
+          case 'assignmentDone':
+          case 'assignmentFailed': return { type: type.value, id: asg.value };
           case 'floors': return { type: 'floors', from: from.value, to: to.value };
           case 'place': return { type: 'place', place: place.value };
           case 'player': return { type: 'player', id: player.value };
@@ -244,6 +273,7 @@
     };
     A.pickers.push(picker);
     picker.refresh();
+    picker.refreshAssignments();
     return picker;
   }
 
@@ -611,6 +641,34 @@
     );
     withSchedule(grid.lastElementChild, { label: () => `Опасность: ${C.hazards[hzKind.value]}`, cmd: 'hazard', args: hzArgs });
 
+    // --- Разнарядка на этажи ---
+    const asgFrom = num(firstFloor, { min: 1, max: 999 });
+    const asgTo = num(firstFloor + 4, { min: 1, max: 999 });
+    const asgText = h('input', { maxlength: '120', value: 'Сбор алюминия для нужд дома' });
+    const asgKind = select([['item', 'Сдать предмет'], ['money', 'Сдать талоны'], ['shifts', 'Отработать смены']], 'item');
+    const asgItem = select(opts(C.items), 'spoon');
+    const asgAmount = num(1, { min: 1, max: 99 });
+    const asgMin = num(60, { min: 1, max: 10080 });
+    const syncAsg = () => (asgItem.disabled = asgKind.value !== 'item');
+    asgKind.addEventListener('change', syncAsg);
+    syncAsg();
+    const asgArgs = () => ({ from: asgFrom.value, to: asgTo.value, text: asgText.value, kind: asgKind.value, item: asgItem.value, amount: asgAmount.value, minutes: asgMin.value });
+    A.assignList = h('ul', { class: 'hazard-list' });
+    grid.append(
+      card(
+        'Разнарядка на этажи',
+        'Задание каждой квартире на этажах (по месту жительства): висит на доске, жильцы сдают у доски, смены засчитываются сами. По сроку итог приходит сюда; наградить или наказать — целью «Сдавшие / Не сдавшие разнарядку» в любой карточке.',
+        'warn-card',
+        h('div', { class: 'grid2' }, field('С этажа', asgFrom), field('По этаж', asgTo)),
+        field('Текст', asgText),
+        h('div', { class: 'grid3' }, field('Что', asgKind), field('Предмет', asgItem), field('Сколько', asgAmount)),
+        field('Срок, мин', asgMin),
+        actions(button('Выдать разнарядку', () => cmd('assign', asgArgs()), 'primary')),
+        A.assignList,
+      ),
+    );
+    withSchedule(grid.lastElementChild, { label: () => `Разнарядка: ${asgText.value.slice(0, 40)}`, cmd: 'assign', args: asgArgs });
+
     // --- Радиоточка ---
     const radioText = h('textarea', { maxlength: '300', placeholder: 'Говорит ЖЭК. Сегодня в 22:00 — проверка гермодверей.' });
     const radioSilence = num(10, { min: 1, max: 1440 });
@@ -764,8 +822,12 @@
     renderDirector();
     renderHazards();
     renderRadio();
+    renderAssignments();
     renderEyeSide();
-    for (const picker of A.pickers) picker.refresh();
+    for (const picker of A.pickers) {
+      picker.refresh();
+      if (picker.refreshAssignments) picker.refreshAssignments();
+    }
     for (const [key, row] of Object.entries(A.breakdownRows || {})) {
       const b = s.world.breakdowns[key];
       row.state.textContent = b ? `сломано · ${fmtSec(b.endsInSec)}` : 'работает';
@@ -943,7 +1005,7 @@
     const id = p.id;
     A.card = {};
     A.memo.cardDyn = null;
-    const header = h('div', null, (A.card.title = h('h2')), (A.card.meta = h('div', { class: 'card-meta' })), (A.card.harm = h('div', { class: 'card-meta' })));
+    const header = h('div', null, (A.card.title = h('h2')), (A.card.meta = h('div', { class: 'card-meta' })), (A.card.harm = h('div', { class: 'card-meta' })), (A.card.rumor = h('div', { class: 'card-meta rumor' })));
     const dyn = (A.card.dyn = h('div'));
 
     if (!p.alive) {
@@ -1127,6 +1189,12 @@
     A.card.title.textContent = p.name;
     A.card.meta.textContent = `кв. ${p.apartment.number} · ${p.online ? 'в сети' : 'не в сети'} · смен отработано: ${p.shifts} · ${p.account ? `паспорт «${p.account}»` : 'без паспорта'}${p.newbie ? ' · новосёл' : ''}${p.mutedMin ? ` · заглушён ещё ${p.mutedMin} мин` : ''}${p.banned ? ' · ЗАБАНЕН' : ''}`;
     A.card.meta.textContent += p.ranks ? ` · разряды: ${Object.values(p.ranks).join('/')}` : '';
+    // молва и досье поступков
+    const DEED_NAMES = { gift: 'подарки', aid: 'помощь', rescue: 'спас лежачих', shelter: 'пускал переждать', care: 'берёг дом', assignment: 'разнарядки', theft: 'кражи', rob: 'обирал лежачих', cold: 'не открыл в туман' };
+    const deeds = Object.entries(p.deeds || {}).map(([k, n]) => `${DEED_NAMES[k] || k}: ${n}`);
+    A.card.rumor.textContent = p.alive
+      ? `Молва: ${p.rumor && p.rumor.length ? p.rumor.join(', ') : 'ничего не говорят'}${deeds.length ? ` · досье — ${deeds.join(', ')}` : ''}${p.goodness ? ` · за сутки ${p.goodness > 0 ? '+' : ''}${p.goodness}` : ''}`
+      : '';
     A.card.harm.textContent = p.harmsHour ? `Бед от ЖЭК за час: ${p.harmsHour}${p.harmsHour >= 3 ? ' — не слишком ли часто одному?' : ''}` : '';
     A.card.harm.className = `card-meta${p.harmsHour >= 3 ? ' harm-warn' : ''}`;
     A.card.dyn.replaceChildren(
@@ -1291,6 +1359,31 @@
               );
             })
           : [h('li', { class: 'calm', text: 'Режиссёру нечего подсказать.' })]),
+      );
+    });
+  }
+
+  function renderAssignments() {
+    const list = A.snap.assignments || [];
+    if (!A.assignList) return;
+    memo('assignments', list.map((a) => [a.id, a.done.length, a.total, a.closed, a.leftMin]), () => {
+      A.assignList.replaceChildren(
+        ...(list.length
+          ? list.map((a) =>
+              h(
+                'li',
+                { class: a.closed ? 'fenced' : '' },
+                h('span', { class: 'txt' }, h('b', { text: a.text }), ` · ${a.floors} · ${a.what} · сдали ${a.done.length}/${a.total}`, h('small', { text: a.closed ? ` · закрыта${a.failed.length ? `, не сдали: ${a.failed.join(', ')}` : ''}` : ` · ещё ${a.leftMin} мин` })),
+                a.closed
+                  ? [
+                      button('Премия сдавшим +3 ₸', () => cmd('aid', { target: { type: 'assignmentDone', id: a.id }, money: 3, title: 'Премия ЖЭК', text: `За разнарядку «${a.text}».` }), 'small'),
+                      button('Выговор не сдавшим', () => cmd('custom', { target: { type: 'assignmentFailed', id: a.id }, title: 'Выговор ЖЭК', text: `Разнарядка «${a.text}» не выполнена. Это запомнят.`, style: 'danger', effect: { sanity: -10 } }), 'small'),
+                    ]
+                  : button('Закрыть сейчас', () => cmd('assignClose', { id: a.id }), 'small'),
+                button('✕', () => cmd('assignRemove', { id: a.id }), 'small'),
+              ),
+            )
+          : [h('li', { class: 'calm', text: 'Разнарядок нет.' })]),
       );
     });
   }

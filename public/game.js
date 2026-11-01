@@ -446,7 +446,7 @@
         if (!r || !r.name) return { label: `Кв. ${o.number}`, sub: 'пустует', actions: [knock] };
         return {
           label: `Кв. ${o.number}`,
-          sub: r.name,
+          sub: `${r.name}${r.rumor && r.rumor.length ? ` · говорят: ${r.rumor.join(', ')}` : ''}`,
           actions: [
             knock,
             { label: 'Подсунуть записку', run: () => openNote(o.number, r.name) },
@@ -483,7 +483,7 @@
         const out = { label: 'Выйти в коридор', run: () => act('move', { place: 'corridor' }) };
         const seal = { label: 'Задраить гермодверь', run: () => act('seal', { on: true }) };
         const danger = v.world.fog && v.world.fog.affectsYou;
-        return { label: 'Гермодверь', sub: you.knocker && v.here.ownHome ? `стучит ${you.knocker.name}` : 'открыта', actions: [...letIn, ...(danger ? [seal, out] : [out, seal])] };
+        return { label: 'Гермодверь', sub: you.knocker && v.here.ownHome ? `стучит ${you.knocker.name}${you.knocker.rumor && you.knocker.rumor.length ? ` (говорят: ${you.knocker.rumor.join(', ')})` : ''}` : 'открыта', actions: [...letIn, ...(danger ? [seal, out] : [out, seal])] };
       }
       case 'bed':
         return you.sleeping
@@ -871,7 +871,28 @@
     const body = openSheet('board', 'Доска объявлений', obj);
     const input = h('textarea', { maxlength: '200', rows: '2', placeholder: 'Меняю лампочку на сухари. Кв. …', 'aria-label': 'Текст листка' });
     const mine = res.pinned.find((n) => n.mine);
+    const assignments = (res.assignments || []).map((a) =>
+      h(
+        'li',
+        { class: `assignment${a.closed ? ' closed' : ''}${a.mine ? ' done' : ''}` },
+        h('b', { text: `Разнарядка ЖЭК · этажи ${a.floors}` }),
+        h('p', { text: `«${a.text}». С каждой квартиры: ${a.what}.` }),
+        h('small', {
+          text: a.closed
+            ? `Срок вышел. Сдали ${a.done.length} из ${a.total}.`
+            : `Осталось ${a.leftMin} мин. Сдали ${a.done.length} из ${a.total}${a.done.length ? `: ${a.done.join(', ')}` : ''}.`,
+        }),
+        !a.closed && a.mineApplies
+          ? a.mine
+            ? h('span', { class: 'tag-ok', text: '✔ ваша квартира сдала' })
+            : a.kind === 'shifts'
+              ? h('span', { class: 'note', text: `Ваши смены: ${a.progress || 0} — засчитываются сами, когда закрываете наряд в цеху.` })
+              : h('button', { class: 'btn small primary', type: 'button', text: 'Сдать за свою квартиру', onclick: async () => { const r = await act('assignment_submit', { id: a.id }); if (r.ok) { say(r.message); openBoard(obj); } } })
+          : null,
+      ),
+    );
     body.replaceChildren(
+      ...(assignments.length ? [h('ul', { class: 'board-notes assignments' }, assignments)] : []),
       h('h4', { class: 'board-h', text: 'Листки жильцов' }),
       res.pinned.length
         ? h('ul', { class: 'board-notes pinned' }, res.pinned.map((n) => h('li', { class: n.mine ? 'mine' : '' }, h('small', { text: `${n.name}, кв. ${n.apt} · ${new Date(n.ts).toLocaleString('ru-RU')}` }), n.text)))
@@ -1291,6 +1312,7 @@
           { class: 'chip-person' },
           h('b', { text: p.name }),
           p.away ? h('span', { class: 'symptom', text: 'спит, не в сети' }) : null,
+          p.rumor && p.rumor.length ? h('span', { class: 'rumor', title: 'Что о нём говорят соседи', text: p.rumor.join(', ') }) : null,
           p.rank > 1 ? h('span', { class: 'symptom', text: `${p.rank} разряд` }) : null,
           p.symptoms.length ? h('span', { class: 'symptom', text: p.symptoms.join(', ') }) : null,
           p.away ? null : h('button', { class: 'btn small', text: 'Обмен', onclick: () => tradeWith(p) }),

@@ -69,6 +69,8 @@ const BALANCE = {
   radioEveryMin: 40,
   // Шанс найти в мусоропроводе бумагу (обрывок лора)
   lorePaperChance: 0.08,
+  // Молва о поступке живёт столько реальных часов (выцветает постепенно)
+  rumorHours: 24,
 
   hungerPerMin: -3, // сытость падает: 100 → 0 примерно за 33 минуты
   starvationHpPerMin: -6, // урон здоровью при сытости 0
@@ -140,6 +142,19 @@ const ITEMS = {
   spoon: { name: 'Ложка', desc: 'Алюминиевая. Ценная вещь.' },
   fork: { name: 'Вилка', desc: 'Три зубца из четырёх.' },
   bulb: { name: 'Лампочка', desc: '60 Вт. Можно вкрутить в погасший плафон в коридоре.' },
+};
+
+// Домовая книга: молва. Поступок → черта, которую видят соседи (на двери, рядом, в глазок).
+const DEEDS = {
+  gift: { trait: 'щедрый', good: true },
+  aid: { trait: 'помогает соседям', good: true },
+  rescue: { trait: 'спасает лежачих', good: true },
+  shelter: { trait: 'пускает переждать', good: true },
+  care: { trait: 'бережёт дом', good: true },
+  assignment: { trait: 'исполнительный', good: true },
+  theft: { trait: 'нечист на руку', good: false },
+  rob: { trait: 'обирает лежачих', good: false },
+  cold: { trait: 'не открывает в туман', good: false },
 };
 
 // Бумаги и обрывки лора: попадаются в мусоропроводе, читаются (не тратятся), ими можно меняться.
@@ -358,5 +373,5 @@ const NOTES = {
 module.exports = {
   BUILDING, FACILITIES, BALANCE, ITEMS, SHOPS, CONDITIONS, ACCIDENTS, PLACES, BREAKDOWNS, HALLUCINATIONS,
   HALLUCINATION_VOICES, RESERVED_NAMES, ARCHIVE_DEAD_AFTER_H, NOTES, RANKS, TUTORIAL, ECHO_PHRASES, HAZARDS,
-  LORE, RADIO,
+  LORE, RADIO, DEEDS,
 };

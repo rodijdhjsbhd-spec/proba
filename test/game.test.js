@@ -1693,3 +1693,56 @@ test('хозяин видит и может выставить гостя, уш�
   assert.ok(people.some((x) => x.id === guest.id && x.away));
   assert.equal(game.evict(host, guest.id).ok, true);
 });
+
+test('молва: поступки складываются в черты, видны соседям и выцветают; цели «щедрые» и «скупые»', () => {
+  const { game, clock } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  const c = join(game, 'Пётр');
+  for (const p of [a, b, c]) p.createdAt -= 3 * 3600 * 1000; // не новосёлы
+  for (const p of [a, b, c]) game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  game.admin('give', { id: a.id, item: 'bread', count: 2, silent: true });
+  b.pos = { ...a.pos };
+  assert.equal(game.tradeOffer(a, b.id, { money: 0, items: { bread: 1 } }, { money: 0, items: {} }).gift, true);
+  assert.deepEqual(game.rumor(a), ['щедрый']);
+  assert.ok(game.playerView(c).here.people.find((x) => x.id === a.id).rumor.includes('щедрый'));
+  c.money = 50;
+  assert.deepEqual(game.resolveTargets({ type: 'generous', count: 1 }).map((p) => p.id), [a.id]);
+  assert.equal(game.resolveTargets({ type: 'stingy', count: 1 })[0].id, c.id, 'ничего не делал, а талоны есть');
+  assert.equal(game.adminSnapshot().players.find((p) => p.id === a.id).deeds.gift, 1);
+  clock.t += C.BALANCE.rumorHours * 3600 * 1000;
+  assert.deepEqual(game.rumor(a), [], 'выцвело');
+});
+
+test('разнарядка: сдать у доски за свою квартиру, смены засчитываются сами, итог и цели', () => {
+  const { game, clock, advance } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  const r = game.admin('assign', { from: 101, to: 101, text: 'Сбор ложек', kind: 'item', item: 'spoon', amount: 1, minutes: 10 });
+  assert.equal(r.ok, true, r.error);
+  const id = game.state.assignments[0].id;
+  game.admin('teleport', { id: a.id, place: 'corridor', floor: 101 });
+  walkTo(game, a, type('board'));
+  assert.equal(game.submitAssignment(a, id).ok, false, 'нет ложки');
+  game.admin('give', { id: a.id, item: 'spoon', count: 1, silent: true });
+  assert.equal(game.submitAssignment(a, id).ok, true);
+  assert.equal(game.submitAssignment(a, id).ok, false, 'уже сдано');
+  const board = game.readBoard(a);
+  assert.deepEqual(board.assignments[0].done, [a.apartment.number]);
+  assert.equal(board.assignments[0].total, 2);
+  // смены
+  game.admin('assign', { from: 101, to: 101, text: 'Ударная смена', kind: 'shifts', amount: 1, minutes: 30 });
+  const sid = game.state.assignments[1].id;
+  game.assignmentShift(b);
+  assert.ok(game.state.assignments[1].done[b.apartment.number]);
+  // срок вышел
+  clock.t += 11 * 60000;
+  advance(1000);
+  assert.equal(game.state.assignments[0].closed, true);
+  assert.deepEqual(game.resolveTargets({ type: 'assignmentDone', id }).map((p) => p.id), [a.id]);
+  assert.deepEqual(game.resolveTargets({ type: 'assignmentFailed', id }).map((p) => p.id), [b.id]);
+  // цели по этажу квартиры, а не по месту
+  game.admin('teleport', { id: b.id, place: 'canteen' });
+  assert.ok(game.resolveTargets({ type: 'homeFloors', from: 101, to: 101 }).some((p) => p.id === b.id));
+  assert.ok(sid);
+});

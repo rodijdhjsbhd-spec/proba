@@ -442,3 +442,12 @@ body.sanity-critical .place h1 { animation: flicker 2s infinite; }
 /* поле «Приписка» в передачке — на всю ширину */
 .trade-grid.single > input:not([type=number]) { width: 100%; grid-column: 1 / -1; }
 #death-login { margin-top: 10px; }
+
+/* Молва и разнарядки */
+.chip-person .rumor { font-size: 11px; color: #e3c98a; font-style: italic; }
+.board-notes.assignments li { border-left: 4px solid #b22; background: #f3ecd6; }
+.board-notes.assignments li.done { border-left-color: #3a7a3a; }
+.board-notes.assignments li.closed { opacity: .65; }
+.board-notes.assignments b { display: block; color: #8a1d1d; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+.board-notes.assignments p { margin: 4px 0; }
+.board-notes .tag-ok { color: #2c6b2c; font-weight: 700; font-size: 12px; }

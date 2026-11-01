@@ -352,6 +352,7 @@ const PLAYER_ACTIONS = {
   knock: (p, a) => game.knock(p, a.apt),
   search: (p) => game.searchChute(p),
   memorial: (p) => game.memorial(p),
+  assignment_submit: (p, a) => game.submitAssignment(p, String(a.id || '')),
   radio_listen: (p) => game.listenRadio(p),
   board: (p) => game.readBoard(p),
   open_door: (p, a) => game.openDoor(p, a.guest),
