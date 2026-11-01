@@ -229,7 +229,7 @@
       if (a.id === myId) continue;
       seen.add(a.id);
       const cur = S.actors.get(a.id);
-      if (cur) Object.assign(cur, { tx: a.x, ty: a.y, d: a.d, m: a.m, sick: a.sick, hurt: a.hurt, sleep: a.sleep, down: a.down, mask: a.mask, away: a.away, name: a.name, apt: a.apt });
+      if (cur) Object.assign(cur, { tx: a.x, ty: a.y, d: a.d, m: a.m, sick: a.sick, hurt: a.hurt, sleep: a.sleep, down: a.down, mask: a.mask, away: a.away, newbie: a.newbie, name: a.name, apt: a.apt });
       else S.actors.set(a.id, { ...a, tx: a.x, ty: a.y, look: lookFor(a.id), phase: Math.random() * 6 });
     }
     for (const id of [...S.actors.keys()]) if (!seen.has(id)) S.actors.delete(id);
@@ -894,6 +894,33 @@
     send(msg);
   });
 
+  $('#tutorial-hide').addEventListener('click', () => act('tutorial_hide'));
+
+  /** Куда указывает стрелка памятки: объект текущей сцены для следующего шага. */
+  function tutorialMarker(v) {
+    const next = v.you.tutorial && v.you.tutorial.find((t) => !t.done);
+    if (!next || !S.scene) return null;
+    const here = v.here;
+    const find = (test) => S.scene.objects.find(test);
+    let o = null;
+    if (next.id === 'corridor' && here.place === 'home') o = find((x) => x.type === 'hermodoor');
+    if (next.id === 'factory') {
+      if (here.place === 'home') o = find((x) => x.type === 'hermodoor');
+      else if (here.place === 'corridor' && here.floor === v.facilities.factory.floor) o = find((x) => x.type === 'facility');
+      else if (here.place === 'corridor') o = find((x) => x.type === 'lift');
+      else o = find((x) => x.type === 'exit');
+    }
+    if (next.id === 'shift' && here.place === 'factory') o = find((x) => x.type === 'station');
+    if (next.id === 'eat' && here.place === 'canteen') o = find((x) => x.type === 'counter');
+    if (next.id === 'eat' && here.place === 'corridor' && here.floor === v.facilities.canteen.floor) o = find((x) => x.type === 'facility');
+    if (next.id === 'eat' && here.place === 'factory') o = find((x) => x.type === 'exit');
+    if (next.id === 'seal' && here.place === 'home') o = find((x) => x.type === 'hermodoor');
+    if (next.id === 'seal' && here.place === 'corridor' && here.floor === v.you.apartment.floor) o = find((x) => x.type === 'apt' && x.number === v.you.apartment.number);
+    if (!o) return null;
+    const up = o.wall && !o.bottom ? 0.9 : 0;
+    return { x: o.x + o.w / 2, y: o.y - up - 0.2 };
+  }
+
   // старому жильцу без паспорта — выдать паспорт
   $('#claim-form').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -914,6 +941,19 @@
     $('#app').hidden = true;
     $('#death').hidden = false;
     $('#death-cause').textContent = `${v.you.name}, кв. ${v.you.apartment.number}. ${v.you.deathCause || ''}.`;
+    const ob = v.you.obituary;
+    if (ob) $('#obituary').textContent = `Прожил в доме: ${ob.lived}. Смен отработано: ${ob.shifts}. Помог соседям: ${ob.helped}.${ob.bestRank > 1 ? ` Лучший разряд: ${ob.bestRank}.` : ''}`;
+    const wait = v.you.rebirthInSec || 0;
+    $('#rebirth-submit').disabled = wait > 0;
+    $('#rebirth-wait').textContent = wait > 0 ? `Дом ещё не принял вашу смерть. Новый ордер — через ${fmtSec(wait)}.` : '';
+    $('#echo-box').hidden = !!v.you.echoUsed || !v.you.echoPhrases;
+    memo('echo', [v.you.echoUsed, v.you.echoPhrases], () => {
+      $('#echo-phrases').replaceChildren(
+        ...(v.you.echoPhrases || []).map((text, i) =>
+          h('button', { class: 'btn small', type: 'button', text: `«${text}»`, onclick: async () => { const r = await act('echo', { phrase: i }); if (r.ok) say(r.message); } }),
+        ),
+      );
+    });
     memo('death', v.you.journal.length, () => {
       $('#death-journal').replaceChildren(...v.you.journal.filter((j) => j.kind !== 'death').slice(-6).reverse().map(journalItem));
     });
@@ -951,6 +991,12 @@
 
     renderBanners(v);
     $('#passport-panel').hidden = !!you.account;
+    $('#tutorial-panel').hidden = !you.tutorial;
+    memo('tutorial', you.tutorial, () => {
+      if (!you.tutorial) return;
+      const next = you.tutorial.find((t) => !t.done);
+      $('#tutorial').replaceChildren(...you.tutorial.map((t) => h('li', { class: t.done ? 'done' : t === next ? 'next' : '' }, t.text)));
+    });
     for (const a of you.asks || []) openAsk(a);
     radioSignals(v);
     memo('stats', [you.stats, you.conditions.map((c) => [c.id, c.remainingSec == null ? null : Math.ceil(c.remainingSec / 10)])], () => renderStats(you));
@@ -1202,6 +1248,7 @@
         hurt: you.conditions.some((c) => c.kind === 'injury'),
         sleep: you.sleeping && !S.me.m,
         down: !!you.down,
+        newbie: !!you.tutorial,
         mask: has('gasmask') && you.gasmaskCharge > 0 && !!fog && fog !== 'window',
       },
       actors: [...S.actors.values()],
@@ -1211,6 +1258,7 @@
       dark: v.world.dark,
       night: isNight(v),
       lampsOut: v.here.lampsOut || [],
+      marker: tutorialMarker(v),
       flashlight: has('flashlight') && you.flashCharge > 0,
       fog,
       fogOutside: !!(f && f.phase === 'active' && f.affectsYou),

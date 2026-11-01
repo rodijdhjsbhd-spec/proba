@@ -58,11 +58,17 @@
       <div class="stamp red">ОПЕЧАТАНО</div>
       <h1>Вы погибли</h1>
       <p id="death-cause" class="death-cause"></p>
+      <p id="obituary" class="obituary"></p>
       <ul id="death-journal" class="journal"></ul>
+      <div id="echo-box" class="echo-box" hidden>
+        <p class="echo-h">Отголосок. Одну фразу можно оставить в стенах — её услышит сосед, у которого пошатнулся рассудок:</p>
+        <div id="echo-phrases" class="actions"></div>
+      </div>
       <form id="rebirth-form" autocomplete="off">
         <label for="rebirth-name">Дом не пустует долго. Новый жилец:</label>
         <input id="rebirth-name" maxlength="20" minlength="2" required placeholder="имя нового жильца">
-        <button type="submit" class="btn primary">Заселиться</button>
+        <button type="submit" class="btn primary" id="rebirth-submit">Заселиться</button>
+        <p id="rebirth-wait" class="note"></p>
       </form>
     </div>
   </section>
@@ -93,6 +99,11 @@
 
     <main class="layout">
       <aside class="col col-left">
+        <section class="panel tutorial" id="tutorial-panel" hidden>
+          <h2>Памятка новосёла</h2>
+          <ol id="tutorial" class="tutorial-list"></ol>
+          <button class="btn small" type="button" id="tutorial-hide">Скрыть</button>
+        </section>
         <section class="panel">
           <h2>Самочувствие</h2>
           <div id="stats"></div>

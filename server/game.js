@@ -328,6 +328,79 @@ class Game extends EventEmitter {
     h.nextAt = null;
   }
 
+  /** Наследник получает разряды предшественника на ступень ниже и одну вещь из опечатанной квартиры. */
+  inherit(heir, dead) {
+    heir.heirOf = dead.id;
+    heir.tutorial = { done: C.TUTORIAL.map((t) => t.id), rewarded: true, drill: true }; // памятка — только для совсем новых
+    const skills = {};
+    for (const g of Object.keys(MG.GAMES)) {
+      const rank = this.rankOf(dead, g);
+      if (rank > 1) skills[g] = C.RANKS[rank - 2];
+    }
+    heir.skills = skills;
+    const items = Object.keys(dead.inventory || {});
+    const parts = [];
+    if (items.length) {
+      const id = items[Math.floor(this.random() * items.length)];
+      this.addItem(heir, id, 1);
+      parts.push(`из опечатанной квартиры вам досталась вещь: ${C.ITEMS[id].name}`);
+    }
+    if (Object.keys(skills).length) parts.push('трудовая книжка предшественника — на разряд ниже');
+    this.journal(heir, `Вы — наследник ${dead.name}${parts.length ? `: ${parts.join('; ')}` : ''}.`, 'good');
+  }
+
+  /** Некролог: что видно на экране смерти. */
+  obituary(p) {
+    const lived = (p.diedAt || this.now()) - (p.createdAt || this.now());
+    return {
+      lived: fmtDuration(lived),
+      shifts: p.shifts || 0,
+      helped: (p.deeds && p.deeds.helped) || 0,
+      cause: p.deathCause,
+      bestRank: this.bestRank(p),
+    };
+  }
+
+  /** «Отголосок»: погибший выбирает фразу, её услышит живой сосед с пошатнувшимся рассудком. */
+  echo(p, phraseIndex) {
+    if (p.alive) return { ok: false, error: 'Вы живы.' };
+    if (p.echoUsed) return { ok: false, error: 'Вы уже сказали всё, что могли.' };
+    const text = C.ECHO_PHRASES[toInt(phraseIndex, -1)];
+    if (!text) return { ok: false, error: 'Нет такой фразы.' };
+    p.echoUsed = true;
+    this.world.echoes = [...(this.world.echoes || []), { from: p.name, text, ts: this.now() }].slice(-20);
+    this.log(`Отголосок ${p.name}: «${text}»`, 'social', p.id);
+    return { ok: true, message: 'Ваш голос растворился в стенах. Кто-нибудь его услышит.' };
+  }
+
+  /** Отметить шаг памятки новосёла. */
+  tutorialStep(p, stepId) {
+    const t = p.tutorial;
+    if (!t || t.rewarded || t.done.includes(stepId)) return;
+    t.done.push(stepId);
+    const step = C.TUTORIAL.find((x) => x.id === stepId);
+    this.journal(p, `Памятка: «${step ? step.text : stepId}» — выполнено.`, 'good');
+    if (C.TUTORIAL.every((x) => t.done.includes(x.id))) {
+      t.rewarded = true;
+      p.money += B.tutorialReward;
+      this.notify([p], { title: 'Подъёмные', text: `Вы освоились в доме. ЖЭК выдал подъёмные: ${talons(B.tutorialReward)}.`, style: 'good' });
+      this.log(`${p.name} прошёл памятку новосёла`, 'join', p.id);
+    }
+    this.dirty([p.id]);
+  }
+
+  /** Учебная тревога: один раз, когда новосёл впервые вернулся домой после еды. Без урона. */
+  tutorialDrill(p) {
+    const t = p.tutorial;
+    if (!t || t.drill || !t.done.includes('eat') || !this.isOwnHome(p)) return;
+    t.drill = true;
+    this.notify([p], {
+      title: 'УЧЕБНАЯ ТРЕВОГА',
+      text: 'Это проверка, тумана нет. Так звучит настоящая сирена: подойдите к гермодвери внизу комнаты и задрайте её.',
+      style: 'siren',
+    });
+  }
+
   /** Квитанция ЖЭК «Пока вас не было»: что случилось, пока жилец был не в сети. */
   sendReceipt(p, now) {
     const a = p.absence || { knocks: [] };
@@ -583,6 +656,7 @@ class Game extends EventEmitter {
         hurt: p.conditions.some((c) => C.CONDITIONS[c.id]?.kind === 'injury'),
         sleep: !!p.sleeping,
         down: !!p.down,
+        newbie: this.isNewbie(p),
         mask: this.maskWorks(p) && this.inFog(p.location.floor),
       }));
   }
@@ -685,10 +759,27 @@ class Game extends EventEmitter {
     return { ok: true, name };
   }
 
-  register(rawName, { account = null } = {}) {
+  /** Последний погибший жилец этого паспорта (предшественник для наследства). */
+  lastDeadOf(account) {
+    const key = this.accountKey(account.login);
+    return this.players()
+      .filter((q) => !q.alive && q.account === key)
+      .sort((a, b) => (b.diedAt || 0) - (a.diedAt || 0))[0] || null;
+  }
+
+  /** Сколько секунд ещё ждать новой жизни после смерти предшественника (0 — можно). */
+  rebirthWait(predecessor) {
+    if (!predecessor || predecessor.alive || !predecessor.diedAt) return 0;
+    return Math.max(0, Math.ceil((predecessor.diedAt + B.rebirthDelayMin * 60000 - this.now()) / 1000));
+  }
+
+  register(rawName, { account = null, predecessor = null } = {}) {
     const check = this.checkNewName(rawName);
     if (!check.ok) return check;
     const name = check.name;
+    const heirOf = predecessor || (account ? this.lastDeadOf(account) : null);
+    const wait = this.rebirthWait(heirOf);
+    if (wait > 0) return { ok: false, error: `Дом ещё не принял вашу смерть. Новый ордер — через ${fmtDuration(wait * 1000)}.` };
     if (account && this.accountPlayer(account)) return { ok: false, error: 'У этого паспорта уже есть живой жилец.' };
     const apartment = this.allocateApartment();
     if (!apartment) return { ok: false, error: 'Дом переполнен: свободных квартир нет.' };
@@ -719,10 +810,13 @@ class Game extends EventEmitter {
       shifts: 0,
       journal: [],
       lastHarm: null,
+      deeds: { helped: 0 },
+      tutorial: { done: [], rewarded: false, drill: false },
     };
     this.state.players[id] = p;
     this.byToken.set(token, id);
     if (account) this.linkAccount(p, account);
+    if (heirOf) this.inherit(p, heirOf);
     this.journal(p, `Ордер на заселение получен. Ваша квартира — №${apartment.number}, ${apartment.floor} этаж. Голые стены, кровать и радиоточка.`);
     this.journal(p, `Еда стоит талонов. Талоны дают за смену в цеху (${C.FACILITIES.factory.floor} этаж). Столовая — на ${C.FACILITIES.canteen.floor} этаже.`);
     this.log(`Заселился новый жилец: ${name}, кв. ${apartment.number}`, 'join', id, { public: `заселился ${name} в кв. ${apartment.number}` });
@@ -1123,6 +1217,12 @@ class Game extends EventEmitter {
   }
 
   hallucinate(p) {
+    const echoes = this.world.echoes || [];
+    if (echoes.length) {
+      const e = echoes.shift();
+      this.emit('chat', { id: newId('m'), ts: this.now(), channel: 'local', key: this.locationKey(p), to: p.id, hallucination: true, from: { name: `${e.from} †`, apt: '???' }, text: e.text });
+      return;
+    }
     const voice = C.HALLUCINATION_VOICES[Math.floor(this.random() * C.HALLUCINATION_VOICES.length)];
     const msg = {
       id: newId('m'),
@@ -1188,6 +1288,9 @@ class Game extends EventEmitter {
 
     const witnesses = this.leaveScene(p);
     this.relocate(p, target, entry);
+    if (target.place === 'corridor') this.tutorialStep(p, 'corridor');
+    if (target.place === 'factory') this.tutorialStep(p, 'factory');
+    if (target.place === 'home') this.tutorialDrill(p);
     this.dirty([...witnesses, ...this.othersAt(p)].map((q) => q.id));
     return { ok: true };
   }
@@ -1255,6 +1358,7 @@ class Game extends EventEmitter {
     if (!this.nearTo(p, (o) => o.type === 'hermodoor')) return { ok: false, error: 'Подойдите к гермодвери.' };
     const apt = this.currentApt(p);
     this.setDoorSealed(apt, !!on);
+    if (on && apt === p.apartment.number) this.tutorialStep(p, 'seal');
     this.journal(p, on ? 'Вы задраили гермодверь.' : 'Вы открыли гермодверь.');
     this.dirty(this.othersAt(p).map((q) => q.id));
     return { ok: true };
@@ -1321,6 +1425,7 @@ class Game extends EventEmitter {
     p.sleeping = false;
     this.removeItem(p, itemId, 1);
     const parts = this.applyItemUse(p, itemId);
+    if (def.use.hunger) this.tutorialStep(p, 'eat');
     this.journal(p, `Использовано: ${def.name}${parts.length ? ` (${parts.join(', ')})` : ''}.`);
     return { ok: true };
   }
@@ -1382,6 +1487,8 @@ class Game extends EventEmitter {
       this.log(`${p.name} помог ${t.name}: ${what}`, 'social', p.id);
     }
     this.journal(p, `Вы помогли ${t.name}: ${what}.`, 'good');
+    p.deeds = p.deeds || { helped: 0 };
+    p.deeds.helped++;
     this.dirty([p.id, t.id, ...this.othersAt(t).map((q) => q.id)]);
     return { ok: true, message: t.down ? '' : `${t.name} приходит в себя.` };
   }
@@ -1574,6 +1681,8 @@ class Game extends EventEmitter {
     }
     this.notify([guest], { title: 'Вас впустили', text: `${owner.name} открыл дверь кв. ${owner.apartment.number}. Вы в гостях.`, style: 'good' });
     this.journal(owner, `Вы впустили ${guest.name} (кв. ${guest.apartment.number}).`, 'good');
+    owner.deeds = owner.deeds || { helped: 0 };
+    owner.deeds.helped++;
     this.log(`${owner.name} впустил к себе ${guest.name}${this.inFog(owner.apartment.floor) || (this.world.fog && this.fogPhase() === 'warning') ? ' — в туман' : ''}`, 'social', owner.id);
     this.dirty([owner.id, ...witnesses.map((q) => q.id)]);
     return { ok: true, message: `${guest.name} у вас в гостях.` };
@@ -1668,6 +1777,8 @@ class Game extends EventEmitter {
     this.addDrop(p, check.door, { kind: 'parcel', bundle, text }, check.now);
     const what = this.bundleText(bundle);
     this.journal(p, `Вы оставили передачку у кв. ${check.door.number}: ${what}.`);
+    p.deeds = p.deeds || { helped: 0 };
+    p.deeds.helped++;
     this.log(`${p.name} оставил передачку у кв. ${check.door.number}: ${what}`, 'trade', p.id);
     this.feed({ channel: 'note', to: check.door.number, from: { id: p.id, name: p.name, apt: p.apartment.number }, parcel: what, text });
     return { ok: true, message: 'Свёрток лежит у двери.' };
@@ -1770,6 +1881,7 @@ class Game extends EventEmitter {
     p.money -= entry.price;
     if (entry.daily != null) stock[entry.key] -= 1;
     if (entry.eat) {
+      if ((entry.effect || {}).hunger) this.tutorialStep(p, 'eat');
       this.applyStats(p, entry.effect || {});
       this.journal(p, `${entry.name} — за ${talons(entry.price)}.`);
     } else {
@@ -1841,6 +1953,7 @@ class Game extends EventEmitter {
       this.log(`${p.name}: ${MG.GAMES[job.game].name} — ${rankAfter} разряд`, 'social', p.id);
     }
     if (reward > 0) this.world.shiftsToday = (this.world.shiftsToday || 0) + 1;
+    this.tutorialStep(p, 'shift');
     p.money += reward;
     p.shifts = (p.shifts || 0) + 1;
     const pct = Math.round(score * 100);
@@ -1870,6 +1983,7 @@ class Game extends EventEmitter {
     if (now - (this.lastChatAt.get(p.id) || 0) < 700) return { ok: false, error: 'Не так быстро.' };
     this.lastChatAt.set(p.id, now);
     const msg = { id: newId('m'), ts: now, channel, from: { id: p.id, name: p.name, apt: p.apartment.number }, text };
+    this.tutorialStep(p, 'talk');
     if (channel === 'global') {
       this.pushGlobal(msg);
     } else {
@@ -1948,6 +2062,8 @@ class Game extends EventEmitter {
       this.journal(p, `Вы отдали жильцу ${q.name}: ${what}.`);
       this.notify([q], { title: 'Подарок', text: `${p.name} (кв. ${p.apartment.number}) отдал вам: ${what}.`, style: 'good' });
       this.log(`${p.name} → ${q.name}: подарок (${what})`, 'trade', p.id);
+      p.deeds = p.deeds || { helped: 0 };
+      p.deeds.helped++;
       return { ok: true, gift: true };
     }
 
@@ -2698,6 +2814,11 @@ Game.prototype.playerView = function playerView(p) {
     sleeping: p.sleeping,
     account: p.account ? (this.state.accounts[p.account] || {}).login || p.account : null,
     mutedMin: this.mutedFor(p),
+    obituary: p.alive ? null : this.obituary(p),
+    rebirthInSec: p.alive ? 0 : this.rebirthWait(p),
+    echoUsed: !!p.echoUsed,
+    echoPhrases: p.alive ? null : C.ECHO_PHRASES,
+    tutorial: p.tutorial && !p.tutorial.rewarded && !p.tutorial.hidden ? C.TUTORIAL.map((t) => ({ id: t.id, text: t.text, done: p.tutorial.done.includes(t.id) })) : null,
     asks: (p.asks || []).filter((a) => a.until > now).map((a) => ({ id: a.id, question: a.question, options: a.options, from: a.from })),
     down: p.down ? { remainingSec: Math.max(0, Math.ceil((p.down.until - now) / 1000)), cause: p.down.cause } : null,
     knocker: (() => {
@@ -2802,7 +2923,9 @@ Game.prototype.describePlace = function describePlace(p) {
       for (let i = 1; i <= C.BUILDING.apartmentsPerFloor; i++) {
         const number = `${l.floor}${String(i).padStart(2, '0')}`;
         const r = this.alivePlayers().find((q) => q.apartment.number === number);
-        residents.push({ number, name: r ? r.name : null, online: r ? this.isOnline(r.id) : false, you: r?.id === p.id });
+        // недавно погибший: на двери «†», пока квартиру не займут
+        const dead = r ? null : this.players().find((q) => !q.alive && q.apartment.number === number && q.diedAt && this.now() - q.diedAt < B.tombstoneMin * 60000);
+        residents.push({ number, name: r ? r.name : dead ? `† ${dead.name}` : null, online: r ? this.isOnline(r.id) : false, you: r?.id === p.id, dead: !!dead });
       }
       if (kind === 'residential') here.residents = residents;
       here.lampsOut = this.world.lampsOut[l.floor] || [];

@@ -288,6 +288,11 @@ const PLAYER_ACTIONS = {
   rob: (p, a) => game.rob(p, a.target),
   pickpocket: (p, a) => game.pickpocket(p, a.target),
   fix_lamp: (p, a) => game.fixLamp(p, a.index),
+  echo: (p, a) => game.echo(p, a.phrase),
+  tutorial_hide: (p) => {
+    if (p.tutorial) p.tutorial.hidden = true;
+    return { ok: true };
+  },
   answer: (p, a) => game.answer(p, String(a.id || ''), a.option),
   evict: (p, a) => game.evict(p, a.guest),
   note: (p, a) => game.slipNote(p, a.apt, a.text, !!a.anon),
@@ -433,7 +438,7 @@ function handlePlayerMessage(ws, raw) {
       }
       account = created.account;
     }
-    const res = game.register(msg.name, { account });
+    const res = game.register(msg.name, { account, predecessor: legacyRebirth ? current : null });
     if (!res.ok) {
       send(ws, { t: 'register_error', error: res.error });
       return;

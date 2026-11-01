@@ -918,13 +918,15 @@ test('паспорт: создание, вход, неверный пароль,
 });
 
 test('паспорт: один живой жилец, новая жизнь на том же паспорте', () => {
-  const { game } = makeWorld();
+  const { game, clock } = makeWorld();
   const { account } = game.createAccount('ivan', 'secret1');
   const first = game.register('Иван', { account }).player;
   assert.equal(game.accountPlayer(account), first);
   assert.equal(game.register('Иван Второй', { account }).ok, false, 'пока жив первый — второго не заселить');
   game.kill(first, 'тест');
   assert.equal(game.accountPlayer(account), null);
+  assert.equal(game.register('Иван Второй', { account }).ok, false, 'сразу после смерти — рано');
+  clock.t += C.BALANCE.rebirthDelayMin * 60000 + 1000;
   const second = game.register('Иван Второй', { account }).player;
   assert.equal(second.account, 'ivan');
   assert.deepEqual(account.playerIds, [first.id, second.id]);
@@ -1211,4 +1213,80 @@ test('трудовая книжка: опыт, разряд, задания сл
   assert.match(done.result.text, /надбавка за разряд \+1/);
   assert.equal(done.result.reward, 7);
   assert.equal(game.playerView(p).you.skills.find((x) => x.id === 'sort').rank, 3);
+});
+
+test('памятка новосёла: шаги, учебная тревога без урона, подъёмные', () => {
+  const { game, clock } = makeWorld();
+  const p = join(game, 'Иван');
+  const steps = () => game.playerView(p).you.tutorial.filter((t) => t.done).map((t) => t.id);
+  walkTo(game, p, type('hermodoor'));
+  game.move(p, { place: 'corridor' });
+  assert.deepEqual(steps(), ['corridor']);
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 96 });
+  walkTo(game, p, type('facility'));
+  game.move(p, { place: 'factory' });
+  walkTo(game, p, (o) => o.type === 'station' && o.game === 'sort');
+  const r = game.workStart(p, 'sort');
+  clock.t += 10000;
+  game.workSubmit(p, r.job.id, p.job.secret.answers);
+  game.addItem(p, 'bread');
+  game.useItem(p, 'bread');
+  assert.deepEqual(steps().sort(), ['corridor', 'eat', 'factory', 'shift'].sort());
+  const notes = [];
+  game.on('notify', (n) => notes.push(n));
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  walkTo(game, p, (o) => o.type === 'apt' && o.number === p.apartment.number);
+  game.move(p, { place: 'home' });
+  assert.ok(notes.some((n) => n.title === 'УЧЕБНАЯ ТРЕВОГА'), 'учебная тревога');
+  const hp = p.stats.health;
+  walkTo(game, p, type('hermodoor'));
+  game.seal(p, true);
+  const money = p.money;
+  game.chat(p, 'global', 'Здравствуйте, соседи!');
+  assert.equal(game.playerView(p).you.tutorial, null, 'памятка пройдена — скрыта');
+  assert.equal(p.money, money + C.BALANCE.tutorialReward);
+  assert.equal(p.stats.health, hp, 'тревога учебная — без урона');
+  assert.equal(game.sceneActors(game.locationKey(p))[0].newbie, true);
+});
+
+test('некролог, «†» на двери, наследник с вещью и разрядами', () => {
+  const { game, clock } = makeWorld();
+  const { account } = game.createAccount('ivan', 'secret1');
+  const a = game.register('Иван', { account }).player;
+  game.setOnline(a.id, true);
+  a.skills = { sort: C.RANKS[3] }; // 4 разряд
+  a.shifts = 12;
+  a.deeds = { helped: 3 };
+  game.addItem(a, 'stew', 2);
+  const n = join(game, 'Сосед Петров');
+  game.kill(a, 'Погиб в тумане');
+  const ob = game.playerView(a).you.obituary;
+  assert.equal(ob.shifts, 12);
+  assert.equal(ob.helped, 3);
+  assert.equal(ob.cause, 'Погиб в тумане');
+  assert.ok(game.playerView(a).you.rebirthInSec > 0);
+  game.admin('teleport', { id: n.id, place: 'corridor', floor: 101 });
+  const plate = game.playerView(n).here.residents.find((r) => r.number === a.apartment.number);
+  assert.match(plate.name, /† Иван/);
+  clock.t += C.BALANCE.rebirthDelayMin * 60000 + 1000;
+  const heir = game.register('Иван II', { account }).player;
+  assert.equal(game.rankOf(heir, 'sort'), 3, 'разряд на ступень ниже');
+  assert.equal(heir.inventory.stew, 1, 'одна вещь из опечатанной квартиры');
+  assert.equal(game.playerView(heir).you.tutorial, null, 'наследнику памятка не нужна');
+});
+
+test('отголосок: погибший шепчет фразу соседу на грани безумия', () => {
+  const { game } = makeWorld({ random: () => 0 });
+  const dead = join(game, 'Иван');
+  const living = join(game, 'Мария');
+  game.kill(dead, 'тест');
+  assert.equal(game.echo(living, 0).ok, false, 'живые не отголоски');
+  assert.equal(game.echo(dead, 99).ok, false);
+  assert.equal(game.echo(dead, 0).ok, true);
+  assert.equal(game.echo(dead, 1).ok, false, 'один раз');
+  const msgs = [];
+  game.on('chat', (m) => msgs.push(m));
+  game.hallucinate(living);
+  assert.equal(msgs[0].text, C.ECHO_PHRASES[0]);
+  assert.equal(msgs[0].from.name, 'Иван †');
 });

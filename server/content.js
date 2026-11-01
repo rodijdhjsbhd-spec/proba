@@ -57,6 +57,12 @@ const BALANCE = {
   // Расходники: противогаз (фильтр) и фонарик (батарейка) — сколько процентов заряда в минуту
   gasMaskDrainPerMin: 20,
   flashDrainPerMin: 8,
+  // Цена смерти: новая жизнь на том же паспорте — не раньше, чем через столько минут
+  rebirthDelayMin: 10,
+  // «†» на двери погибшего держится столько минут (пока квартиру не займут)
+  tombstoneMin: 60,
+  // Подъёмные новосёлу за выполненную памятку
+  tutorialReward: 5,
 
   hungerPerMin: -3, // сытость падает: 100 → 0 примерно за 33 минуты
   starvationHpPerMin: -6, // урон здоровью при сытости 0
@@ -257,6 +263,26 @@ const HALLUCINATION_VOICES = ['Сосед', 'Сосед сверху', 'Кто-�
 // Эти имена нельзя взять жильцу: ими говорит дом и ЖЭК.
 const RESERVED_NAMES = ['ЖЭК', 'Радиоточка', 'Голос за стеной', 'Админ', 'Администратор', 'Модератор', 'Система', 'Диспетчер', ...HALLUCINATION_VOICES];
 
+// Памятка новосёла: шаги по порядку
+const TUTORIAL = [
+  { id: 'corridor', text: 'Выйти в коридор (гермодверь внизу комнаты)' },
+  { id: 'factory', text: 'Доехать на лифте до Цеха №4 (96 этаж) и войти' },
+  { id: 'shift', text: 'Отработать смену у любого станка' },
+  { id: 'eat', text: 'Поесть: Столовая №3 (100 этаж) или хлеб из карманов' },
+  { id: 'seal', text: 'Дома задраить гермодверь (учебная тревога)' },
+  { id: 'talk', text: 'Заговорить с соседом (Enter — чат)' },
+];
+
+// «Отголосок»: что погибший может шепнуть живому соседу с пошатнувшимся рассудком
+const ECHO_PHRASES = [
+  'не открывай им дверь',
+  'в столовой не ешь суп',
+  'лифт врёт про этажи',
+  'я всё ещё здесь, за стеной',
+  'береги противогаз',
+  'они знают, где ты живёшь',
+];
+
 // Через сколько реальных часов погибших уносят из Пульта в архив домовой книги
 const ARCHIVE_DEAD_AFTER_H = 24;
 
@@ -272,5 +298,5 @@ const NOTES = {
 
 module.exports = {
   BUILDING, FACILITIES, BALANCE, ITEMS, SHOPS, CONDITIONS, ACCIDENTS, PLACES, BREAKDOWNS, HALLUCINATIONS,
-  HALLUCINATION_VOICES, RESERVED_NAMES, ARCHIVE_DEAD_AFTER_H, NOTES, RANKS,
+  HALLUCINATION_VOICES, RESERVED_NAMES, ARCHIVE_DEAD_AFTER_H, NOTES, RANKS, TUTORIAL, ECHO_PHRASES,
 };

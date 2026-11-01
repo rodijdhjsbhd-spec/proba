@@ -838,7 +838,7 @@
           if (r && r.name) {
             const label = r.you ? 'ВЫ' : r.name.length > 9 ? `${r.name.slice(0, 8)}…` : r.name;
             b.rrect(o.x - 0.12, o.y - 1.02, 1.24, 0.28, 0.06, 'rgba(20,20,18,0.8)');
-            b.text(label, o.x + 0.5, o.y - 0.875, 0.19, r.you ? '#e3a13b' : r.online ? '#cfe9c8' : '#a8a597');
+            b.text(label, o.x + 0.5, o.y - 0.875, 0.19, r.you ? '#e3a13b' : r.dead ? '#d79a92' : r.online ? '#cfe9c8' : '#a8a597');
           }
         } else if (o.type === 'hermodoor') {
           const a = s.sealed ? 0.6 : 0;
@@ -892,6 +892,19 @@
         b.circle(l[0], l[1], 0.28, 'rgba(0,0,0,0.25)');
         for (let k = 0; k < 5; k++) b.rect(l[0] - 0.2 + ((k * 37) % 40) / 100, l[1] - 0.12 + ((k * 23) % 25) / 100, 0.06, 0.03, 'rgba(210,230,235,0.8)');
         b.g.restore();
+      }
+      if (s.marker) {
+        // стрелка памятки новосёла над нужным объектом
+        const bob = Math.sin(t * 4) * 0.12;
+        const mx = s.marker.x, my = s.marker.y + bob;
+        b.g.fillStyle = 'rgba(227,161,59,0.95)';
+        b.g.beginPath();
+        b.g.moveTo((mx - 0.22) * b.T, (my - 0.32) * b.T);
+        b.g.lineTo((mx + 0.22) * b.T, (my - 0.32) * b.T);
+        b.g.lineTo(mx * b.T, my * b.T);
+        b.g.closePath();
+        b.g.fill();
+        b.rect(mx - 0.07, my - 0.62, 0.14, 0.32, 'rgba(227,161,59,0.95)');
       }
       if (s.pathEnd) {
         const p = (t * 2) % 1;
@@ -1007,7 +1020,7 @@
       g.textBaseline = 'bottom';
       for (const a of people) {
         if (a.sleep && !a.down) continue;
-        const label = a.down ? `${a.name} · без сознания` : a.away ? `${a.name} · не в сети` : a.name;
+        const label = a.down ? `${a.name} · без сознания` : a.away ? `${a.name} · не в сети` : a.newbie ? `${a.name} · новосёл` : a.name;
         const nx = a.x * TD, ny = (a.down ? a.y - 0.45 : a.y - 1.15) * TD;
         const wName = g.measureText(label).width + 8 * this.dpr;
         g.fillStyle = 'rgba(10,11,11,0.6)';

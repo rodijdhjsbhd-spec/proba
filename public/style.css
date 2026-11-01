@@ -412,3 +412,13 @@ body.sanity-critical .place h1 { animation: flicker 2s infinite; }
 .skills li small { grid-column: 1 / -1; color: var(--muted); font-size: 11px; }
 .price.out { color: var(--red); }
 .inventory .equip.dead { color: var(--red); }
+
+/* Памятка новосёла, некролог, отголосок */
+.tutorial { border-color: var(--amber-dim); }
+.tutorial-list { margin: 0 0 8px; padding-left: 20px; display: grid; gap: 4px; font-size: 13px; }
+.tutorial-list li.done { color: var(--muted); text-decoration: line-through; }
+.tutorial-list li.next { color: var(--amber); font-weight: 700; }
+.obituary { color: var(--muted); font-size: 14px; margin: 0 0 10px; }
+.echo-box { border-top: 1px dashed var(--line); margin-top: 10px; padding-top: 8px; }
+.echo-h { font-size: 13px; color: var(--violet); margin: 0 0 6px; }
+.echo-box .actions { flex-wrap: wrap; }
