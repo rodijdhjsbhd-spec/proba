@@ -24,6 +24,7 @@ const PUSH_STYLES = { siren: 'urgent', fog: 'urgent', danger: 'urgent', death: '
 const PUSH_TAG_GAP_MS = 10 * 60000;
 const PUSH_URGENT_GAP_MS = 30000;
 const PUSH_PER_HOUR = 12;
+const PEOPLE_SHOWN = 30; // сколько соседей по сцене попадает в вид жильца (остальные — числом)
 const STAT_NAMES = { health: 'Здоровье', hunger: 'Сытость', energy: 'Силы', sanity: 'Рассудок' };
 const MOVE_PLACES = ['home', 'corridor', 'canteen', 'medpost', 'factory'];
 
@@ -248,8 +249,56 @@ class Game extends EventEmitter {
     return Object.values(this.state.players);
   }
 
+  /**
+   * Живые жильцы. Список кешируется: его спрашивают сотни раз в секунду (соседи, хозяин квартиры,
+   * сцены). Сбрасывается там, где меняется состав дома или жив/мёртв (invalidatePlayers), и на всякий
+   * случай в начале каждого тика и команды ЖЭК. Массив общий — не менять его на месте.
+   */
   alivePlayers() {
-    return this.players().filter((p) => p.alive);
+    if (!this._alive) this._alive = this.players().filter((p) => p.alive);
+    if (this.checkCache) {
+      const fresh = this.players().filter((p) => p.alive);
+      if (fresh.length !== this._alive.length || fresh.some((p, i) => p !== this._alive[i])) throw new Error('кеш живых жильцов устарел');
+    }
+    return this._alive;
+  }
+
+  invalidatePlayers() {
+    this._alive = null;
+    this._owners = null;
+    this._deadIn = null;
+  }
+
+  /**
+   * Индекс «сцена → живые жильцы» на время fn (рассылка видов и позиций). Внутри fn никто не
+   * переходит из сцены в сцену, поэтому индекс верен; вне fn — обычный перебор.
+   */
+  withSceneIndex(fn) {
+    if (this._sceneIndex) return fn();
+    this._sceneIndex = this.playersByScene();
+    try {
+      return fn();
+    } finally {
+      this._sceneIndex = null;
+    }
+  }
+
+  /** Живые жильцы, разложенные по сценам (и те, кто не в сети). */
+  playersByScene() {
+    const map = new Map();
+    for (const p of this.alivePlayers()) {
+      const key = this.locationKey(p);
+      const list = map.get(key);
+      if (list) list.push(p);
+      else map.set(key, [p]);
+    }
+    return map;
+  }
+
+  /** Все живые в сцене key (в сети и нет). */
+  playersAt(key) {
+    if (this._sceneIndex) return this._sceneIndex.get(key) || [];
+    return this.alivePlayers().filter((q) => this.locationKey(q) === key);
   }
 
   getPlayer(id) {
@@ -704,16 +753,36 @@ class Game extends EventEmitter {
 
   /** Последний погибший жилец квартиры, пока на двери висит «†». */
   lastDeadIn(apt) {
-    let best = null;
-    for (const q of this.players()) {
-      if (q.alive || q.apartment.number !== apt || !q.diedAt || this.now() - q.diedAt >= B.tombstoneMin * 60000) continue;
-      if (!best || q.diedAt > best.diedAt) best = q;
+    // квартира → последний погибший в ней (индекс сбрасывается вместе с кешем живых)
+    if (!this._deadIn) {
+      this._deadIn = new Map();
+      for (const q of this.players()) {
+        if (q.alive || !q.diedAt) continue;
+        const cur = this._deadIn.get(q.apartment.number);
+        if (!cur || q.diedAt > cur.diedAt) this._deadIn.set(q.apartment.number, q);
+      }
+    }
+    const q = this._deadIn.get(apt);
+    const best = q && !q.alive && this.now() - q.diedAt < B.tombstoneMin * 60000 ? q : null;
+    if (this.checkCache) {
+      let fresh = null;
+      for (const x of this.players()) {
+        if (x.alive || x.apartment.number !== apt || !x.diedAt || this.now() - x.diedAt >= B.tombstoneMin * 60000) continue;
+        if (!fresh || x.diedAt > fresh.diedAt) fresh = x;
+      }
+      if (fresh !== best) throw new Error('индекс погибших устарел');
     }
     return best;
   }
 
   ownerOf(apt) {
-    return this.alivePlayers().find((q) => q.apartment.number === apt) || null;
+    if (!this._owners) {
+      // первый живой с этой квартирой — как раньше find по списку
+      this._owners = new Map();
+      for (const q of this.alivePlayers()) if (!this._owners.has(q.apartment.number)) this._owners.set(q.apartment.number, q);
+    }
+    if (this.checkCache && (this._owners.get(apt) || null) !== (this.alivePlayers().find((q) => q.apartment.number === apt) || null)) throw new Error('кеш хозяев квартир устарел');
+    return this._owners.get(apt) || null;
   }
 
   locationKey(p) {
@@ -731,8 +800,7 @@ class Game extends EventEmitter {
   }
 
   othersAt(p) {
-    const key = this.locationKey(p);
-    return this.alivePlayers().filter((q) => q.id !== p.id && this.isOnline(q.id) && this.locationKey(q) === key);
+    return this.playersAt(this.locationKey(p)).filter((q) => q.id !== p.id && this.isOnline(q.id));
   }
 
   sceneOf(p) {
@@ -852,11 +920,10 @@ class Game extends EventEmitter {
     return { ok: true, message: 'Огорожено. Табличка «Осторожно» висит.' };
   }
 
-  /** Кого видно в сцене: живые жильцы в сети. */
-  sceneActors(key) {
+  /** Кого видно в сцене: живые жильцы (не в сети — «спят»). list — уже отобранные жильцы сцены. */
+  sceneActors(key, list = null) {
     const now = this.now();
-    return this.alivePlayers()
-      .filter((p) => this.locationKey(p) === key)
+    return (list || this.playersAt(key))
       .map((p) => ({
         away: !this.isOnline(p.id),
         id: p.id,
@@ -1086,6 +1153,7 @@ class Game extends EventEmitter {
       tutorial: { done: [], rewarded: false, drill: false },
     };
     this.state.players[id] = p;
+    this.invalidatePlayers();
     this.byToken.set(token, id);
     if (account) this.linkAccount(p, account);
     if (heirOf) this.inherit(p, heirOf);
@@ -1238,6 +1306,7 @@ class Game extends EventEmitter {
   // Тик мира
   // =========================================================================
   tick() {
+    this.invalidatePlayers(); // страховка: если где-то забыли сбросить кеш, он живёт не дольше секунды
     const w = this.world;
     if (w.paused) return;
     const now = this.now();
@@ -2699,6 +2768,7 @@ class Game extends EventEmitter {
       delete this.state.players[p.id];
       this.byToken.delete(p.token);
       this.onlineSet.delete(p.id);
+      this.invalidatePlayers();
     }
   }
 
@@ -3920,6 +3990,7 @@ class Game extends EventEmitter {
     if (!p.alive) return;
     const wasTraveling = !!p.travel;
     p.alive = false;
+    this.invalidatePlayers();
     p.deathCause = cause;
     p.diedAt = this.now();
     p.travel = null;
@@ -4121,10 +4192,13 @@ class Game extends EventEmitter {
     const danger = this.dangerLabel(cmd, args);
     if (danger) this.takeSnapshot(danger, ctx.who);
     let res;
+    this.invalidatePlayers(); // команда ЖЭК может поменять кого угодно — кеш строим заново
     try {
       res = fn.call(this, args, ctx) || { ok: true };
     } catch (err) {
       res = { ok: false, error: err.message };
+    } finally {
+      this.invalidatePlayers();
     }
     if (!QUIET_COMMANDS.includes(cmd)) this.godLogAdd(ctx.who, cmd, args, res);
     return res;
@@ -4524,6 +4598,7 @@ const ADMIN_COMMANDS = {
     }
     p.name = this.freeName(p.name, p.id);
     p.alive = true;
+    this.invalidatePlayers();
     p.deathCause = null;
     p.diedAt = null;
     p.conditions = [];
@@ -4561,6 +4636,7 @@ const ADMIN_COMMANDS = {
   erase({ id }) {
     const p = this.requirePlayer(id, { alive: false });
     delete this.state.players[p.id];
+    this.invalidatePlayers();
     this.byToken.delete(p.token);
     this.onlineSet.delete(p.id);
     this.log(`Жилец ${p.name} стёрт из домовой книги`, 'admin');
@@ -4842,6 +4918,7 @@ const ADMIN_COMMANDS = {
     const data = JSON.parse(snap.data);
     const fresh = Game.normalize({ ...this.state, ...data });
     Object.assign(this.state, fresh);
+    this.invalidatePlayers();
     this.applyPalette();
     this.rebuildMap(); // перепланировка тоже откатилась
     this.byToken = new Map(Object.values(this.state.players).map((p) => [p.token, p.id]));
@@ -4866,6 +4943,7 @@ const ADMIN_COMMANDS = {
     this.takeSnapshot(`перед откатом жильца ${cur.name}`, ctx.who);
     const keep = { token: cur.token, account: cur.account, journal: cur.journal };
     this.state.players[id] = Object.assign(old, keep);
+    this.invalidatePlayers();
     const p = this.state.players[id];
     p.job = null;
     const scene = this.sceneOf(p);
@@ -5555,7 +5633,14 @@ Game.prototype.describePlace = function describePlace(p) {
   const l = p.location;
   const w = this.world;
   const dark = this.isDark(l.floor);
-  const people = this.othersAt(p).map((q) => ({
+  // в толпе (столовая, цех) — ближайшие PEOPLE_SHOWN: с ними и можно что-то сделать, остальные — числом
+  let others = this.othersAt(p);
+  const crowd = others.length > PEOPLE_SHOWN ? others.length - PEOPLE_SHOWN : 0;
+  if (crowd) {
+    const d = (q) => Math.hypot(q.pos.x - p.pos.x, q.pos.y - p.pos.y);
+    others = others.map((q) => [d(q), q]).sort((a, b) => a[0] - b[0]).slice(0, PEOPLE_SHOWN).map((x) => x[1]).sort((a, b) => (a.id < b.id ? -1 : 1));
+  }
+  const people = others.map((q) => ({
     id: q.id,
     name: q.name,
     apt: q.apartment.number,
@@ -5565,12 +5650,12 @@ Game.prototype.describePlace = function describePlace(p) {
   }));
   // у себя дома хозяин видит и гостей, ушедших из сети: иначе выходом из игры можно удерживать чужое укрытие
   if (this.isOwnHome(p)) {
-    for (const q of this.alivePlayers()) {
-      if (q.id === p.id || this.isOnline(q.id) || this.locationKey(q) !== this.locationKey(p)) continue;
+    for (const q of this.playersAt(this.locationKey(p))) {
+      if (q.id === p.id || this.isOnline(q.id)) continue;
       people.push({ id: q.id, name: q.name, apt: q.apartment.number, symptoms: [], rank: this.bestRank(q), away: true });
     }
   }
-  const here = { key: this.locationKey(p), place: l.place, floor: l.floor, title: this.placeTitle(p), text: '', people, shop: null, residents: null, closed: null };
+  const here = { key: this.locationKey(p), place: l.place, floor: l.floor, title: this.placeTitle(p), text: '', people, crowd, shop: null, residents: null, closed: null };
   here.hazards = (this.world.hazards[here.key] || []).map((hz) => ({ id: hz.id, kind: hz.kind, name: C.HAZARDS[hz.kind].name, x: hz.x, y: hz.y, fenced: !!hz.fenced }));
   here.scars = this.scarsView(here.key);
   if (l.place === 'home') here.furniture = Object.keys(this.furnitureAt(this.currentApt(p)));
@@ -5603,7 +5688,7 @@ Game.prototype.describePlace = function describePlace(p) {
       const elderHere = this.elderOf(l.floor);
       for (let i = 1; i <= C.BUILDING.apartmentsPerFloor; i++) {
         const number = `${l.floor}${String(i).padStart(2, '0')}`;
-        const r = this.alivePlayers().find((q) => q.apartment.number === number);
+        const r = this.ownerOf(number);
         // недавно погибший: на двери «†», пока квартиру не займут
         const dead = r ? null : this.lastDeadIn(number);
         residents.push({ number, name: r ? r.name : dead ? `† ${dead.name}` : null, online: r ? this.isOnline(r.id) : false, you: r?.id === p.id, dead: !!dead, rumor: r ? this.rumor(r) : [], elder: !!(r && elderHere && elderHere.id === r.id) });

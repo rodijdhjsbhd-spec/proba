@@ -183,14 +183,33 @@
         $('#register').hidden = true;
         break;
       case 'view':
+      case 'vpatch':
         if (S.banned) break; // экран бана не должен смениться игрой
-        S.view = msg.view;
+        if (msg.t === 'vpatch' && !S.view) break; // изменения без целого вида не применить
+        S.view = msg.t === 'view' ? msg.view : ViewPatch.apply(S.view, msg);
         S.viewAt = performance.now();
         syncScene();
         render();
         break;
       case 'actors':
-        if (msg.key === S.sceneKey) updateActors(msg.actors);
+        if (msg.key !== S.sceneKey) break;
+        if (msg.base != null) {
+          // изменения к версии, которой у нас нет (пропустили, сменили сцену) — попросить целиком
+          if (S.actorsKey !== msg.key || S.actorsSeq !== msg.base) {
+            if (Date.now() - (S.actorsResyncAt || 0) > 1000) {
+              send({ t: 'actors_resync' });
+              S.actorsResyncAt = Date.now();
+            }
+            break;
+          }
+          updateActors(msg.actors, msg.gone || []);
+          for (const [id, x, y, d, m] of msg.moves || []) {
+            const cur = S.actors.get(id);
+            if (cur) Object.assign(cur, { tx: x, ty: y, d, m: !!m });
+          }
+        } else updateActors(msg.actors);
+        S.actorsKey = msg.key;
+        S.actorsSeq = msg.seq;
         break;
       case 'pos_fix':
         if (S.me && msg.seq === S.posSeq) {
@@ -249,6 +268,7 @@
       S.scene = S.map.scene(key);
       renderer.setScene(S.scene);
       S.actors.clear();
+      S.actorsKey = null; // соседи новой сцены придут целиком
       S.hover = null;
       if (S.sheet && S.sheet.kind !== 'work') closeSheet();
     }
@@ -263,7 +283,8 @@
     }
   }
 
-  function updateActors(list) {
+  /** Соседи в сцене: list — весь список (gone не задан) или только изменившиеся (gone — ушедшие). */
+  function updateActors(list, gone = null) {
     const myId = S.view && S.view.you.id;
     const seen = new Set();
     for (const a of list) {
@@ -273,7 +294,8 @@
       if (cur) Object.assign(cur, { tx: a.x, ty: a.y, d: a.d, m: a.m, sick: a.sick, hurt: a.hurt, sleep: a.sleep, down: a.down, mask: a.mask, away: a.away, newbie: a.newbie, name: a.name, apt: a.apt });
       else S.actors.set(a.id, { ...a, tx: a.x, ty: a.y, look: lookForActor(a), phase: Math.random() * 6 });
     }
-    for (const id of [...S.actors.keys()]) if (!seen.has(id)) S.actors.delete(id);
+    if (gone) for (const id of gone) S.actors.delete(id);
+    else for (const id of [...S.actors.keys()]) if (!seen.has(id)) S.actors.delete(id);
   }
 
   // ---------------------------------------------------------------------------
@@ -1339,7 +1361,7 @@
       $('#place-title').replaceChildren(v.here.title, ...(showFloor ? [h('span', { class: 'floor-tag', text: ` ${v.here.floor} этаж` })] : []));
       $('#place-text').textContent = v.here.text;
     });
-    memo('nearby', [v.here.people, v.trades, v.here.ownHome], () => renderNearby(v));
+    memo('nearby', [v.here.people, v.here.crowd, v.trades, v.here.ownHome], () => renderNearby(v));
     memo('journal', you.journal.length && you.journal[you.journal.length - 1].ts, () => {
       $('#journal').replaceChildren(...you.journal.slice().reverse().map(journalItem));
       if (S.journalSeen && S.pocket !== 'log') pocketDot('log', true);
@@ -1573,6 +1595,7 @@
         ),
       );
     }
+    if (v.here.crowd) kids.push(h('span', { class: 'chip-person crowd', text: `и ещё ${v.here.crowd} — подальше` }));
     $('#nearby').replaceChildren(...kids);
   }
 

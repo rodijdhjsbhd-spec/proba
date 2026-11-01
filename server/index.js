@@ -29,10 +29,12 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { monitorEventLoopDelay } = require('perf_hooks');
 const { WebSocketServer } = require('ws');
 const { Game, WORLD_CONFIG, ROLE_NAMES } = require('./game');
 const storage = require('./storage');
 const Push = require('./push');
+const ViewPatch = require('../public/shared/viewpatch');
 const { BALANCE, ITEMS } = require('./content');
 
 let ITEM_CATALOG = Object.fromEntries(Object.entries(ITEMS).map(([id, it]) => [id, it.name]));
@@ -152,6 +154,43 @@ const CSP = [
 /** Состояние для /healthz. */
 const health = { savedAt: null, saveError: null };
 
+// ---- замеры нагрузки: видны в /healthz, по ним смотрят боты-нагрузчики (scripts/loadtest.js) ----
+const loopLag = monitorEventLoopDelay({ resolution: 10 });
+loopLag.enable();
+const perf = { tick: [], actors: [], save: [], saveKb: 0, cpuPct: 0, lag: null, cpu: process.cpuUsage(), cpuAt: Date.now() };
+/** Выполнить fn и запомнить, сколько миллисекунд оно заняло (последние 120 замеров). */
+function timed(list, fn) {
+  const t0 = performance.now();
+  try {
+    return fn();
+  } finally {
+    list.push(performance.now() - t0);
+    if (list.length > 120) list.shift();
+  }
+}
+const ms = (x) => Math.round(x * 10) / 10;
+const spread = (list) => (list.length ? { avg: ms(list.reduce((a, b) => a + b, 0) / list.length), max: ms(Math.max(...list)) } : null);
+setInterval(() => {
+  const used = process.cpuUsage(perf.cpu);
+  perf.cpuPct = Math.round(((used.user + used.system) / 1000 / Math.max(1, Date.now() - perf.cpuAt)) * 100);
+  perf.cpu = process.cpuUsage();
+  perf.cpuAt = Date.now();
+  perf.lag = { p50: ms(loopLag.percentile(50) / 1e6), p99: ms(loopLag.percentile(99) / 1e6), max: ms(loopLag.max / 1e6) };
+  loopLag.reset();
+}, 5000).unref();
+function perfView() {
+  return {
+    tickMs: spread(perf.tick),
+    actorsMs: spread(perf.actors),
+    saveMs: spread(perf.save),
+    saveKb: perf.saveKb,
+    loopLagMs: perf.lag,
+    cpuPct: perf.cpuPct,
+    heapMb: Math.round(process.memoryUsage().heapUsed / 1048576),
+    sockets: playerWss.clients.size,
+  };
+}
+
 const server = http.createServer((req, res) => {
   let pathname;
   try {
@@ -165,7 +204,7 @@ const server = http.createServer((req, res) => {
     const savedAgo = health.savedAt ? Math.round((Date.now() - health.savedAt) / 1000) : null;
     const ok = !health.saveError;
     res.writeHead(ok ? 200 : 503, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
-    res.end(JSON.stringify({ ok, uptimeSec: Math.round(process.uptime()), online: game.onlineSet.size, alive: game.alivePlayers().length, savedAgoSec: savedAgo, saveError: health.saveError || undefined }));
+    res.end(JSON.stringify({ ok, uptimeSec: Math.round(process.uptime()), online: game.onlineSet.size, alive: game.alivePlayers().length, savedAgoSec: savedAgo, saveError: health.saveError || undefined, perf: perfView() }));
     return;
   }
   if (pathname === '/') pathname = '/index.html';
@@ -248,6 +287,7 @@ function sendBanned(ws, ban) {
 
 function bind(ws, player) {
   ws.playerId = player.id;
+  ws.viewParts = null; // новый жилец в этом сокете — первый вид целиком
   player.lastIp = ws.ip;
   if (!socketsByPlayer.has(player.id)) socketsByPlayer.set(player.id, new Set());
   socketsByPlayer.get(player.id).add(ws);
@@ -284,7 +324,18 @@ function pushView(id) {
   const p = game.getPlayer(id);
   if (!set || !p) return;
   const view = game.playerView(p);
-  for (const ws of set) send(ws, { t: 'view', view });
+  for (const ws of set) {
+    const msg = viewMessage(ws, view);
+    if (msg) send(ws, msg);
+  }
+}
+
+/** Вид жильца уходит изменениями (public/shared/viewpatch.js): первый раз целиком, дальше — что поменялось. */
+function viewMessage(ws, view) {
+  const { parts, patch } = ViewPatch.diff(ws.viewParts, view);
+  ws.viewParts = parts;
+  if (!patch) return null;
+  return patch.full ? { t: 'view', view } : { t: 'vpatch', set: patch.set, del: patch.del };
 }
 
 function sendToPlayer(id, msg) {
@@ -304,9 +355,28 @@ function syncLocation(id) {
 }
 
 // ---- события мира → сокеты ----
+// Виды тех, кого задело событие, пересчитываем пачкой раз в 50 мс: в толпе (столовая, цех) входят и
+// выходят постоянно, и без пачки каждый вход пересчитывал бы виды всех, кто внутри.
+const dirtyIds = new Set();
+let dirtyTimer = null;
 game.on('dirty', (ids) => {
-  for (const id of ids) pushView(id);
+  for (const id of ids) dirtyIds.add(id);
+  if (!dirtyTimer) dirtyTimer = setTimeout(flushDirty, 50);
 });
+function flushDirty() {
+  dirtyTimer = null;
+  const ids = [...dirtyIds];
+  dirtyIds.clear();
+  game.withSceneIndex(() => {
+    for (const id of ids) {
+      try {
+        pushView(id);
+      } catch (err) {
+        console.error('[view]', id, err);
+      }
+    }
+  });
+}
 
 game.on('notify', ({ to, title, text, style, action, ask }) => {
   for (const id of to) sendToPlayer(id, { t: 'notify', title, text, style, action, ask });
@@ -717,6 +787,12 @@ function handleRest(ws, msg) {
     return;
   }
 
+  if (msg.t === 'actors_resync') {
+    // клиент пропустил версию соседей (например, сменил сцену) — следующая рассылка придёт целиком
+    if (ws.playerId) lastActors.delete(ws.playerId);
+    return;
+  }
+
   if (msg.t === 'pos') {
     const p = ws.playerId ? game.getPlayer(ws.playerId) : null;
     if (!p) return;
@@ -877,21 +953,25 @@ function handleAdminMessage(ws, ip, raw) {
 // ---------------------------------------------------------------------------
 // Игровой цикл, сохранение, пинги
 // ---------------------------------------------------------------------------
-setInterval(() => {
+setInterval(() => timed(perf.tick, gameTick), BALANCE.tickMs);
+function gameTick() {
   try {
     game.tick();
   } catch (err) {
     // Ошибка в одном тике не должна ронять весь дом
     console.error('[tick]', err);
   }
-  for (const [id] of socketsByPlayer) {
-    try {
-      pushView(id);
-      syncLocation(id);
-    } catch (err) {
-      console.error('[view]', id, err);
+  // пока рассылаем виды, никто не ходит — соседей по сцене берём из индекса, а не перебором всего дома
+  game.withSceneIndex(() => {
+    for (const [id] of socketsByPlayer) {
+      try {
+        pushView(id);
+        syncLocation(id);
+      } catch (err) {
+        console.error('[view]', id, err);
+      }
     }
-  }
+  });
   if (admins.size) {
     try {
       sendSnapshot(admins, game.adminSnapshot());
@@ -899,7 +979,7 @@ setInterval(() => {
       console.error('[snapshot]', err);
     }
   }
-}, BALANCE.tickMs);
+}
 
 /**
  * Снимок для Пульта — изменениями: жильцы, у которых ничего не поменялось с прошлой отправки
@@ -920,15 +1000,18 @@ function sendSnapshot(list, snapshot) {
 }
 
 // Кто где стоит — рассылаем каждому жильцу состав его сцены (только если что-то изменилось).
-const lastActors = new Map(); // playerId → подпись последней отправки
-setInterval(() => {
+const lastActors = new Map(); // playerId → «сцена#версия», которую жилец уже получил
+const sceneActorState = new Map(); // сцена → { seq, sigs: Map(id → JSON), rest: Map(id → JSON без x/y/d/m) }
+// всё, кроме положения: если поменялось только оно — шлём коротко [id, x, y, d, m]
+const actorRest = (a) => JSON.stringify({ ...a, x: 0, y: 0, d: 0, m: 0 });
+setInterval(() => timed(perf.actors, () => {
   try {
     if (!game.world.paused && Object.keys(game.world.puppets).length) game.stepPuppets(0.1);
     broadcastActors();
   } catch (err) {
     console.error('[actors]', err);
   }
-}, 100);
+}), 100);
 
 function broadcastActors() {
   // Глазок ЖЭК: админам — состояние выбранной сцены
@@ -940,6 +1023,8 @@ function broadcastActors() {
     ws.watchSig = sig;
     send(ws, { t: 'watch', scene: snap });
   }
+  // жильцы по сценам — один проход по дому; сообщение сцены собирается один раз на всех её зрителей
+  const scenes = game.playersByScene();
   const byScene = new Map();
   for (const [id] of socketsByPlayer) {
     const p = game.getPlayer(id);
@@ -948,13 +1033,45 @@ function broadcastActors() {
     if (!byScene.has(key)) byScene.set(key, []);
     byScene.get(key).push(id);
   }
+  /*
+   * Соседи по сцене уходят изменениями: кто получил прошлую версию сцены — только сдвинувшихся и
+   * ушедших; новенький (или сбившийся — клиент попросит actors_resync) — весь список. В толпе
+   * (столовая, цех) шевелится обычно несколько человек, а не все сразу.
+   */
+  for (const key of sceneActorState.keys()) if (!byScene.has(key)) sceneActorState.delete(key);
   for (const [key, ids] of byScene) {
-    const actors = game.sceneActors(key);
-    const sig = key + JSON.stringify(actors);
+    const actors = game.sceneActors(key, scenes.get(key) || []);
+    const sigs = new Map(actors.map((a) => [a.id, JSON.stringify(a)]));
+    const st = sceneActorState.get(key) || { seq: 0, sigs: new Map(), rest: new Map() };
+    sceneActorState.set(key, st);
+    const changed = [];
+    const moves = [];
+    const rest = new Map();
+    for (const a of actors) {
+      const r = actorRest(a);
+      rest.set(a.id, r);
+      if (st.sigs.get(a.id) === sigs.get(a.id)) continue;
+      if (st.rest.get(a.id) === r) moves.push([a.id, a.x, a.y, a.d, a.m ? 1 : 0]);
+      else changed.push(a);
+    }
+    const gone = [...st.sigs.keys()].filter((id) => !sigs.has(id));
+    const base = st.seq;
+    if (changed.length || moves.length || gone.length) {
+      st.seq++;
+      st.sigs = sigs;
+      st.rest = rest;
+    }
+    const now = `${key}#${st.seq}`;
+    let full = null;
+    let delta = null;
     for (const id of ids) {
-      if (lastActors.get(id) === sig) continue;
-      lastActors.set(id, sig);
-      sendToPlayer(id, { t: 'actors', key, actors });
+      const had = lastActors.get(id);
+      if (had === now) continue;
+      let raw;
+      if (had === `${key}#${base}` && st.seq === base + 1) raw = delta = delta || JSON.stringify({ t: 'actors', key, seq: st.seq, base, actors: changed, moves, gone });
+      else raw = full = full || JSON.stringify({ t: 'actors', key, seq: st.seq, actors });
+      lastActors.set(id, now);
+      for (const ws of socketsByPlayer.get(id) || []) if (ws.readyState === ws.OPEN) ws.send(raw);
     }
   }
 }
@@ -962,7 +1079,15 @@ function broadcastActors() {
 function persist() {
   try {
     game.state.savedAt = Date.now();
-    storage.save(DATA_FILE, game.state);
+    const bytes = timed(perf.save, () => storage.save(DATA_FILE, game.state));
+    perf.saveKb = Math.round(bytes / 1024);
+    // замеры: мир на 1000 жильцов пишется за десятки миллисекунд. Если запись стала долгой — пора
+    // переходить на базу с записью только изменившихся жильцов (ROADMAP, раздел 2.7)
+    const took = perf.save[perf.save.length - 1];
+    if (took > 250 && Date.now() - (perf.slowSaveWarnAt || 0) > 3600000) {
+      perf.slowSaveWarnAt = Date.now();
+      console.warn(`[storage] Сохранение мира заняло ${Math.round(took)} мс (${perf.saveKb} КБ): пора переводить хранение на SQLite — см. ROADMAP, раздел 2.7.`);
+    }
     health.savedAt = game.state.savedAt;
     health.saveError = null;
   } catch (err) {

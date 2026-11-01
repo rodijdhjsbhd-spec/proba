@@ -27,12 +27,14 @@ function load(file) {
   }
 }
 
-/** Атомарная запись: сначала во временный файл, потом rename — чтобы не получить полфайла при падении. */
+/** Атомарная запись: сначала во временный файл, потом rename — чтобы не получить полфайла при падении. Возвращает размер в байтах. */
 function save(file, state) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(state));
+  const text = JSON.stringify(state);
+  fs.writeFileSync(tmp, text);
   fs.renameSync(tmp, file);
+  return Buffer.byteLength(text);
 }
 
 /**

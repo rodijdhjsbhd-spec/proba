@@ -10,6 +10,7 @@ const World = require('../public/shared/world');
 function makeWorld({ random = () => 0.99 } = {}) {
   const clock = { t: 1_000_000 };
   const game = new Game(null, { now: () => clock.t, random });
+  game.checkCache = true; // кеш живых жильцов и хозяев сверяется с честным пересчётом на каждом вызове
   const advance = (ms) => {
     const steps = Math.round(ms / C.BALANCE.tickMs);
     for (let i = 0; i < steps; i++) {
@@ -2497,4 +2498,71 @@ test('пуши: задраенная дверь — сирена не срочн
   assert.equal(pa.urgent, false);
   assert.match(pb.body, /не дома/);
   assert.equal(pb.urgent, true);
+});
+
+test('индекс «сцена → жильцы» не меняет того, что видят жильцы', () => {
+  const { game } = makeWorld();
+  const ps = ['Иван', 'Мария', 'Пётр', 'Анна', 'Олег', 'Вера'].map((n) => join(game, n));
+  game.admin('teleport', { id: ps[1].id, place: 'corridor', floor: 101 });
+  game.admin('teleport', { id: ps[2].id, place: 'corridor', floor: 101 });
+  game.admin('teleport', { id: ps[3].id, place: 'canteen' });
+  game.setOnline(ps[4].id, false); // «спит» дома
+  // гость у Ивана, ушедший из сети
+  ps[5].location = { place: 'home', floor: ps[0].apartment.floor, apt: ps[0].apartment.number };
+  game.setOnline(ps[5].id, false);
+  const plain = ps.map((p) => JSON.stringify(game.playerView(p)));
+  const actors = ['corridor:101', `home:${ps[0].apartment.number}`].map((k) => JSON.stringify(game.sceneActors(k)));
+  game.withSceneIndex(() => {
+    assert.deepEqual(ps.map((p) => JSON.stringify(game.playerView(p))), plain);
+    const scenes = game.playersByScene();
+    assert.deepEqual(['corridor:101', `home:${ps[0].apartment.number}`].map((k) => JSON.stringify(game.sceneActors(k, scenes.get(k)))), actors);
+  });
+  assert.ok(game.playerView(ps[0]).here.people.some((q) => q.name === 'Вера' && q.away), 'хозяин видит гостя, ушедшего из сети');
+  assert.equal(game.othersAt(ps[1]).length, 1);
+});
+
+test('вид изменениями: применённые изменения дают ровно тот же вид, что целиком', () => {
+  const VP = require('../public/shared/viewpatch');
+  const { game, advance } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  let parts = null;
+  let client = null;
+  let sentBytes = 0;
+  let fullBytes = 0;
+  const step = () => {
+    const view = game.playerView(a);
+    const { parts: next, patch } = VP.diff(parts, view);
+    parts = next;
+    if (patch) {
+      client = VP.apply(client, JSON.parse(JSON.stringify(patch))); // как по сети
+      sentBytes += JSON.stringify(patch).length;
+    }
+    fullBytes += JSON.stringify(view).length;
+    assert.deepEqual(client, JSON.parse(JSON.stringify(view)));
+  };
+  step();
+  for (let i = 0; i < 5; i++) {
+    advance(1000);
+    step();
+  }
+  // туман, гость, поездка, болезнь, смерть — меняются целые разделы и поля появляются/исчезают
+  game.admin('fog', { from: 101, to: 101, warnSec: 5, durationMin: 1 });
+  step();
+  game.admin('teleport', { id: b.id, place: 'corridor', floor: 101 });
+  game.admin('teleport', { id: a.id, place: 'corridor', floor: 101 });
+  step();
+  advance(10000);
+  step();
+  game.admin('disease', { target: { type: 'player', id: a.id }, disease: 'flu' });
+  step();
+  game.admin('fogClear');
+  game.kill(a, 'тест');
+  step();
+  advance(3000);
+  step();
+  assert.ok(sentBytes < fullBytes / 2, `изменениями меньше: ${sentBytes} против ${fullBytes}`);
+  // без изменений — ничего не отправляем
+  const again = VP.diff(parts, game.playerView(a));
+  assert.equal(again.patch, null);
 });

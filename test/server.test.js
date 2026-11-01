@@ -47,8 +47,13 @@ test.before(async () => {
   });
 });
 
-test.after(() => {
-  if (proc) proc.kill('SIGTERM');
+test.after(async () => {
+  // сервер при остановке дописывает мир — ждём, пока выйдет, и только потом убираем папку
+  if (proc && proc.exitCode === null) {
+    const exited = new Promise((resolve) => proc.once('exit', resolve));
+    proc.kill('SIGTERM');
+    await exited;
+  }
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -155,9 +160,45 @@ test('PWA и пуши: манифест, service worker, ключ в приве�
   assert.equal(bad.ok, false);
   pl.send(JSON.stringify({ t: 'act', id: 2, action: 'push_subscribe', args: { sub: { endpoint: 'https://fcm.googleapis.com/fcm/send/test', keys } } }));
   assert.equal((await pl.next((m) => m.t === 'res' && m.id === 2)).ok, true);
-  const view = await pl.next((m) => m.t === 'view' && m.view.you.push && m.view.you.push.length === 1);
-  assert.equal(view.view.you.push[0], 'https://fcm.googleapis.com/fcm/send/test');
+  // вид приходит изменениями: ждём, когда в нём появится телефон
+  const patch = await pl.next((m) => m.t === 'vpatch' && m.set['you.push'] && m.set['you.push'].length === 1);
+  assert.equal(patch.set['you.push'][0], 'https://fcm.googleapis.com/fcm/send/test');
   pl.send(JSON.stringify({ t: 'act', id: 3, action: 'push_unsubscribe', args: { endpoint: 'https://fcm.googleapis.com/fcm/send/test' } }));
   assert.equal((await pl.next((m) => m.t === 'res' && m.id === 3)).ok, true);
   pl.close();
+});
+
+test('соседи по сцене: сначала целиком, потом изменениями (шаг — коротко), по просьбе — снова целиком', async () => {
+  const join = async (name, login) => {
+    const ws = await open('/ws');
+    ws.send(JSON.stringify({ t: 'hello' }));
+    ws.send(JSON.stringify({ t: 'register', name, login, password: 'secret12' }));
+    const w = await ws.next((m) => m.t === 'welcome');
+    return { ws, id: w.id };
+  };
+  const a = await join('Соседов', 'sosedov');
+  await new Promise((r) => setTimeout(r, 1600)); // паспорт — не чаще раза в 1,5 с с адреса
+  const b = await join('Шагов', 'shagov');
+  const ad = await open('/admin-ws');
+  ad.send(JSON.stringify({ t: 'auth', password: 'pw-test' }));
+  await ad.next((m) => m.t === 'admin_init');
+  for (const [n, p] of [[1, a], [2, b]]) {
+    ad.send(JSON.stringify({ t: 'cmd', id: n, cmd: 'teleport', args: { id: p.id, place: 'corridor', floor: 150 } }));
+    assert.equal((await ad.next((m) => m.t === 'res' && m.id === n)).ok, true);
+  }
+  // A видит B целиком
+  const full = await a.ws.next((m) => m.t === 'actors' && m.key === 'corridor:150' && m.base == null && m.actors.some((x) => x.id === b.id), 3000);
+  // B делает шаг — A получает короткую запись о шаге к своей версии
+  const bView = await b.ws.next((m) => (m.t === 'view' || m.t === 'vpatch') && JSON.stringify(m).includes('corridor:150'), 3000);
+  const pos = bView.t === 'view' ? bView.view.you.pos : bView.set['you.pos'];
+  b.ws.send(JSON.stringify({ t: 'pos', x: pos.x + 0.3, y: pos.y, d: 'right' }));
+  const delta = await a.ws.next((m) => m.t === 'actors' && m.base != null && (m.moves || []).some((x) => x[0] === b.id), 3000);
+  assert.ok(delta.seq > full.seq || delta.base >= full.seq);
+  const mv = delta.moves.find((x) => x[0] === b.id);
+  assert.equal(mv[3], 'right');
+  assert.ok(!delta.actors.some((x) => x.id === b.id), 'шаг — без полной карточки');
+  // клиент сбился — просит целиком
+  a.ws.send(JSON.stringify({ t: 'actors_resync' }));
+  await a.ws.next((m) => m.t === 'actors' && m.base == null && m.seq >= delta.seq, 3000);
+  for (const ws of [a.ws, b.ws, ad]) ws.close();
 });

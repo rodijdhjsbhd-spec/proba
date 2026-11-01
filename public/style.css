@@ -554,3 +554,4 @@ body.sanity-critical .place h1 { animation: flicker 2s infinite; }
   .modal-actions .btn { min-height: 42px; }
 }
 @keyframes pocketup { from { transform: translateY(24px); opacity: .4; } to { transform: none; opacity: 1; } }
+.chip-person.crowd { color: var(--muted); padding-right: 10px; font-style: italic; }
