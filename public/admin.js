@@ -867,6 +867,8 @@
     if (p.sleeping) s += ' 💤';
     if (p.homeward && !p.online) s += ' · бредёт домой';
     if (p.working) s += ' 🔧';
+    if (p.guestAt) s += ' · в гостях';
+    if (p.down != null) s = `🩸 без сознания ${fmtSec(p.down)} · ${s}`;
     return s;
   }
 
@@ -900,6 +902,7 @@
       setCell(td[7], String(p.money), 'num');
       setCell(td[8], p.conditions.map((c) => c.name).join(', '), 'conds');
       tr.classList.toggle('dead', !p.alive);
+      tr.classList.toggle('down', p.down != null);
       tr.classList.toggle('selected', p.id === A.selected);
       if (body.children[i] !== tr) body.insertBefore(tr, body.children[i] || null);
       seen.add(p.id);
@@ -955,6 +958,10 @@
             button('Стереть из домовой книги', () => confirm(`Стереть ${p.name} навсегда?`) && cmd('erase', { id }, 'Стёрт'), 'danger'),
           ),
         ),
+        // бан паспорта переживает смерть жильца — снять его можно и отсюда
+        p.account || p.banned
+          ? h('div', { class: 'card-section' }, h('h3', { text: 'Модерация' }), actions(button('Разбанить паспорт и адрес', () => cmd('unban', { id }), 'small')))
+          : null,
       );
       box.replaceChildren(...kids);
       return;

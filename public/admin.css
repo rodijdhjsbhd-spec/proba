@@ -169,3 +169,4 @@ textarea { width: 100%; resize: vertical; min-height: 60px; }
   .eye-stage { height: 50vh; }
   .event-card .grid4 { grid-template-columns: repeat(2, 1fr); }
 }
+table.players tbody tr.down td { background: rgba(221,90,79,0.14); }

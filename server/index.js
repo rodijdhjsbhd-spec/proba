@@ -15,6 +15,8 @@
  *   TRUST_PROXY     — 1, если сервер стоит за своим nginx/Caddy: тогда адрес игрока берётся из X-Forwarded-For
  *   OFFLINE_GRACE_MS — сколько ждать переподключения, прежде чем считать жильца ушедшим (по умолчанию 20000)
  *   GH_BALANCE      — JSON с правками баланса из server/content.js (BALANCE), например '{"hungerPerMin":-2}'
+ *   REAL_IP_HEADER  — за прокси брать адрес игрока из этого заголовка (например x-real-ip), а не из X-Forwarded-For
+ *   ADMIN_TRUSTED_IPS — адреса, которые не запирает общая блокировка входа в Пульт
  *   ALLOWED_ORIGINS — через запятую, с каких адресов можно открыть игру (по умолчанию — только с того же
  *                     адреса, что и сервер). Пример: 'https://dom.example.ru,https://www.dom.example.ru'
  */
@@ -57,14 +59,15 @@ function resolveAdminPassword() {
   return generated;
 }
 
-/** Адрес игрока. За своим прокси — из X-Forwarded-For, иначе — адрес соединения. */
 /**
  * Адрес игрока для лимитов и блокировок.
- * За своим прокси (TRUST_PROXY=1) — X-Real-IP или ПОСЛЕДНИЙ элемент X-Forwarded-For: его дописал ваш
- * прокси, а начало заголовка присылает сам клиент и может подделать. Заголовкам верим, только если
- * соединение пришло с локального адреса (прокси на той же машине) или из TRUSTED_PROXIES.
+ * За своим прокси (TRUST_PROXY=1) — ПОСЛЕДНИЙ элемент X-Forwarded-For: его дописал ваш прокси, а начало
+ * заголовка присылает сам клиент и может подделать. X-Real-IP по умолчанию не читаем: многие прокси
+ * передают его от клиента как есть. Если ваш прокси его перезаписывает — REAL_IP_HEADER=x-real-ip.
+ * Заголовкам верим, только если соединение пришло с локального адреса или из TRUSTED_PROXIES.
  * IPv4 внутри IPv6 приводим к IPv4, IPv6 — к сети /64 (иначе у одного абонента миллиарды адресов).
  */
+const REAL_IP_HEADER = String(process.env.REAL_IP_HEADER || '').trim().toLowerCase();
 const TRUSTED_PROXIES = String(process.env.TRUSTED_PROXIES || '').split(',').map((x) => x.trim()).filter(Boolean);
 function normalizeIp(ip) {
   let a = String(ip || '').trim();
@@ -76,7 +79,7 @@ function clientIp(req) {
   const remote = req.socket.remoteAddress || '';
   const fromProxy = TRUST_PROXY && (/^(127\.|::1$|::ffff:127\.)/.test(remote) || TRUSTED_PROXIES.includes(normalizeIp(remote)));
   if (fromProxy) {
-    const real = String(req.headers['x-real-ip'] || '').trim();
+    const real = REAL_IP_HEADER ? String(req.headers[REAL_IP_HEADER] || '').trim() : '';
     if (real) return normalizeIp(real);
     const chain = String(req.headers['x-forwarded-for'] || '').split(',').map((x) => x.trim()).filter(Boolean);
     if (chain.length) return normalizeIp(chain[chain.length - 1]);
@@ -228,6 +231,7 @@ const offlineTimers = new Map();
 const admins = new Set();
 
 function sendBanned(ws, ban) {
+  unbind(ws); // больше никаких видов в этот сокет: экран бана не должен смениться игрой
   send(ws, { t: 'banned', reason: ban.reason, until: ban.until || null });
   setTimeout(() => ws.close(), 200);
 }
@@ -239,7 +243,7 @@ function bind(ws, player) {
   socketsByPlayer.get(player.id).add(ws);
   clearTimeout(offlineTimers.get(player.id));
   offlineTimers.delete(player.id);
-  send(ws, { t: 'welcome', id: player.id, token: player.token, catalog: ITEM_CATALOG, world: WORLD_CONFIG });
+  send(ws, { t: 'welcome', id: player.id, token: player.token, catalog: ITEM_CATALOG, world: WORLD_CONFIG, config: { touchReach: BALANCE.touchReach } });
   lastActors.delete(player.id);
   send(ws, { t: 'chat_history', ...game.chatHistory(player) });
   game.setOnline(player.id, true); // после приветствия: квитанция «Пока вас не было» придёт уже в игру
@@ -382,6 +386,8 @@ const PLAYER_ACTIONS = {
 };
 
 const failedLogins = new Map(); // адрес → { count, until } — неудачные входы (Пульт и паспорта)
+// адреса, с которых уже входили в Пульт (и ADMIN_TRUSTED_IPS): их не запирает общая тревога
+const adminIps = new Set(String(process.env.ADMIN_TRUSTED_IPS || '').split(',').map((x) => normalizeIp(x)).filter((x) => x && x !== 'unknown'));
 
 // Сколько жильцов заселили с каждого адреса за последний час
 const registrations = new Map(); // ip → [время, ...]
@@ -398,6 +404,7 @@ setInterval(() => {
   const now = Date.now();
   for (const [ip, list] of registrations) if (!list.some((t) => now - t < 60 * 60 * 1000)) registrations.delete(ip);
   for (const [ip, lock] of failedLogins) if (!lock.until || lock.until < now) failedLogins.delete(ip);
+  for (const [ip, rec] of heavyByIp) if (now - rec.since > 60000) heavyByIp.delete(ip);
 }, 10 * 60 * 1000);
 
 playerWss.on('connection', (ws, req) => {
@@ -429,10 +436,15 @@ function handlePlayerMessage(ws, raw) {
   if (!msg || typeof msg !== 'object') return;
 
   if (msg.t === 'hello') {
-    const p = game.playerByToken(msg.token);
+    let p = game.playerByToken(msg.token);
     if (!p) {
       send(ws, { t: 'need_register' });
       return;
+    }
+    // этот жилец погиб, а по его паспорту уже заселён новый (с другого устройства) — к нему
+    if (!p.alive && p.account && game.state.accounts[p.account]) {
+      const living = game.accountPlayer(game.state.accounts[p.account]);
+      if (living) p = living;
     }
     const ban = game.banInfo(p, ws.ip);
     if (ban) {
@@ -445,19 +457,76 @@ function handlePlayerMessage(ws, raw) {
 
   // Вход по паспорту (логин и пароль) — с любого устройства
   if (msg.t === 'login') {
-    const lock = failedLogins.get(`p:${ws.ip}`);
-    if (lock && lock.until > Date.now()) {
+    const accKey = `acc:${game.accountKey(msg.login)}`;
+    const locked = [failedLogins.get(`p:${ws.ip}`), failedLogins.get(accKey)].some((l) => l && l.until > Date.now());
+    if (locked) {
       send(ws, { t: 'register_error', error: 'Слишком много попыток. Подождите минуту.' });
       return;
     }
-    const res = game.verifyLogin(msg.login, msg.password);
-    if (!res.ok) {
-      const count = (lock?.count || 0) + 1;
-      failedLogins.set(`p:${ws.ip}`, { count, until: count >= 5 ? Date.now() + 60000 : 0 });
-      send(ws, { t: 'register_error', error: res.error });
+    if (!heavyAllowed(ws)) return send(ws, { t: 'register_error', error: BUSY });
+    heavyInFlight++;
+    game
+      .verifyLoginAsync(msg.login, msg.password)
+      .then((res) => {
+        if (ws.readyState !== ws.OPEN) return;
+        if (!res.ok) {
+          // неудачи считаем и по адресу, и по паспорту: вход в СВОЙ паспорт не обнуляет счётчик чужого
+          countFailure(`p:${ws.ip}`);
+          countFailure(accKey);
+          send(ws, { t: 'register_error', error: res.error });
+          return;
+        }
+        failedLogins.delete(accKey);
+        finishLogin(ws, res);
+      })
+      .catch((err) => console.error('[login]', err))
+      .finally(() => heavyInFlight--);
+    return;
+  }
+
+  if (msg.t === 'register' || msg.t === 'act') {
+    // заселение с новым паспортом и выдача паспорта считают scrypt — тоже не чаще
+    const heavy = msg.t === 'register' ? !ws.account && !(ws.playerId && game.getPlayer(ws.playerId) && !game.getPlayer(ws.playerId).alive) : msg.action === 'claim_account';
+    if (heavy && !heavyAllowed(ws)) {
+      if (msg.t === 'act') send(ws, { t: 'res', id: msg.id, ok: false, error: BUSY });
+      else send(ws, { t: 'register_error', error: BUSY });
       return;
     }
-    failedLogins.delete(`p:${ws.ip}`);
+  }
+
+  handleRest(ws, msg);
+}
+
+/** Неудачная попытка входа: 5 подряд за 10 минут — блокировка на минуту. */
+function countFailure(key) {
+  const prev = failedLogins.get(key);
+  const fresh = prev && Date.now() - (prev.since || 0) < 10 * 60000 ? prev : { since: Date.now(), count: 0, until: 0 };
+  fresh.count++;
+  if (fresh.count >= 5) fresh.until = Date.now() + 60000;
+  failedLogins.set(key, fresh);
+}
+
+/**
+ * Тяжёлые операции (проверка пароля — scrypt) не чаще раза в 1,5 с на сокет, 20 в минуту на адрес
+ * и не больше 8 одновременно: иначе один жилец с верным паролем «заморозит» дом.
+ */
+let heavyInFlight = 0;
+const heavyByIp = new Map();
+const BUSY = 'Не так часто. Подождите пару секунд.';
+function heavyAllowed(ws) {
+  const now = Date.now();
+  if (now - (ws.lastHeavyAt || 0) < 1500 || heavyInFlight >= 8) return false;
+  const rec = heavyByIp.get(ws.ip);
+  const fresh = rec && now - rec.since < 60000 ? rec : { since: now, count: 0 };
+  if (fresh.count >= 20) return false;
+  fresh.count++;
+  heavyByIp.set(ws.ip, fresh);
+  ws.lastHeavyAt = now;
+  return true;
+}
+
+function finishLogin(ws, res) {
+  {
     const ban = game.accountBanInfo(res.account, ws.ip);
     if (ban) {
       sendBanned(ws, ban);
@@ -472,9 +541,10 @@ function handlePlayerMessage(ws, raw) {
       ws.account = game.accountKey(res.account.login);
       send(ws, { t: 'need_new_life', login: res.account.login });
     }
-    return;
   }
+}
 
+function handleRest(ws, msg) {
   if (msg.t === 'register') {
     const bound = ws.playerId ? game.getPlayer(ws.playerId) : null;
     const rebirth = !!ws.account || !!(bound && !bound.alive);
@@ -492,6 +562,12 @@ function handlePlayerMessage(ws, raw) {
     let account = null;
     if (ws.account) account = game.state.accounts[ws.account] || null;
     else if (current && !current.alive && current.account) account = game.state.accounts[current.account] || null;
+    // паспорт могли забанить между входом и заселением
+    const accBan = account ? game.accountBanInfo(account, ws.ip) : null;
+    if (accBan) {
+      sendBanned(ws, accBan);
+      return;
+    }
     const legacyRebirth = !account && current && !current.alive && !current.account;
     if (!account && !legacyRebirth) {
       const name = game.checkNewName(msg.name);
@@ -587,7 +663,9 @@ function handleAdminMessage(ws, ip, raw) {
   if (msg.t === 'auth') {
     const lock = failedLogins.get(ip);
     const total = failedLogins.get('admin:*');
-    if ((lock && lock.until > Date.now()) || (total && total.until > Date.now())) {
+    // общая тревога (перебор с многих адресов) не запирает адреса, с которых бог уже входил
+    const trusted = adminIps.has(ip);
+    if ((lock && lock.until > Date.now()) || (!trusted && total && total.until > Date.now())) {
       send(ws, { t: 'auth_error', error: 'Слишком много попыток. Подождите минуту.' });
       return;
     }
@@ -607,6 +685,7 @@ function handleAdminMessage(ws, ip, raw) {
       return;
     }
     failedLogins.delete(ip);
+    adminIps.add(ip);
     ws.isAdmin = true;
     admins.add(ws);
     const snapshot = game.adminSnapshot();

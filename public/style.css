@@ -438,3 +438,7 @@ body.sanity-critical .place h1 { animation: flicker 2s infinite; }
 .modal.paper h3 { color: #3a2f1c; }
 .modal.paper .paper-text { font-family: var(--mono); font-size: 14px; line-height: 1.5; }
 .modal.paper .btn { color: #222; }
+
+/* поле «Приписка» в передачке — на всю ширину */
+.trade-grid.single > input:not([type=number]) { width: 100%; grid-column: 1 / -1; }
+#death-login { margin-top: 10px; }

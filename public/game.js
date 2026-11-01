@@ -132,10 +132,14 @@
         // Токен не стираем: если мир восстановят из копии, жилец найдётся при следующем входе.
         showRegister(S.token ? 'Жилец по вашему ордеру в домовой книге не найден: возможно, он давно погиб или мир начали заново. Можно заселиться снова.' : '');
         break;
-      case 'register_error':
-        $(S.regMode === 'login' ? '#login-error' : '#register-error').textContent = msg.error;
-        toast({ title: S.regMode === 'login' ? 'Не вышло войти' : 'Ордер не выдан', text: msg.error, style: 'error' });
+      case 'register_error': {
+        // ошибка новой жизни — на экране смерти, а не в скрытой форме входа
+        const onDeath = !$('#death').hidden;
+        if (onDeath) $('#rebirth-wait').textContent = msg.error;
+        else $(S.regMode === 'login' ? '#login-error' : '#register-error').textContent = msg.error;
+        toast({ title: onDeath ? 'Новый ордер не выдан' : S.regMode === 'login' ? 'Не вышло войти' : 'Ордер не выдан', text: msg.error, style: 'error' });
         break;
+      }
       case 'need_new_life':
         // вошли по паспорту, но все жильцы этого паспорта погибли
         showRegister(`Паспорт «${msg.login}»: прошлые жильцы погибли. Дом не пустует долго — заселите нового.`, 'newlife');
@@ -156,14 +160,18 @@
         S.catalog = msg.catalog || {};
         break;
       case 'welcome':
+        S.banned = false;
+        if (S.regMode === 'login' || S.regMode === 'newlife') S.regMode = 'new';
         S.token = msg.token;
         S.catalog = msg.catalog || {};
+        S.config = msg.config || {};
         S.map = World.create(msg.world);
         S.sceneKey = null;
         store.set('gh_token', msg.token);
         $('#register').hidden = true;
         break;
       case 'view':
+        if (S.banned) break; // экран бана не должен смениться игрой
         S.view = msg.view;
         S.viewAt = performance.now();
         syncScene();
@@ -685,7 +693,7 @@
       const person = { id: a.id, name: a.name, apt: a.apt };
       const open = () => (a.down ? openAid(person, true) : openTrade(person));
       if (Math.hypot(a.x - S.me.x, a.y - S.me.y) <= (a.down ? 1.6 : 2.5)) open();
-      else walkTo({ x: a.x, y: a.y + 0.6 }, open);
+      else approach(a.id, open);
       return;
     }
     const o = renderer.objectAt(pt);
@@ -1002,6 +1010,7 @@
 
   $('#register-form').addEventListener('submit', (e) => {
     e.preventDefault();
+    S.banned = false;
     $('#register-error').textContent = '';
     unlockAudio();
     const msg = { t: 'register', name: $('#register-name').value };
@@ -1049,6 +1058,8 @@
     }
   });
 
+  $('#death-login').addEventListener('click', () => showRegister('Войдите по паспорту: если по нему уже заселён новый жилец, вы окажетесь у него.', 'login'));
+
   $('#rebirth-form').addEventListener('submit', (e) => {
     e.preventDefault();
     closeSheet();
@@ -1089,7 +1100,7 @@
 
   function render() {
     const v = S.view;
-    if (!v) return;
+    if (!v || S.banned) return;
     if (!v.you.alive) {
       if (S.sheet) closeSheet();
       showDeath(v);
@@ -1279,9 +1290,10 @@
           'span',
           { class: 'chip-person' },
           h('b', { text: p.name }),
+          p.away ? h('span', { class: 'symptom', text: 'спит, не в сети' }) : null,
           p.rank > 1 ? h('span', { class: 'symptom', text: `${p.rank} разряд` }) : null,
           p.symptoms.length ? h('span', { class: 'symptom', text: p.symptoms.join(', ') }) : null,
-          h('button', { class: 'btn small', text: 'Обмен', onclick: () => tradeWith(p) }),
+          p.away ? null : h('button', { class: 'btn small', text: 'Обмен', onclick: () => tradeWith(p) }),
           evict,
         ),
       );
@@ -1405,7 +1417,7 @@
     const ch = msg.channel === 'global' ? 'global' : 'local';
     S.chat[ch].push(msg);
     if (S.chat[ch].length > 120) S.chat[ch].shift();
-    if (ch !== S.tab) S.unread[ch]++;
+    if (ch !== S.tab && !(msg.from && msg.from.id && S.ignored.has(msg.from.id))) S.unread[ch]++;
     if (ch === 'local' && msg.from && msg.from.id && !msg.hallucination && !S.ignored.has(msg.from.id)) S.bubbles.set(msg.from.id, { text: msg.text, until: Date.now() + 6000, msgId: msg.id });
     renderChat();
   }
@@ -1497,8 +1509,16 @@
             class: 'btn small primary toast-action',
             text: action.label,
             onclick: async () => {
-              const res = await act(action.act, action.args || {});
-              if (res.ok) el.remove();
+              const go = async () => {
+                const res = await act(action.act, action.args || {});
+                if (res.ok) el.remove();
+              };
+              // «Открыть» на стук: сначала дойти до гермодвери
+              const door = action.act === 'open_door' && S.scene && S.scene.objects.find((o) => o.type === 'hermodoor');
+              if (door && door.spot && S.me && !World.nearObject(door, S.me)) {
+                if (walkTo(door.spot, go)) return;
+              }
+              go();
             },
           })
         : null,
@@ -1583,10 +1603,25 @@
   }
 
   // ---- помочь соседу предметом / обшарить лежачего ----
+  /** Подойти к соседу на расстояние вытянутой руки (сервер разрешает касаться с touchReach). */
+  function approach(id, then) {
+    const a = S.actors.get(id);
+    const reach = (S.config && S.config.touchReach) || 1.8;
+    if (!a || !S.me || Math.hypot(a.x - S.me.x, a.y - S.me.y) <= reach - 0.2) return then();
+    // ближайшая проходимая точка рядом с телом
+    const spots = [[0, 0.7], [0.7, 0], [-0.7, 0], [0, -0.7], [0.6, 0.6], [-0.6, 0.6], [0.6, -0.6], [-0.6, -0.6]]
+      .map(([dx, dy]) => ({ x: a.x + dx, y: a.y + dy }))
+      .filter((pt) => World.canStand(S.scene, pt.x, pt.y))
+      .sort((p1, p2) => Math.hypot(p1.x - S.me.x, p1.y - S.me.y) - Math.hypot(p2.x - S.me.x, p2.y - S.me.y));
+    for (const pt of spots) if (walkTo(pt, then)) return undefined;
+    return then();
+  }
+
   function openAid(person, down) {
     const you = S.view.you;
     const usable = you.inventory.filter((it) => it.usable);
     const run = (action, args) => async () => {
+      await new Promise((resolve) => approach(person.id, resolve));
       const res = await act(action, { target: person.id, ...args });
       if (res.ok && res.message) say(res.message);
       return res.ok;

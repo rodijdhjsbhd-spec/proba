@@ -56,8 +56,11 @@ function nameSkeleton(name) {
 }
 
 function sanitizeName(raw) {
-  const name = sanitizeText(raw, 40).replace(/[^\p{L}\p{N} _.\-]/gu, '').trim().slice(0, 20);
-  return name.length >= 2 ? name : null;
+  // только кириллица (с украинскими и белорусскими буквами), латиница, цифры, пробел, точка, дефис:
+  // греческие двойники, невидимые «буквы»-заполнители и прочая экзотика позволяли выдать себя за соседа
+  const name = sanitizeText(raw, 40).replace(/\s+/g, ' ').trim();
+  if (/[^A-Za-zА-Яа-яЁёІіЇїЄєҐґЎў0-9 _.\-]/.test(name)) return null; // чужие буквы — не вырезаем молча, а отказываем
+  return /[A-Za-zА-Яа-яЁёІіЇїЄєҐґЎў]/.test(name) && name.length >= 2 && name.length <= 20 ? name : null;
 }
 
 function plural(n, one, few, many) {
@@ -144,6 +147,11 @@ class Game extends EventEmitter {
     this.knocks = new Map(); // хозяин → кто стучит { guestId, ts }
     this.groupSince = new Map(); // сцена → с какого момента там собралось 3+ жильцов (для режиссёра)
     this.refusals = new Map(); // гость → кто не открыл ему в туман или выставил { apt, owner, ts, kind }
+    this.unsealedBy = new Map(); // кв. → гость, который открыл чужую гермодверь
+    // Сервер лежал: для мира это пауза. Таймеры (туман, поломки, болезни, «без сознания», расписание)
+    // продолжаются с того же места — иначе лежачий умрёт на первом тике, пока помочь было некому.
+    const downtime = this.state.savedAt ? this.now() - this.state.savedAt : 0;
+    if (downtime > 1000 && !this.world.paused) this.shiftTimers(downtime);
     for (const p of Object.values(this.state.players)) {
       this.byToken.set(p.token, p.id);
       const scene = this.sceneOf(p);
@@ -293,7 +301,8 @@ class Game extends EventEmitter {
     if (here.place !== 'corridor') {
       const exit = scene.objects.find((o) => o.type === 'exit' || o.type === 'hermodoor');
       if (h.step !== 'exit') {
-        if (this.inFog(here.floor)) return wait(5000); // за дверью туман — ждём внутри
+        // за дверью туман — ждём внутри, но только в квартире: в столовой или цеху внутри не безопаснее
+        if (this.inFog(here.floor) && here.place === 'home') return wait(5000);
         if (here.place === 'home' && this.doorSealed(this.currentApt(p))) return wait(10000); // дверь задраена
         h.step = 'exit';
         h.nextAt = now + this.walkMs(p.pos, exit && exit.spot);
@@ -322,8 +331,9 @@ class Game extends EventEmitter {
       return;
     }
 
-    // 3. Чужой этаж — к лифту (или лестнице) и наверх/вниз. В туман на своём этаже не едет.
-    if (this.inFog(homeFloor)) return wait(5000);
+    // 3. Чужой этаж — к лифту (или лестнице) и наверх/вниз. В туман на своём этаже не едет —
+    // если только туман не стоит и здесь: тогда стоять на месте хуже, чем идти.
+    if (this.inFog(homeFloor) && !this.inFog(here.floor)) return wait(5000);
     const via = this.world.breakdowns.lift ? 'stairs' : 'lift';
     const target = scene.objects.find((o) => o.type === via);
     if (h.step !== via) {
@@ -415,7 +425,9 @@ class Game extends EventEmitter {
   sendReceipt(p, now) {
     const a = p.absence || { knocks: [] };
     const lines = [`Вас не было: ${fmtDuration(now - p.leftAt)}.`];
-    if (p.location.place === 'home') lines.push('Вы проснулись у себя дома.');
+    if (p.down) lines.push(`Вы лежите без сознания: ${this.placeTitle(p)}. Осталось ${Math.max(0, Math.ceil((p.down.until - now) / 1000))} с — кто-нибудь поможет?`);
+    else if (this.isOwnHome(p)) lines.push('Вы проснулись у себя дома.');
+    else if (p.location.place === 'home') lines.push(`Вы очнулись в гостях: ${this.placeTitle(p)}.`);
     else if (p.travel && p.travel.stuck) lines.push('Вы очнулись в застрявшем лифте.');
     else if (p.travel) lines.push(p.travel.via === 'stairs' ? 'Вы очнулись по дороге — на лестнице.' : 'Вы очнулись по дороге — в лифте.');
     else lines.push(`До дома вы так и не дошли: ${this.placeTitle(p)}.`);
@@ -423,6 +435,8 @@ class Game extends EventEmitter {
       const parts = STAT_KEYS.map((k) => [STAT_NAMES[k], a.stats[k], Math.round(p.stats[k])]).filter(([, was, now2]) => was !== now2);
       if (parts.length) lines.push(parts.map(([n, was, now2]) => `${n}: ${was} → ${now2}`).join(' · '));
     }
+    if (a.money != null && a.money !== p.money) lines.push(`Талоны: ${a.money} → ${p.money}.`);
+    if (a.robbedBy && a.robbedBy.length) lines.push(`Пока вы лежали, в ваших карманах рылся: ${[...new Set(a.robbedBy)].join(', ')}.`);
     if (a.knocks && a.knocks.length) {
       const by = new Map();
       for (const k of a.knocks) by.set(`${k.name} (кв. ${k.apt})`, (by.get(`${k.name} (кв. ${k.apt})`) || 0) + 1);
@@ -453,6 +467,15 @@ class Game extends EventEmitter {
     if (notes) parts.push(`${notes} ${plural(notes, 'записка', 'записки', 'записок')}`);
     if (parcels) parts.push(`${parcels} ${plural(parcels, 'передачка', 'передачки', 'передачек')}`);
     return [`Под вашей дверью ждут: ${parts.join(' и ')}. Заберёте, когда вернётесь домой.`];
+  }
+
+  /**
+   * Отсчёт для новых таймеров мира. На паузе — от момента паузы: при снятии паузы shiftTimers сдвинет
+   * все таймеры на её длину, и созданный на паузе таймер не «съедет» на всю паузу вперёд.
+   */
+  timerNow() {
+    const w = this.world;
+    return w.paused && w.pausedAt ? w.pausedAt : this.now();
   }
 
   gameClock() {
@@ -530,7 +553,7 @@ class Game extends EventEmitter {
   addCondition(p, id, { silent = false } = {}) {
     const def = C.CONDITIONS[id];
     if (!def || !p.alive) return false;
-    const now = this.now();
+    const now = this.timerNow();
     const until = def.durationMin ? now + def.durationMin * 60000 : null;
     const existing = p.conditions.find((c) => c.id === id);
     if (existing) {
@@ -597,6 +620,7 @@ class Game extends EventEmitter {
 
   /** Перенести жильца в другое место (сцену) — он появится у нужного входа. */
   relocate(p, location, entry = 'default') {
+    const prevApt = this.currentApt(p);
     p.location = { place: location.place, floor: location.floor };
     if (location.place === 'home') p.location.apt = location.apt || p.apartment.number;
     p.pos = { ...this.map.spawn(this.locationKey(p), entry), d: 'down' };
@@ -612,6 +636,17 @@ class Game extends EventEmitter {
       // отсутствующего перенесли не домой (например, Пульт) — тело побредёт домой
       p.homeward = { since: this.now(), nextAt: null, step: null };
     }
+    // гость ушёл через дверь, которую сам открыл, а хозяин остался внутри — дверь задраивается за ним
+    if (prevApt && prevApt !== p.apartment.number && this.currentApt(p) !== prevApt && this.unsealedBy.get(prevApt) === p.id) {
+      this.unsealedBy.delete(prevApt);
+      const inside = this.alivePlayers().some((q) => q !== p && this.currentApt(q) === prevApt);
+      if (inside && !this.doorSealed(prevApt)) {
+        this.setDoorSealed(prevApt, true);
+        this.journal(p, `Вы вышли и задраили за собой гермодверь кв. ${prevApt}: хозяин остался внутри.`);
+      }
+    }
+    // попал в квартиру (в свою или в гости) — значит, ему всё-таки открыли
+    if (location.place === 'home') this.refusals.delete(p.id);
   }
 
   /** Объект сцены рядом с жильцом, подходящий под условие (или null). */
@@ -766,7 +801,8 @@ class Game extends EventEmitter {
   }
 
   allocateApartment() {
-    const taken = new Set(this.alivePlayers().map((p) => p.apartment.number));
+    // занята — если там живёт живой или внутри кто-то пережидает туман
+    const taken = new Set(this.alivePlayers().flatMap((p) => [p.apartment.number, this.currentApt(p)]).filter(Boolean));
     for (let floor = C.BUILDING.firstResidentialFloor; floor <= C.BUILDING.maxFloor; floor++) {
       for (let i = 1; i <= C.BUILDING.apartmentsPerFloor; i++) {
         const number = `${floor}${String(i).padStart(2, '0')}`;
@@ -879,6 +915,11 @@ class Game extends EventEmitter {
     return crypto.scryptSync(String(password), salt, 32).toString('hex');
   }
 
+  /** То же, но не держит сервер: scrypt считается в пуле потоков. */
+  static hashPasswordAsync(password, salt) {
+    return new Promise((resolve, reject) => crypto.scrypt(String(password), salt, 32, (err, key) => (err ? reject(err) : resolve(key.toString('hex')))));
+  }
+
   accountKey(login) {
     return String(login || '').trim().toLocaleLowerCase('ru');
   }
@@ -908,6 +949,22 @@ class Game extends EventEmitter {
     const expected = Buffer.from(account.hash, 'hex');
     if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return fail;
     return { ok: true, account };
+  }
+
+  /** Проверка пароля без блокировки цикла событий (для входа по сети). */
+  async verifyLoginAsync(rawLogin, password) {
+    const account = this.getAccount(rawLogin);
+    const fail = { ok: false, error: 'Неверный логин или пароль.' };
+    if (!password || String(password).length > 200) return fail;
+    // нет такого паспорта — всё равно считаем хеш, чтобы по времени ответа нельзя было понять, есть ли логин
+    const salt = account ? account.salt : '00000000000000000000000000000000';
+    const given = Buffer.from(await Game.hashPasswordAsync(password, salt), 'hex');
+    if (!account) return fail;
+    const fresh = this.getAccount(rawLogin); // пока считали, паспорт могли удалить
+    if (!fresh) return fail;
+    const expected = Buffer.from(fresh.hash, 'hex');
+    if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return fail;
+    return { ok: true, account: fresh };
   }
 
   linkAccount(p, account) {
@@ -970,6 +1027,9 @@ class Game extends EventEmitter {
     if (!msg) for (const list of this.localChat.values()) msg = msg || list.find((m) => m.id === msgId);
     if (!msg || !msg.from || !msg.from.id) return { ok: false, error: 'Сообщение не найдено.' };
     if (msg.from.id === p.id) return { ok: false, error: 'На себя не жалуются.' };
+    msg.reportedBy = msg.reportedBy || [];
+    if (msg.reportedBy.includes(p.id)) return { ok: false, error: 'Вы уже жаловались на это сообщение.' };
+    msg.reportedBy.push(p.id);
     p.lastReportAt = now;
     this.log(`Жалоба от ${p.name} на ${msg.from.name} (${msg.channel === 'global' ? 'весь дом' : msg.where || 'рядом'}): «${msg.text}»`, 'report', msg.from.id);
     return { ok: true, message: 'Жалоба передана в ЖЭК.' };
@@ -1111,18 +1171,8 @@ class Game extends EventEmitter {
     }
     if (w.power && w.power.until && now >= w.power.until) this.restorePower();
     if (w.fog) {
-      if (!w.fog.arrived && now >= w.fog.warnUntil) {
-        w.fog.arrived = true;
-        const f = w.fog;
-        const victims = this.alivePlayers().filter((p) => p.location.floor >= f.from && p.location.floor <= f.to);
-        this.notify(victims, {
-          title: 'ТУМАН',
-          text: 'Туман пришёл на ваш этаж. Если вы не за закрытой гермодверью — бегите.',
-          style: 'fog',
-        });
-        this.log(`Туман накрыл этажи ${f.from}–${f.to}`, 'event');
-      }
-      if (now >= w.fog.until) this.endFog();
+      if (!w.fog.arrived && now >= w.fog.warnUntil) this.fogArrive();
+      if (w.fog && now >= w.fog.until) this.endFog();
     }
     for (const t of Object.values(this.state.trades)) {
       if (now - t.createdAt > 3 * 60000) delete this.state.trades[t.id];
@@ -1130,6 +1180,7 @@ class Game extends EventEmitter {
     if (this.world.tick % 60 === 0) {
       this.archiveDead(now);
       this.expireBoardNotes(now);
+      this.evictOrphanGuests();
     }
     for (const [key, list] of Object.entries(this.world.hazards)) {
       const left = list.filter((hz) => !hz.until || hz.until > now);
@@ -1377,17 +1428,24 @@ class Game extends EventEmitter {
 
   /** Планировщик ЖЭК: выполнить команды, время которых пришло. */
   runSchedule(now) {
-    const due = this.state.schedule.filter((e) => now >= e.at).slice(0, 10);
-    for (const e of due) {
-      const res = this.admin(e.cmd, JSON.parse(JSON.stringify(e.args || {})));
-      e.runs = (e.runs || 0) + 1;
-      this.log(`По расписанию: ${e.label}${res.ok ? (res.message ? ` — ${res.message}` : '') : ` — не вышло: ${res.error}`}`, 'schedule');
-      if (e.repeatMs) {
-        e.at += e.repeatMs;
-        if (e.at <= now) e.at = now + e.repeatMs;
-      } else {
-        this.state.schedule = this.state.schedule.filter((x) => x !== e);
+    if (this.inSchedule || this.world.paused) return; // команда из расписания не запускает расписание заново
+    this.inSchedule = true;
+    try {
+      const due = this.state.schedule.filter((e) => now >= e.at).slice(0, 10);
+      for (const e of due) {
+        // сначала переставить запись, потом выполнять: что бы ни сделала команда, второй раз она не сработает
+        if (e.repeatMs) {
+          e.at += e.repeatMs;
+          if (e.at <= now) e.at = now + e.repeatMs;
+        } else {
+          this.state.schedule = this.state.schedule.filter((x) => x !== e);
+        }
+        e.runs = (e.runs || 0) + 1;
+        const res = this.admin(e.cmd, JSON.parse(JSON.stringify(e.args || {})));
+        this.log(`По расписанию: ${e.label}${res.ok ? (res.message ? ` — ${res.message}` : '') : ` — не вышло: ${res.error}`}`, 'schedule');
       }
+    } finally {
+      this.inSchedule = false;
     }
   }
 
@@ -1401,6 +1459,8 @@ class Game extends EventEmitter {
     if (w.power && w.power.until) w.power.until += ms;
     for (const b of Object.values(w.breakdowns)) if (b && b.until) b.until += ms;
     for (const e of this.state.schedule) e.at += ms;
+    for (const list of Object.values(w.hazards)) for (const hz of list) if (hz.until) hz.until += ms;
+    if (w.radio && w.radio.silenceUntil) w.radio.silenceUntil += ms;
     for (const p of this.players()) {
       for (const c of p.conditions) if (c.until) c.until += ms;
       if (p.travel && !p.travel.stuck) {
@@ -1675,6 +1735,11 @@ class Game extends EventEmitter {
 
   updateTravel(p, now) {
     const t = p.travel;
+    if (t.frozen) {
+      if (p.down) return; // лежит на пролёте
+      t.frozen = false;
+      t.arriveAt = now + (t.remainingMs || 0);
+    }
     if (t.via === 'lift' && this.world.breakdowns.lift) {
       if (!t.stuck) {
         t.stuck = true;
@@ -1708,6 +1773,9 @@ class Game extends EventEmitter {
     if (!this.nearTo(p, (o) => o.type === 'hermodoor')) return { ok: false, error: 'Подойдите к гермодвери.' };
     const apt = this.currentApt(p);
     this.setDoorSealed(apt, !!on);
+    // гость открыл чужую дверь — запомним: уходя, он задраит её за собой, если хозяин остался внутри
+    if (!on && apt !== p.apartment.number) this.unsealedBy.set(apt, p.id);
+    else this.unsealedBy.delete(apt);
     if (on && apt === p.apartment.number) this.tutorialStep(p, 'seal');
     this.journal(p, on ? 'Вы задраили гермодверь.' : 'Вы открыли гермодверь.');
     this.dirty(this.othersAt(p).map((q) => q.id));
@@ -1794,12 +1862,17 @@ class Game extends EventEmitter {
       this.kill(p, cause);
       return;
     }
-    const now = this.now();
+    const now = this.timerNow();
     p.down = { since: now, until: now + B.downSec * 1000, cause, robbedBy: [] };
     p.stats.health = 0;
     p.sleeping = false;
     p.job = null;
-    p.homeward = null;
+    // homeward не трогаем: пока жилец лежит, тело никуда не идёт, а очнувшись — побредёт дальше
+    if (p.travel && p.travel.via === 'stairs' && !p.travel.frozen) {
+      // на лестнице тело само не идёт: замираем на пролёте
+      p.travel.frozen = true;
+      p.travel.remainingMs = Math.max(0, p.travel.arriveAt - this.now());
+    }
     this.notify([p], { title: 'Вы теряете сознание', text: 'В глазах темнеет. Может быть, кто-нибудь поможет…', style: 'danger' });
     this.log(`${p.name} без сознания: ${cause}`, 'accident', p.id);
     this.dirty([p.id, ...this.othersAt(p).map((q) => q.id)]);
@@ -1807,7 +1880,29 @@ class Game extends EventEmitter {
 
   /** Соседи рядом, до которых можно дотянуться. */
   canTouch(p, target) {
-    return target && target.alive && target.id !== p.id && this.locationKey(target) === this.locationKey(p) && this.distance(p, target) <= B.touchReach;
+    // лифт и лестница — общая «сцена» для всех этажей: в пути до соседа не дотянуться
+    if (!target || p.travel || target.travel) return false;
+    return target.alive && target.id !== p.id && this.locationKey(target) === this.locationKey(p) && this.distance(p, target) <= B.touchReach;
+  }
+
+  /**
+   * Привести в чувство (помощь соседа, лечение от ЖЭК). Отсутствующий жилец, очнувшись не дома,
+   * снова побредёт домой.
+   */
+  wake(p, { by = null, what = '' } = {}) {
+    if (!p.down) return;
+    const robbers = p.down.robbedBy || [];
+    p.down = null;
+    p.stats.health = Math.max(10, p.stats.health);
+    p.lastHarm = null;
+    this.notify([p], {
+      title: 'Вы очнулись',
+      text: `${by ? `Вас привёл в чувство ${by}${what ? `: ${what}` : ''}.` : 'Вы пришли в себя.'}${robbers.length ? `\nПока вы лежали, в ваших карманах рылся: ${robbers.join(', ')}.` : ''}`,
+      style: 'good',
+    });
+    p.lastRobbedBy = robbers.length ? robbers.slice() : null;
+    if (!this.isOnline(p.id) && !this.isOwnHome(p) && !p.homeward) p.homeward = { since: this.now(), nextAt: null, step: null };
+    this.dirty([p.id, ...this.othersAt(p).map((q) => q.id)]);
   }
 
   /** Использовать свой предмет на соседе: перевязать, дать таблетку, накормить. Лежачий очнётся. */
@@ -1819,19 +1914,12 @@ class Game extends EventEmitter {
     const def = C.ITEMS[itemId];
     if (!def || !def.use || !this.hasItem(p, itemId)) return { ok: false, error: 'Этим не помочь.' };
     if (!t.down && !this.itemUseful(t, itemId)) return { ok: false, error: `${t.name} это сейчас не нужно.` };
+    const wasDown = !!t.down;
     this.removeItem(p, itemId, 1);
     const parts = this.applyItemUse(t, itemId);
     const what = `${def.name}${parts.length ? ` (${parts.join(', ')})` : ''}`;
-    if (t.down) {
-      const robbers = t.down.robbedBy;
-      t.down = null;
-      t.stats.health = Math.max(10, t.stats.health);
-      t.lastHarm = null;
-      this.notify([t], {
-        title: 'Вы очнулись',
-        text: `Вас привёл в чувство ${p.name}: ${what}.${robbers.length ? `\nПока вы лежали, в ваших карманах рылся: ${robbers.join(', ')}.` : ''}`,
-        style: 'good',
-      });
+    if (wasDown) {
+      this.wake(t, { by: p.name, what });
       this.log(`${p.name} привёл в чувство ${t.name}: ${what}`, 'social', p.id);
     } else {
       this.notify([t], { title: 'Помощь', text: `${p.name} дал вам: ${what}.`, style: 'good' });
@@ -1841,7 +1929,7 @@ class Game extends EventEmitter {
     p.deeds = p.deeds || { helped: 0 };
     p.deeds.helped++;
     this.dirty([p.id, t.id, ...this.othersAt(t).map((q) => q.id)]);
-    return { ok: true, message: t.down ? '' : `${t.name} приходит в себя.` };
+    return { ok: true, message: wasDown ? `${t.name} приходит в себя.` : `Вы помогли: ${t.name}.` };
   }
 
   /** Разряд жильца на станке (1–6) по опыту из трудовой книжки. */
@@ -1925,6 +2013,7 @@ class Game extends EventEmitter {
     }
     this.moveBundle(t, p, taken);
     t.down.robbedBy.push(p.name);
+    if (t.absence && !this.isOnline(t.id)) t.absence.robbedBy = [...(t.absence.robbedBy || []), p.name];
     const what = this.bundleText(taken);
     this.journal(p, `Вы обшарили карманы ${t.name}: ${what}.`, 'warn');
     this.log(`${p.name} обшарил карманы лежащего ${t.name}: ${what}`, 'social', p.id);
@@ -2059,12 +2148,51 @@ class Game extends EventEmitter {
 
   /** Гостей хозяина, который умер или пропал, выводим в коридор. */
   evictAllGuests(apt, floor) {
-    for (const q of this.alivePlayers()) {
-      if (q.location.place === 'home' && this.currentApt(q) === apt && q.apartment.number !== apt) {
-        this.relocate(q, { place: 'corridor', floor }, `apt:${apt}`);
-        this.journal(q, `Хозяина кв. ${apt} больше нет. Вы вышли в коридор.`, 'warn');
+    const guests = this.alivePlayers().filter((q) => q.location.place === 'home' && this.currentApt(q) === apt && q.apartment.number !== apt);
+    // мир сам никого не наказывает: в туман (и в сирену) гостей за дверь не выставляем — пусть переждут
+    const f = this.world.fog;
+    if (guests.length && f && floor >= f.from && floor <= f.to) {
+      for (const q of guests) {
+        this.journal(q, `Хозяина кв. ${apt} больше нет. Пока на этаже туман, можно переждать здесь.`, 'warn');
         this.dirty([q.id]);
       }
+      return false;
+    }
+    for (const q of guests) {
+      this.relocate(q, { place: 'corridor', floor }, `apt:${apt}`);
+      this.journal(q, `Хозяина кв. ${apt} больше нет. Вы вышли в коридор.`, 'warn');
+      this.dirty([q.id]);
+    }
+    this.setDoorSealed(apt, false); // следующий жилец получит квартиру с открытой дверью
+    return true;
+  }
+
+  /** Гости в квартирах погибших — выйти, когда туман ушёл. */
+  evictOrphanGuests() {
+    const done = new Set();
+    for (const q of this.alivePlayers()) {
+      const apt = this.currentApt(q);
+      if (!apt || apt === q.apartment.number || done.has(apt) || this.ownerOf(apt)) continue;
+      done.add(apt);
+      this.evictAllGuests(apt, Math.floor(Number(apt) / 100));
+    }
+  }
+
+  /**
+   * Передачки и записки погибшему: передачки — назад живым отправителям, записки — в мусоропровод.
+   * Иначе их заберёт следующий жилец квартиры.
+   */
+  returnDrops(apt, deadName) {
+    const drops = this.state.doorDrops[apt] || [];
+    delete this.state.doorDrops[apt];
+    for (const d of drops) {
+      if (d.kind !== 'parcel') continue;
+      const sender = this.getPlayer(d.fromId);
+      if (!sender || !sender.alive) continue;
+      for (const [id, n] of Object.entries(d.bundle.items)) if (C.ITEMS[id]) this.addItem(sender, id, n);
+      sender.money += d.bundle.money;
+      this.journal(sender, `Передачка для ${deadName} вернулась к вам: ${this.bundleText(d.bundle)}. Адресата больше нет.`, 'warn');
+      this.dirty([sender.id]);
     }
   }
 
@@ -2092,6 +2220,8 @@ class Game extends EventEmitter {
     if (now - (p.lastDropAt || 0) < C.NOTES.cooldownMs) return { error: 'Не так часто.' };
     const drops = this.state.doorDrops[door.number] || [];
     if (drops.length >= C.NOTES.perDoor) return { error: 'Под дверью уже не протолкнуть — там куча бумажек и свёртков.' };
+    // один жилец не может забить чужую дверь: не больше двух своих бумажек и свёртков
+    if (drops.filter((d) => d.fromId === p.id).length >= 2) return { error: 'Под этой дверью уже лежат два ваших свёртка. Подождите, пока хозяин заберёт.' };
     return { door, now };
   }
 
@@ -2125,7 +2255,8 @@ class Game extends EventEmitter {
     if (!this.hasBundle(p, bundle)) return { ok: false, error: 'У вас нет того, что вы хотите оставить.' };
     p.money -= bundle.money;
     for (const [id, n] of Object.entries(bundle.items)) this.removeItem(p, id, n);
-    const text = sanitizeText(rawText, C.NOTES.maxLength);
+    // заглушённый жилец передаёт вещи молча — приписка была лазейкой мимо запрета
+    const text = this.mutedFor(p) ? '' : sanitizeText(rawText, C.NOTES.maxLength);
     this.addDrop(p, check.door, { kind: 'parcel', bundle, text }, check.now);
     const what = this.bundleText(bundle);
     this.journal(p, `Вы оставили передачку у кв. ${check.door.number}: ${what}.`);
@@ -2496,6 +2627,7 @@ class Game extends EventEmitter {
       this.scar(key, 'chalk', p.pos.x, p.pos.y);
       if (p.lastSaid && this.now() - p.lastSaid.ts < 6 * 3600 * 1000) this.scar(key, 'lastword', p.pos.x + 0.6, p.pos.y + 0.2, { text: p.lastSaid.text, by: p.name });
     }
+    this.returnDrops(p.apartment.number, p.name);
     this.evictAllGuests(p.apartment.number, p.apartment.floor);
     this.dirty([p.id, ...this.othersAt(p).map((q) => q.id)]);
   }
@@ -2589,6 +2721,7 @@ class Game extends EventEmitter {
     }
     if (effect.kill) this.kill(p, cause);
     else if (p.stats.health <= 0) this.fall(p, cause);
+    else if (p.down) this.wake(p); // бог подлечил лежачего — он приходит в себя
     this.dirty([p.id]);
     return parts;
   }
@@ -2616,7 +2749,7 @@ class Game extends EventEmitter {
     if (this.world.fog) this.endFog(true);
     const a = toInt(from, C.BUILDING.firstResidentialFloor);
     const b = toInt(to, a);
-    const now = this.now();
+    const now = this.timerNow();
     this.world.fog = {
       from: Math.min(a, b),
       to: Math.max(a, b),
@@ -2636,8 +2769,23 @@ class Game extends EventEmitter {
     this.notify(elsewhere, { title: 'Сирена', text: `Где-то воет сирена: туман на этажах ${f.from}–${f.to}.`, style: 'warn' });
     this.systemChat(`ВНИМАНИЕ! Туман на этажах ${f.from}–${f.to}. Жильцам немедленно укрыться в квартирах.`);
     this.log(`Объявлен туман: этажи ${f.from}–${f.to}, сила ${f.intensity}, ${durationMin} мин`, 'event', null, { public: `туман на этажах ${f.from}–${f.to}` });
-    if (f.warnUntil <= now) this.updateWorldTimers(now);
+    // сирена 0 с — туман сразу (только приход: расписание и прочие таймеры отсюда не трогаем)
+    if (f.warnUntil <= now) this.fogArrive();
     return { ok: true };
+  }
+
+  /** Сирена отвыла — туман пришёл. */
+  fogArrive() {
+    const f = this.world.fog;
+    if (!f || f.arrived) return;
+    f.arrived = true;
+    const victims = this.alivePlayers().filter((p) => p.location.floor >= f.from && p.location.floor <= f.to);
+    this.notify(victims, {
+      title: 'ТУМАН',
+      text: 'Туман пришёл на ваш этаж. Если вы не за закрытой гермодверью — бегите.',
+      style: 'fog',
+    });
+    this.log(`Туман накрыл этажи ${f.from}–${f.to}`, 'event');
   }
 
   endFog(silent = false) {
@@ -2645,6 +2793,7 @@ class Game extends EventEmitter {
     const f = this.world.fog;
     this.world.fog = null;
     if (f.arrived) this.fogScars(f);
+    this.evictOrphanGuests();
     if (!silent) {
       this.notify(this.alivePlayers(), { title: 'Отбой', text: `Туман на этажах ${f.from}–${f.to} рассеялся.`, style: 'good' });
       this.systemChat(`Отбой тревоги. Туман на этажах ${f.from}–${f.to} рассеялся.`);
@@ -2658,9 +2807,9 @@ class Game extends EventEmitter {
     if (!C.BREAKDOWNS[key]) throw new Error('Нет такого оборудования');
     const def = C.BREAKDOWNS[key];
     if (broken) {
-      const until = Number(durationMin) > 0 ? this.now() + Number(durationMin) * 60000 : null;
+      const until = Number(durationMin) > 0 ? this.timerNow() + Number(durationMin) * 60000 : null;
       const text = sanitizeText(reason, 200) || def.brokenText;
-      this.world.breakdowns[key] = { since: this.now(), until, reason: text };
+      this.world.breakdowns[key] = { since: this.timerNow(), until, reason: text };
       if (key === 'factory') {
         const workers = this.alivePlayers().filter((p) => p.job);
         for (const p of workers) p.job = null;
@@ -2680,7 +2829,7 @@ class Game extends EventEmitter {
   cutPower({ from, to, durationMin } = {}) {
     const a = toInt(from, C.BUILDING.firstResidentialFloor);
     const b = toInt(to, a);
-    const until = Number(durationMin) > 0 ? this.now() + Number(durationMin) * 60000 : null;
+    const until = Number(durationMin) > 0 ? this.timerNow() + Number(durationMin) * 60000 : null;
     this.world.power = { from: Math.min(a, b), to: Math.max(a, b), until };
     const pw = this.world.power;
     const victims = this.alivePlayers().filter((p) => p.location.floor >= pw.from && p.location.floor <= pw.to);
@@ -2750,7 +2899,7 @@ const ADMIN_COMMANDS = {
    */
   schedule({ cmd, args = {}, label, mode = 'in', value, repeat = 'none', repeatMin }) {
     if (!ADMIN_COMMANDS[cmd] || ['schedule', 'unschedule', 'pause', 'erase'].includes(cmd)) throw new Error('Эту команду нельзя поставить в расписание');
-    const now = this.now();
+    const now = this.timerNow();
     const gameMinMs = 1000; // каждый тик добавляет tickMs/1000 игровых минут: 1 игровая минута = 1 реальная секунда
     let at;
     if (mode === 'at') {
@@ -2801,7 +2950,7 @@ const ADMIN_COMMANDS = {
     const p = this.requirePlayer(id);
     for (const k of STAT_KEYS) if (stats[k] !== undefined && stats[k] !== '') p.stats[k] = clamp(Number(stats[k]) || 0);
     if (stats.money !== undefined && stats.money !== '') p.money = Math.max(0, toInt(stats.money));
-    if (p.down && p.stats.health > 0) p.down = null;
+    if (p.down && p.stats.health > 0) this.wake(p);
     this.log(`Параметры ${p.name} изменены вручную`, 'admin', p.id);
     if (p.stats.health <= 0) this.kill(p, 'Умер при невыясненных обстоятельствах');
     this.dirty([p.id]);
@@ -2871,6 +3020,9 @@ const ADMIN_COMMANDS = {
   revive({ id }) {
     const p = this.requirePlayer(id, { alive: false });
     if (p.alive) throw new Error('Жилец и так жив');
+    const acc = p.account ? this.state.accounts[p.account] : null;
+    const heir = acc ? this.accountPlayer(acc) : null;
+    if (heir) throw new Error(`По этому паспорту уже живёт ${heir.name}. Двух живых на одном паспорте не бывает`);
     if (this.alivePlayers().some((q) => q.apartment.number === p.apartment.number)) {
       const apt = this.allocateApartment();
       if (!apt) throw new Error('Дом переполнен — некуда вернуть жильца');
@@ -3018,7 +3170,7 @@ const ADMIN_COMMANDS = {
       if (!free.length) throw new Error('Некуда поставить');
       pos = free[Math.floor(this.random() * free.length)];
     }
-    const hz = { id: newId('h'), kind, x: pos.x, y: pos.y, fenced: false, until: Number(minutes) > 0 ? this.now() + Number(minutes) * 60000 : null };
+    const hz = { id: newId('h'), kind, x: pos.x, y: pos.y, fenced: false, until: Number(minutes) > 0 ? this.timerNow() + Number(minutes) * 60000 : null };
     this.world.hazards[key] = [...(this.world.hazards[key] || []), hz].slice(-20);
     this.log(`Опасность «${C.HAZARDS[kind].name}» — ${key}`, 'event');
     return { ok: true, message: `${C.HAZARDS[kind].name}: ${key}`, id: hz.id };
@@ -3050,7 +3202,7 @@ const ADMIN_COMMANDS = {
   /** «Тишина в эфире» — предвестник. minutes 0 — вернуть эфир. */
   radioSilence({ minutes = 10 }) {
     const min = Math.max(0, Math.min(1440, Number(minutes) || 0));
-    this.world.radio.silenceUntil = min > 0 ? this.now() + min * 60000 : null;
+    this.world.radio.silenceUntil = min > 0 ? this.timerNow() + min * 60000 : null;
     this.log(min > 0 ? `Тишина в эфире на ${min} мин` : 'Эфир радиоточки возвращён', 'admin');
     return { ok: true, message: min > 0 ? `Радиоточки замолчали на ${min} мин` : 'Эфир вернулся' };
   },
@@ -3067,6 +3219,16 @@ const ADMIN_COMMANDS = {
     if (this.isOnline(p.id) && this.isOwnHome(p)) this.collectDrops(p);
     this.log(`Записка под дверь ${p.name}${sign ? ` от «${sign}»` : ' без подписи'}: «${clean}»`, 'admin', p.id);
     return { ok: true, message: this.isOwnHome(p) ? 'Записка у жильца' : 'Записка ждёт под дверью' };
+  },
+
+  /** Изъять записки и передачки из-под двери (передачки вернутся отправителям). */
+  dropsClear({ apt }) {
+    const key = String(apt || '');
+    if (!this.state.doorDrops[key]) return { ok: true, message: 'Под этой дверью пусто' };
+    const n = this.state.doorDrops[key].length;
+    this.returnDrops(key, `кв. ${key}`);
+    this.log(`ЖЭК изъял из-под двери кв. ${key}: ${n}`, 'admin');
+    return { ok: true, message: `Изъято: ${n}` };
   },
 
   /** Стереть следы (копоть, налёт, мел) — в одной сцене или во всём доме. */
@@ -3431,6 +3593,13 @@ Game.prototype.describePlace = function describePlace(p) {
     symptoms: q.conditions.map((c) => C.CONDITIONS[c.id]?.symptom).filter(Boolean),
     rank: this.bestRank(q),
   }));
+  // у себя дома хозяин видит и гостей, ушедших из сети: иначе выходом из игры можно удерживать чужое укрытие
+  if (this.isOwnHome(p)) {
+    for (const q of this.alivePlayers()) {
+      if (q.id === p.id || this.isOnline(q.id) || this.locationKey(q) !== this.locationKey(p)) continue;
+      people.push({ id: q.id, name: q.name, apt: q.apartment.number, symptoms: [], rank: this.bestRank(q), away: true });
+    }
+  }
   const here = { key: this.locationKey(p), place: l.place, floor: l.floor, title: this.placeTitle(p), text: '', people, shop: null, residents: null, closed: null };
   here.hazards = (this.world.hazards[here.key] || []).map((hz) => ({ id: hz.id, kind: hz.kind, name: C.HAZARDS[hz.kind].name, x: hz.x, y: hz.y, fenced: !!hz.fenced }));
   here.scars = this.scarsView(here.key);
@@ -3559,6 +3728,8 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       conditions: [],
       shifts: p.shifts || 0,
       lastSeen: p.lastSeen,
+      account: p.account ? (this.state.accounts[p.account] || {}).login || p.account : null,
+      banned: !!this.banInfo(p),
     } : {
       id: p.id,
       name: p.name,
