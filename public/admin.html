@@ -109,6 +109,28 @@
               <button class="btn small" type="submit">Смотреть</button>
             </form>
             <ul class="eye-scenes" id="eye-scenes"></ul>
+            <h2>Марионетки</h2>
+            <div class="puppet-new">
+              <select id="pp-preset" aria-label="Кто">
+                <option value="walker">Обходчик</option>
+                <option value="controller">Контролёр</option>
+                <option value="double">Двойник жильца…</option>
+                <option value="custom">Своё имя…</option>
+              </select>
+              <select id="pp-player" aria-label="Чей двойник" hidden></select>
+              <input id="pp-name" maxlength="20" placeholder="имя" hidden>
+              <button class="btn small" type="button" id="pp-create">Сюда</button>
+            </div>
+            <ul class="eye-hazards" id="pp-list"></ul>
+            <div class="puppet-ctl" id="pp-ctl" hidden>
+              <input id="pp-say" maxlength="200" placeholder="Что сказать (облачко)">
+              <div class="row">
+                <button class="btn small" type="button" id="pp-say-btn">Сказать</button>
+                <input id="pp-apt" maxlength="6" placeholder="кв." inputmode="numeric">
+                <button class="btn small" type="button" id="pp-knock">Постучать</button>
+              </div>
+              <p class="hint">Выбранную марионетку ведёт клик по полу Глазка.</p>
+            </div>
             <h2>Опасности на клетках</h2>
             <ul class="eye-hazards" id="eye-hazards"></ul>
           </aside>

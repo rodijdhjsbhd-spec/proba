@@ -33,6 +33,15 @@
     };
   }
 
+  // Марионетки ЖЭК: узнаваемые обходчик и контролёр; двойник — внешность настоящего жильца (lookId)
+  const PRESET_LOOKS = {
+    walker: { coat: '#5a5a5a', skin: '#c99d78', hair: '#1d1d1d', hat: true, scarf: null },
+    controller: { coat: '#2f3b46', skin: '#e0b896', hair: '#2b2118', hat: true, scarf: '#8d2f2a' },
+  };
+  function lookForActor(a) {
+    return PRESET_LOOKS[a.preset] || lookFor(a.lookId || a.id);
+  }
+
   function rng(seed) {
     let s = seed >>> 0 || 1;
     return () => {
@@ -1253,15 +1262,17 @@
         if (!bub || bub.until < now) continue;
         bubble(a.x, (a.y - 1.5) * TD - fontPx, bub);
       }
-      // радиоточка говорит облачком над собой
-      if (s.radioBubble && s.radioBubble.until > now) {
-        const o = this.scene.objects.find((x) => x.type === 'radio');
-        // радиоточки висят на верхней стене — облачко под ней, чтобы не уходило за край
-        if (o) bubble(o.x + 0.5, (o.y + o.h - 0.1) * TD, { ...s.radioBubble, radio: true }, true);
+      // говорящие вещи (радиоточка, мусоропровод) — облачком под собой: они висят на верхней стене
+      const objectBubbles = { ...(s.objectBubbles || {}), ...(s.radioBubble ? { radio: s.radioBubble } : {}) };
+      for (const [type, ob] of Object.entries(objectBubbles)) {
+        if (!ob || ob.until <= now) continue;
+        const o = this.scene.objects.find((x) => x.type === type);
+        if (o) bubble(o.x + o.w / 2, (o.y + o.h - 0.1) * TD, { ...ob, radio: true }, true);
       }
     }
   }
 
   global.Renderer = Renderer;
   global.lookFor = lookFor;
+  global.lookForActor = lookForActor;
 })(typeof window !== 'undefined' ? window : globalThis);

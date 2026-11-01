@@ -171,3 +171,10 @@ textarea { width: 100%; resize: vertical; min-height: 60px; }
 }
 table.players tbody tr.down td { background: rgba(221,90,79,0.14); }
 .admin-log .petition { border-color: #b28a1d; color: #f0d9a0; }
+
+/* Марионетки */
+.puppet-new { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.puppet-new select, .puppet-new input { flex: 1; min-width: 0; }
+.puppet-ctl { display: grid; gap: 6px; margin: 6px 0 14px; }
+.puppet-ctl .row input { width: 70px; flex: 0 0 70px; }
+#pp-list li.selected { outline: 1px solid var(--amber); }

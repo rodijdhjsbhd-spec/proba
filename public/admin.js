@@ -724,6 +724,28 @@
     );
     withSchedule(grid.lastElementChild, { label: () => `Разнарядка: ${asgText.value.slice(0, 40)}`, cmd: 'assign', args: asgArgs });
 
+    // --- Одержимые вещи ---
+    const ovFloor = num(firstFloor, { min: 1, max: 999 });
+    const ovObj = select([['chute', 'Мусоропровод (слышат в коридоре)'], ['board', 'Доска (листок от любого имени)']], 'chute');
+    const ovAs = h('input', { maxlength: '30', placeholder: 'подпись листка, например «Сосед сверху»' });
+    const ovText = h('textarea', { maxlength: '200', placeholder: 'Кто-нибудь… вытащите меня отсюда…' });
+    const ovArgs = () => (ovText.value.trim() ? { floor: ovFloor.value, object: ovObj.value, text: ovText.value, as: ovAs.value } : (toast('Сначала напишите текст', 'error'), null));
+    grid.append(
+      card(
+        'Одержимые вещи',
+        'Дом говорит вашим голосом: мусоропровод шепчет тем, кто в коридоре этажа; на доске появляется листок от любого имени. Радиоточка — в своей карточке. Марионеток водите во вкладке «Глазок».',
+        'whisper-card',
+        h('div', { class: 'grid2' }, field('Этаж', ovFloor), field('Что', ovObj)),
+        field('Подпись (для доски)', ovAs),
+        field('Текст', ovText),
+        actions(button('Заговорить', () => {
+          const a = ovArgs();
+          if (a) cmd('objectVoice', a).then((r) => r.ok && (ovText.value = ''));
+        }, 'primary')),
+      ),
+    );
+    withSchedule(grid.lastElementChild, { label: () => `Голос вещи: ${ovText.value.slice(0, 40)}`, cmd: 'objectVoice', args: ovArgs });
+
     // --- Радиоточка ---
     const radioText = h('textarea', { maxlength: '300', placeholder: 'Говорит ЖЭК. Сегодня в 22:00 — проверка гермодверей.' });
     const radioSilence = num(10, { min: 1, max: 1440 });
@@ -1571,6 +1593,26 @@
     });
     canvas.addEventListener('mouseleave', () => (E.hover = null));
     $('#eye-clear').addEventListener('click', () => E.key && cmd('hazardClear', { scene: E.key }));
+    // марионетки
+    const syncPreset = () => {
+      $('#pp-player').hidden = $('#pp-preset').value !== 'double';
+      $('#pp-name').hidden = $('#pp-preset').value !== 'custom';
+    };
+    $('#pp-preset').addEventListener('change', syncPreset);
+    syncPreset();
+    $('#pp-create').addEventListener('click', async () => {
+      if (!E.key) return toast('Сначала откройте помещение в Глазке', 'error');
+      const preset = $('#pp-preset').value;
+      const r = await cmd('puppetCreate', { preset, scene: E.key, playerId: preset === 'double' ? $('#pp-player').value : undefined, name: $('#pp-name').value });
+      if (r.ok && r.puppetId) E.puppet = r.puppetId;
+    });
+    $('#pp-say-btn').addEventListener('click', async () => {
+      if (!E.puppet || !$('#pp-say').value.trim()) return;
+      const r = await cmd('puppetSay', { id: E.puppet, text: $('#pp-say').value });
+      if (r.ok) $('#pp-say').value = '';
+    });
+    $('#pp-say').addEventListener('keydown', (e) => e.key === 'Enter' && $('#pp-say-btn').click());
+    $('#pp-knock').addEventListener('click', () => E.puppet && cmd('puppetKnock', { id: E.puppet, apt: $('#pp-apt').value }));
     $('#eye-scars').addEventListener('click', () => E.key && cmd('scarsClear', { scene: E.key }));
     fillEyeTools();
     requestAnimationFrame(eyeFrame);
@@ -1615,7 +1657,7 @@
       seen.add(a.id);
       const cur = E.actors.get(a.id);
       if (cur) Object.assign(cur, { ...a, x: cur.x, y: cur.y, tx: a.x, ty: a.y });
-      else E.actors.set(a.id, { ...a, tx: a.x, ty: a.y, look: lookFor(a.id), phase: Math.random() * 6 });
+      else E.actors.set(a.id, { ...a, tx: a.x, ty: a.y, look: lookForActor(a), phase: Math.random() * 6 });
     }
     for (const id of [...E.actors.keys()]) if (!seen.has(id)) E.actors.delete(id);
     const bits = [`жильцов: ${snap.actors.length}`];
@@ -1688,7 +1730,13 @@
         best = a;
       }
     }
-    if (best) {
+    if (best && best.npc === 'puppet') {
+      E.puppet = best.id;
+      A.memo.puppets = null;
+      renderPuppets();
+      return;
+    }
+    if (best && !best.npc) {
       openPlayer(best.id);
       return;
     }
@@ -1697,12 +1745,50 @@
       cmd('hazard', { scene: E.key, kind, x: pt.x, y: pt.y, minutes: $('#eye-minutes').value });
       return;
     }
+    const pp = (A.snap.world.puppets || []).find((x) => x.id === E.puppet);
+    if (pp && pp.scene === E.key) {
+      cmd('puppetMove', { id: pp.id, x: pt.x, y: pt.y });
+      return;
+    }
     const hz = (E.scene?.hazards || []).find((z) => Math.hypot(z.x - pt.x, z.y - pt.y) < 0.6);
     if (hz && confirm(`Убрать опасность «${A.content.hazards[hz.kind]}»?`)) cmd('hazardClear', { scene: E.key, id: hz.id });
   }
 
+  function renderPuppets() {
+    const list = A.snap.world.puppets || [];
+    if (E.puppet && !list.some((x) => x.id === E.puppet)) E.puppet = null;
+    $('#pp-ctl').hidden = !E.puppet;
+    // список жильцов для двойника
+    const players = alivePlayers();
+    memo('ppPlayers', players.map((p) => p.id), () => {
+      $('#pp-player').replaceChildren(...players.map((p) => h('option', { value: p.id, text: `${p.name} (${p.apartment.number})` })));
+    });
+    memo('puppets', [list, E.puppet], () => {
+      $('#pp-list').replaceChildren(
+        ...(list.length
+          ? list.map((x) =>
+              h(
+                'li',
+                { class: x.id === E.puppet ? 'selected' : '' },
+                h('span', { class: 'txt' }, h('b', { text: x.name }), ` — ${x.title}`),
+                button(x.id === E.puppet ? 'Выбрана' : 'Выбрать', () => {
+                  E.puppet = x.id;
+                  A.memo.puppets = null;
+                  renderPuppets();
+                  if (x.scene !== E.key) watchScene(x.scene);
+                }, 'small'),
+                button('Сюда', () => E.key && cmd('puppetMove', { id: x.id, scene: E.key }), 'small'),
+                button('✕', () => cmd('puppetRemove', { id: x.id }), 'small'),
+              ),
+            )
+          : [h('li', { class: 'calm', text: 'Марионеток нет.' })]),
+      );
+    });
+  }
+
   /** «Дом в разрезе»: где сейчас кто, этажи сверху вниз. */
   function renderEyeSide() {
+    renderPuppets();
     const groups = new Map();
     const add = (k) => groups.get(k) || groups.set(k, []).get(k);
     for (const p of alivePlayers()) if (p.scene) add(p.scene).push(p);

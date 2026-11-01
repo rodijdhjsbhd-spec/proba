@@ -335,6 +335,8 @@ game.on('content_changed', () => {
 
 // Радиоточка: передача доходит только до тех, кто сейчас у радиоточки
 game.on('radio', ({ to, text, garbled, kind }) => sendToPlayer(to, { t: 'radio', text, garbled, kind }));
+// Одержимые вещи: мусоропровод говорит с теми, кто рядом
+game.on('object_say', ({ to, object, text }) => sendToPlayer(to, { t: 'object_say', object, text }));
 
 // Удалённое сообщение исчезает у всех
 game.on('chat_delete', ({ id }) => {
@@ -783,6 +785,7 @@ function sendSnapshot(list, snapshot) {
 const lastActors = new Map(); // playerId → подпись последней отправки
 setInterval(() => {
   try {
+    if (!game.world.paused && Object.keys(game.world.puppets).length) game.stepPuppets(0.1);
     broadcastActors();
   } catch (err) {
     console.error('[actors]', err);

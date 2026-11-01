@@ -196,6 +196,12 @@
       case 'chat':
         addChat(msg.msg);
         break;
+      case 'object_say':
+        // одержимая вещь (мусоропровод) говорит голосом ЖЭК
+        S.objectBubbles = { ...(S.objectBubbles || {}), [msg.object]: { text: msg.text, until: Date.now() + 8000, ghost: true } };
+        addChat({ id: `obj${Date.now()}`, channel: 'local', radio: true, garbled: true, from: { system: true, name: msg.object === 'chute' ? 'Мусоропровод' : 'Голос' }, text: msg.text });
+        playDrone();
+        break;
       case 'radio':
         // передача радиоточки: облачко над ней и строка в «Здесь»
         S.radioBubble = { text: msg.text, until: Date.now() + 8000, ghost: msg.garbled };
@@ -248,7 +254,7 @@
       seen.add(a.id);
       const cur = S.actors.get(a.id);
       if (cur) Object.assign(cur, { tx: a.x, ty: a.y, d: a.d, m: a.m, sick: a.sick, hurt: a.hurt, sleep: a.sleep, down: a.down, mask: a.mask, away: a.away, newbie: a.newbie, name: a.name, apt: a.apt });
-      else S.actors.set(a.id, { ...a, tx: a.x, ty: a.y, look: lookFor(a.id), phase: Math.random() * 6 });
+      else S.actors.set(a.id, { ...a, tx: a.x, ty: a.y, look: lookForActor(a), phase: Math.random() * 6 });
     }
     for (const id of [...S.actors.keys()]) if (!seen.has(id)) S.actors.delete(id);
   }
@@ -638,7 +644,7 @@
 
   function renderPrompt() {
     const busy = !S.view || S.view.you.travel || S.view.you.down;
-    const npc = busy || !S.me ? null : [...S.actors.values()].find((a) => a.npc && Math.hypot(a.x - S.me.x, a.y - S.me.y) <= 1.8);
+    const npc = busy || !S.me ? null : [...S.actors.values()].find((a) => a.npc === 'baryga' && Math.hypot(a.x - S.me.x, a.y - S.me.y) <= 1.8);
     S.npcNear = npc || null;
     if (npc) {
       S.near = null;
@@ -739,6 +745,10 @@
     unlockAudio();
     const pt = worldPoint(e);
     const a = actorAt(pt);
+    if (a && a.npc === 'puppet') {
+      say(`${a.name} смотрит сквозь вас и молчит.`);
+      return;
+    }
     if (a && a.npc === 'baryga') {
       if (Math.hypot(a.x - S.me.x, a.y - S.me.y) <= 2) openBaryga();
       else approach(a.id, openBaryga);
@@ -1565,6 +1575,7 @@
       hazards: v.here.hazards || [],
       scars: v.here.scars || [],
       radioBubble: S.radioBubble,
+      objectBubbles: S.objectBubbles,
       marker: tutorialMarker(v),
       flashlight: has('flashlight') && you.flashCharge > 0,
       fog,
@@ -1605,7 +1616,7 @@
         ? list.map((m) => {
             if (m.from && m.from.system) return h('li', { class: `sys${m.radio ? ' radio' : ''}${m.garbled ? ' garbled' : ''}` }, h('span', { class: 'from', text: `📻 ${m.from.name}: ` }), m.text);
             const tools =
-              m.from && m.from.id && m.from.id !== myId
+              m.from && m.from.id && m.from.id !== myId && !m.from.puppet
                 ? h(
                     'span',
                     { class: 'msg-tools' },
@@ -1616,7 +1627,7 @@
             return h(
               'li',
               { class: m.hallucination ? 'ghost' : '' },
-              h('span', { class: 'from' }, m.from.name, h('span', { class: 'apt', text: `(${m.from.apt})` })),
+              h('span', { class: 'from' }, m.from.name, m.from.puppet ? null : h('span', { class: 'apt', text: `(${m.from.apt})` })),
               ': ',
               m.text,
               tools,

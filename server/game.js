@@ -107,6 +107,7 @@ function freshState() {
       barygaClients: {}, // жилец → когда последний раз продавал барыге
       plan: null, // план дома на неделю { week, target, done, participants }
       honor: null, // доска почёта прошлой недели { week, workers, generous }
+      puppets: {}, // марионетки ЖЭК { id: { id, name, preset, lookId, scene, x, y, d, path } }
     },
     players: {},
     trades: {},
@@ -184,6 +185,7 @@ class Game extends EventEmitter {
     s.world.hazards = s.world.hazards || {};
     s.world.scars = s.world.scars || {};
     s.world.barygaClients = s.world.barygaClients || {};
+    s.world.puppets = s.world.puppets && typeof s.world.puppets === 'object' ? s.world.puppets : {};
     s.assignments = Array.isArray(s.assignments) ? s.assignments : [];
     s.petitions = Array.isArray(s.petitions) ? s.petitions : [];
     s.elders = s.elders && typeof s.elders === 'object' ? s.elders : {};
@@ -762,9 +764,48 @@ class Game extends EventEmitter {
 
   /** Неигровые персонажи сцены (пока — барыга). */
   npcsAt(key) {
+    const out = [];
     const b = this.world.baryga;
-    if (!b || key !== `corridor:${b.floor}`) return [];
-    return [{ id: 'npc:baryga', name: 'Барыга', npc: 'baryga', x: b.x, y: b.y, d: 'down', m: false, apt: '' }];
+    if (b && key === `corridor:${b.floor}`) out.push({ id: 'npc:baryga', name: 'Барыга', npc: 'baryga', x: b.x, y: b.y, d: 'down', m: false, apt: '' });
+    for (const pp of Object.values(this.world.puppets)) {
+      if (pp.scene !== key) continue;
+      out.push({ id: pp.id, name: pp.name, npc: 'puppet', preset: pp.preset, lookId: pp.lookId, x: pp.x, y: pp.y, d: pp.d || 'down', m: !!(pp.path && pp.path.length), apt: '' });
+    }
+    return out;
+  }
+
+  // =========================================================================
+  // Марионетки ЖЭК: ходят, говорят, стучат — ими управляет бог
+  // =========================================================================
+  /** Шаг марионеток по пути (вызывается каждые 100 мс из сервера, чтобы ходили плавно). */
+  stepPuppets(dtSec) {
+    for (const pp of Object.values(this.world.puppets)) {
+      if (!pp.path || !pp.path.length) continue;
+      let left = World.SPEED * 0.8 * dtSec;
+      while (left > 0 && pp.path.length) {
+        const t = pp.path[0];
+        const dx = t.x - pp.x, dy = t.y - pp.y;
+        const d = Math.hypot(dx, dy);
+        if (d <= left) {
+          pp.x = t.x;
+          pp.y = t.y;
+          pp.path.shift();
+          left -= d;
+        } else {
+          pp.x += (dx / d) * left;
+          pp.y += (dy / d) * left;
+          left = 0;
+        }
+        if (Math.abs(dx) > Math.abs(dy)) pp.d = dx > 0 ? 'right' : 'left';
+        else if (dy) pp.d = dy > 0 ? 'down' : 'up';
+      }
+    }
+  }
+
+  requirePuppet(id) {
+    const pp = this.world.puppets[id];
+    if (!pp) throw new Error('Нет такой марионетки');
+    return pp;
   }
 
   /** Темно ли там, где стоит жилец: нет света на этаже или в коридоре погасла половина ламп. */
@@ -4000,6 +4041,119 @@ const ADMIN_COMMANDS = {
     return { ok: true, message: this.isOwnHome(p) ? 'Записка у жильца' : 'Записка ждёт под дверью' };
   },
 
+  /**
+   * Марионетка: preset 'walker' (обходчик), 'controller' (контролёр), 'double' (двойник жильца playerId)
+   * или своё имя. Появляется в сцене scene (или там, где жилец playerId).
+   */
+  puppetCreate({ name, preset = 'walker', scene, playerId, x, y }) {
+    if (Object.keys(this.world.puppets).length >= 12) throw new Error('Марионеток слишком много (12)');
+    let key = scene;
+    let lookId = null;
+    let label = sanitizeText(name, 20);
+    if (preset === 'double') {
+      const q = this.requirePlayer(playerId);
+      lookId = q.id;
+      label = label || q.name;
+      key = key || this.locationKey(q);
+    } else if (playerId) {
+      key = key || this.locationKey(this.requirePlayer(playerId));
+    }
+    if (!label) label = preset === 'controller' ? 'Контролёр' : preset === 'walker' ? 'Обходчик' : 'Незнакомец';
+    if (!key) throw new Error('Где поставить? Укажите помещение или жильца');
+    let sc;
+    try {
+      sc = this.map.scene(key);
+    } catch {
+      throw new Error('Нет такого помещения');
+    }
+    let pos = x != null && y != null && World.canStand(sc, Number(x), Number(y), 0.2) ? { x: Number(x), y: Number(y) } : null;
+    if (!pos) pos = this.map.spawn(key, 'default');
+    const id = newId('pp');
+    this.world.puppets[id] = { id, name: label, preset: ['walker', 'controller', 'double'].includes(preset) ? preset : 'custom', lookId, scene: key, x: pos.x, y: pos.y, d: 'down', path: [] };
+    this.log(`Марионетка «${label}» — ${this.sceneTitle(key)}`, 'admin');
+    return { ok: true, message: `${label}: ${this.sceneTitle(key)}`, puppetId: id };
+  },
+
+  /** Повести марионетку к клетке (по проходам), или перенести в другое помещение (scene). */
+  puppetMove({ id, x, y, scene }) {
+    const pp = this.requirePuppet(id);
+    if (scene && scene !== pp.scene) {
+      try {
+        this.map.scene(scene);
+      } catch {
+        throw new Error('Нет такого помещения');
+      }
+      const spawn = this.map.spawn(scene, 'default');
+      Object.assign(pp, { scene, x: spawn.x, y: spawn.y, path: [] });
+      return { ok: true, message: `${pp.name}: ${this.sceneTitle(scene)}` };
+    }
+    const sc = this.map.scene(pp.scene);
+    const path = World.findPath(sc, pp, { x: Number(x), y: Number(y) });
+    if (!path) throw new Error('Туда не пройти');
+    pp.path = path.slice(0, 200);
+    return { ok: true };
+  },
+
+  /** Марионетка говорит: облачко над ней и строка в «Здесь» у тех, кто рядом. */
+  puppetSay({ id, text }) {
+    const pp = this.requirePuppet(id);
+    const clean = sanitizeText(text, 200);
+    if (!clean) throw new Error('Пустая реплика');
+    const msg = { id: newId('m'), ts: this.now(), channel: 'local', key: pp.scene, where: this.sceneTitle(pp.scene), from: { id: pp.id, name: pp.name, apt: '—', puppet: true }, text: clean };
+    const list = this.localChat.get(pp.scene) || [];
+    list.push(msg);
+    if (list.length > 30) list.shift();
+    this.localChat.set(pp.scene, list);
+    this.emit('chat', msg);
+    this.log(`${pp.name} (марионетка): «${clean}»`, 'admin');
+    return { ok: true };
+  },
+
+  /** Марионетка стучит в квартиру: хозяин увидит в глазок её имя. Открыть ей нельзя — она не войдёт. */
+  puppetKnock({ id, apt }) {
+    const pp = this.requirePuppet(id);
+    const owner = this.ownerOf(String(apt));
+    if (!owner) throw new Error('Квартира пустует');
+    const floor = owner.apartment.floor;
+    const sc = this.map.scene(`corridor:${floor}`);
+    const door = sc.objects.find((o) => o.type === 'apt' && o.number === owner.apartment.number);
+    Object.assign(pp, { scene: `corridor:${floor}`, x: door.spot.x, y: door.spot.y, d: 'up', path: [] });
+    if (this.isOwnHome(owner) && this.isOnline(owner.id)) {
+      this.notify([owner], { title: 'Стук в дверь', text: `В глазок видно: ${pp.name}. Стоит и ждёт. Не уходит.`, style: 'knock', journal: false });
+    } else if (owner.absence) {
+      owner.absence.knocks.push({ name: pp.name, apt: '—', ts: this.now() });
+    }
+    this.log(`${pp.name} (марионетка) стучит в кв. ${owner.apartment.number}`, 'admin');
+    return { ok: true, message: `Стук в кв. ${owner.apartment.number}` };
+  },
+
+  puppetRemove({ id }) {
+    if (id) delete this.world.puppets[id];
+    else this.world.puppets = {};
+    return { ok: true, message: 'Марионетка исчезла' };
+  },
+
+  /** Одержимые вещи: мусоропровод или доска «говорят» голосом ЖЭК на этаже. */
+  objectVoice({ floor, object = 'chute', text, as }) {
+    const f = toInt(floor, C.BUILDING.firstResidentialFloor);
+    const clean = sanitizeText(text, 200);
+    if (!clean) throw new Error('Пустой текст');
+    if (object === 'board') {
+      // листок на доске от любого имени (жильцы не знают, что это ЖЭК)
+      const sign = sanitizeText(as, 30) || 'без подписи';
+      const notes = this.state.boardNotes[f] || [];
+      notes.push({ id: newId('b'), ts: this.now(), playerId: null, name: sign, apt: '—', text: clean, byZhek: true });
+      this.state.boardNotes[f] = notes.slice(-C.NOTES.perBoard);
+      this.log(`Листок на доске ${f} этажа от «${sign}»: «${clean}»`, 'admin');
+      return { ok: true, message: 'Листок на доске' };
+    }
+    const key = `corridor:${f}`;
+    const listeners = this.alivePlayers().filter((p) => this.locationKey(p) === key && this.isOnline(p.id));
+    for (const p of listeners) this.emit('object_say', { to: p.id, object: 'chute', text: clean });
+    this.log(`Мусоропровод ${f} этажа: «${clean}»`, 'admin');
+    return { ok: true, message: `Услышали: ${listeners.length}` };
+  },
+
   /** Поставить барыгу на технический этаж. */
   barygaPlace({ floor }) {
     const f = toInt(floor, 99);
@@ -4606,6 +4760,7 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       lampsOutFloors: Object.keys(w.lampsOut).length,
       rent: this.rentAmount(),
       baryga: w.baryga ? { floor: w.baryga.floor, purse: w.baryga.purse } : null,
+      puppets: Object.values(w.puppets).map((pp) => ({ id: pp.id, name: pp.name, preset: pp.preset, scene: pp.scene, title: this.sceneTitle(pp.scene) })),
       plan: w.plan ? { done: w.plan.done, target: w.plan.target, week: w.plan.week + 1, participants: Object.keys(w.plan.participants).length } : null,
       stock: this.state.stock,
       radio: { queue: w.radio.queue, silenceSec: w.radio.silenceUntil ? Math.max(0, Math.round((w.radio.silenceUntil - now) / 1000)) : 0, log: w.radio.log },

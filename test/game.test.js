@@ -1951,3 +1951,46 @@ test('план дома: смены копятся, через неделю — 
   assert.equal(game.world.honor.workers[0].name, 'Иван');
   assert.equal(b.money, 0, 'не участвовал — премии нет');
 });
+
+test('марионетки: появляются в сцене, ходят по проходам, говорят и стучат', () => {
+  const { game } = makeWorld();
+  const p = join(game, 'Иван');
+  const q = join(game, 'Мария');
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  const r = game.admin('puppetCreate', { preset: 'double', playerId: q.id, scene: 'corridor:101' });
+  assert.equal(r.ok, true, r.error);
+  const actor = game.sceneActors('corridor:101').find((a) => a.npc === 'puppet');
+  assert.equal(actor.name, 'Мария', 'двойник носит имя жильца');
+  assert.equal(actor.lookId, q.id, 'и его внешность');
+  const pp = game.world.puppets[r.puppetId];
+  const target = { x: pp.x + 4, y: pp.y };
+  assert.equal(game.admin('puppetMove', { id: pp.id, ...target }).ok, true);
+  for (let i = 0; i < 30; i++) game.stepPuppets(0.1);
+  assert.ok(Math.hypot(pp.x - target.x, pp.y - target.y) < 0.6, 'дошла');
+  const chat = [];
+  game.on('chat', (m) => chat.push(m));
+  game.admin('puppetSay', { id: pp.id, text: 'Не выходите сегодня.' });
+  assert.equal(chat[0].from.puppet, true);
+  assert.equal(chat[0].key, 'corridor:101');
+  const notes = [];
+  game.on('notify', (n) => notes.push(n));
+  assert.equal(game.admin('puppetKnock', { id: pp.id, apt: q.apartment.number }).ok, true);
+  assert.ok(notes.some((n) => n.title === 'Стук в дверь' && /Мария/.test(n.text)));
+  game.admin('puppetRemove', { id: pp.id });
+  assert.equal(game.sceneActors('corridor:101').filter((a) => a.npc).length, 0);
+});
+
+test('одержимые вещи: мусоропровод шепчет тем, кто в коридоре; листок на доске от любого имени', () => {
+  const { game } = makeWorld();
+  const p = join(game, 'Иван');
+  const far = join(game, 'Мария');
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  const said = [];
+  game.on('object_say', (e) => said.push(e));
+  assert.equal(game.admin('objectVoice', { floor: 101, object: 'chute', text: 'Вытащите меня…' }).ok, true);
+  assert.deepEqual(said.map((e) => e.to), [p.id]);
+  game.admin('objectVoice', { floor: 101, object: 'board', text: 'Не открывайте на три стука.', as: 'Сосед сверху' });
+  walkTo(game, p, type('board'));
+  assert.equal(game.readBoard(p).pinned[0].name, 'Сосед сверху');
+  assert.ok(far);
+});
