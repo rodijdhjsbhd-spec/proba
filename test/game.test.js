@@ -1394,3 +1394,18 @@ test('опасность кликом в Глазке: ровно в клетк�
   assert.equal(game.admin('hazard', { scene: 'corridor:101', kind: 'rats', x: wall.x + 0.5, y: wall.y + 0.5 }).ok, false);
   assert.equal(game.adminSnapshot().players.find((x) => x.id === p.id).scene, 'corridor:101');
 });
+
+test('паспортный стол: смена имени, занятые и зарезервированные имена нельзя', () => {
+  const { game } = makeWorld();
+  const a = join(game, 'Иван');
+  join(game, 'Мария');
+  assert.equal(game.admin('rename', { id: a.id, name: 'Мария' }).ok, false, 'занято');
+  assert.equal(game.admin('rename', { id: a.id, name: 'Сосед' }).ok, false, 'зарезервировано домом');
+  assert.equal(game.admin('rename', { id: a.id, name: '!' }).ok, false, 'плохое имя');
+  const r = game.admin('rename', { id: a.id, name: 'Пётр', reason: 'непотребное имя' });
+  assert.equal(r.ok, true, r.error);
+  assert.equal(a.name, 'Пётр');
+  assert.deepEqual(a.formerNames, ['Иван']);
+  assert.ok(game.nameTaken('Иван') === null, 'старое имя освободилось');
+  assert.ok(a.journal.some((j) => j.text.includes('Паспортный стол')));
+});

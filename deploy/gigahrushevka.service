@@ -1,0 +1,34 @@
+# /etc/systemd/system/gigahrushevka.service
+# sudo useradd --system --create-home --home-dir /opt/gigahrushevka gh
+# sudo systemctl daemon-reload && sudo systemctl enable --now gigahrushevka
+[Unit]
+Description=Гигахрущёвка — игровой сервер
+After=network.target
+
+[Service]
+Type=simple
+User=gh
+WorkingDirectory=/opt/gigahrushevka
+ExecStart=/usr/bin/node server/index.js
+# SIGTERM — сервер сохраняет мир и выходит
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=3
+Environment=NODE_ENV=production
+Environment=PORT=3000
+Environment=HOST=127.0.0.1
+Environment=TRUST_PROXY=1
+# Пароль Пульта и прочее — в отдельном файле (chmod 600), чтобы не светить в systemctl show:
+#   ADMIN_PASSWORD=...
+#   ALLOWED_ORIGINS=https://dom.example.ru
+EnvironmentFile=-/etc/gigahrushevka.env
+# Песочница: писать можно только в data/
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/gigahrushevka/data
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -2918,6 +2918,24 @@ const ADMIN_COMMANDS = {
     this.log(`${p.name}: заглушка снята`, 'admin', p.id);
   },
 
+  /** Паспортный стол: сменить жильцу имя (за непотребное имя или по просьбе). Паспорт и вещи — те же. */
+  rename({ id, name, reason }) {
+    const p = this.requirePlayer(id);
+    const clean = sanitizeName(name);
+    if (!clean) throw new Error('Имя — от 2 до 20 букв или цифр');
+    const taken = this.nameTaken(clean, p.id);
+    if (taken) throw new Error(taken);
+    const old = p.name;
+    if (old === clean) throw new Error('Имя то же самое');
+    p.name = clean;
+    p.formerNames = [...(p.formerNames || []), old].slice(-5);
+    const why = sanitizeText(reason, 200);
+    this.notify([p], { title: 'Паспортный стол', text: `Вам выдали новый паспорт. Теперь вы — ${clean}.${why ? ` Основание: ${why}` : ''}`, style: 'announce' });
+    this.log(`Паспортный стол: ${old} → ${clean}${why ? ` (${why})` : ''}`, 'admin', p.id);
+    this.dirty([p.id, ...this.othersAt(p).map((q) => q.id)]);
+    return { ok: true, message: `${old} теперь ${clean}` };
+  },
+
   /** Бан паспорта (а без паспорта — самого жильца); по желанию и адреса. minutes 0 — навсегда. */
   ban({ id, minutes = 0, reason, ip }) {
     const p = this.requirePlayer(id, { alive: false });

@@ -7,6 +7,7 @@
  *
  * Переменные окружения:
  *   PORT            — порт (по умолчанию 3000)
+ *   HOST            — на каком адресе слушать (по умолчанию все; за своим прокси — 127.0.0.1)
  *   ADMIN_PASSWORD  — пароль админки (если не задан — генерируется и сохраняется в data/admin.secret)
  *   DATA_FILE       — куда сохранять мир (по умолчанию data/world.json)
  *   BACKUP_DIR      — куда класть почасовые копии мира (по умолчанию data/backups)
@@ -14,6 +15,8 @@
  *   TRUST_PROXY     — 1, если сервер стоит за своим nginx/Caddy: тогда адрес игрока берётся из X-Forwarded-For
  *   OFFLINE_GRACE_MS — сколько ждать переподключения, прежде чем считать жильца ушедшим (по умолчанию 20000)
  *   GH_BALANCE      — JSON с правками баланса из server/content.js (BALANCE), например '{"hungerPerMin":-2}'
+ *   ALLOWED_ORIGINS — через запятую, с каких адресов можно открыть игру (по умолчанию — только с того же
+ *                     адреса, что и сервер). Пример: 'https://dom.example.ru,https://www.dom.example.ru'
  */
 
 const http = require('http');
@@ -34,6 +37,7 @@ const BACKUP_DIR = process.env.BACKUP_DIR || path.join(path.dirname(DATA_FILE), 
 const REGISTER_LIMIT = process.env.REGISTER_LIMIT === undefined ? 5 : Number(process.env.REGISTER_LIMIT) || 0;
 const TRUST_PROXY = process.env.TRUST_PROXY === '1';
 const PORT = Number(process.env.PORT) || 3000;
+const HOST = process.env.HOST || undefined; // за прокси — 127.0.0.1, чтобы наружу смотрел только он
 const ADMIN_PASSWORD = resolveAdminPassword();
 // сколько ждать переподключения, прежде чем считать игрока ушедшим
 const OFFLINE_GRACE_MS = Number(process.env.OFFLINE_GRACE_MS) || 20000;
@@ -120,12 +124,35 @@ const MIME = {
   '.json': 'application/json; charset=utf-8',
 };
 
+const CSP = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+  'font-src https://fonts.gstatic.com',
+  "img-src 'self' data:",
+  "connect-src 'self' ws: wss:",
+  "frame-ancestors 'none'",
+  "base-uri 'none'",
+  "form-action 'self'",
+].join('; ');
+
+/** Состояние для /healthz. */
+const health = { savedAt: null, saveError: null };
+
 const server = http.createServer((req, res) => {
   let pathname;
   try {
     pathname = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
   } catch {
     res.writeHead(400).end('Bad request');
+    return;
+  }
+  if (pathname === '/healthz') {
+    // для мониторинга и systemd/Docker: жив ли процесс и сохраняется ли мир
+    const savedAgo = health.savedAt ? Math.round((Date.now() - health.savedAt) / 1000) : null;
+    const ok = !health.saveError;
+    res.writeHead(ok ? 200 : 503, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(JSON.stringify({ ok, uptimeSec: Math.round(process.uptime()), online: game.onlineSet.size, alive: game.alivePlayers().length, savedAgoSec: savedAgo, saveError: health.saveError || undefined }));
     return;
   }
   if (pathname === '/') pathname = '/index.html';
@@ -144,6 +171,9 @@ const server = http.createServer((req, res) => {
       'Content-Type': MIME[path.extname(file)] || 'application/octet-stream',
       'Cache-Control': 'no-cache',
       'X-Content-Type-Options': 'nosniff',
+      'Referrer-Policy': 'no-referrer',
+      // игру нельзя встроить в чужой сайт; скрипты — только свои, шрифты — с Google Fonts
+      'Content-Security-Policy': CSP,
     });
     res.end(data);
   });
@@ -155,8 +185,33 @@ const server = http.createServer((req, res) => {
 const playerWss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 });
 const adminWss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
 
+const ALLOWED_ORIGINS = String(process.env.ALLOWED_ORIGINS || '').split(',').map((x) => x.trim().replace(/\/$/, '').toLowerCase()).filter(Boolean);
+
+/**
+ * Можно ли открыть сокет с этой страницы. Браузер всегда присылает Origin: чужой сайт не сможет
+ * тайком подключать своих посетителей к дому (боты, накрутка). Без Origin — не браузер (тесты, утилиты).
+ */
+function originAllowed(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  const o = String(origin).toLowerCase().replace(/\/$/, '');
+  if (ALLOWED_ORIGINS.length) return ALLOWED_ORIGINS.includes(o);
+  let host;
+  try {
+    host = new URL(o).host;
+  } catch {
+    return false;
+  }
+  const own = [req.headers.host, TRUST_PROXY ? req.headers['x-forwarded-host'] : null].filter(Boolean).map((h) => String(h).split(',')[0].trim().toLowerCase());
+  return own.includes(host);
+}
+
 server.on('upgrade', (req, socket, head) => {
   socket.on('error', () => socket.destroy());
+  if (!originAllowed(req)) {
+    socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+    return;
+  }
   const pathname = String(req.url || '').split('?')[0]; // без new URL: кривой адрес не должен ронять сервер
   if (pathname === '/ws') playerWss.handleUpgrade(req, socket, head, (ws) => playerWss.emit('connection', ws, req));
   else if (pathname === '/admin-ws') adminWss.handleUpgrade(req, socket, head, (ws) => adminWss.emit('connection', ws, req));
@@ -549,12 +604,14 @@ function handleAdminMessage(ws, ip, raw) {
     failedLogins.delete(ip);
     ws.isAdmin = true;
     admins.add(ws);
+    const snapshot = game.adminSnapshot();
+    ws.sentPlayers = new Map(snapshot.players.map((pl) => [pl.id, JSON.stringify(pl)]));
     send(ws, {
       t: 'admin_init',
       content: game.adminContent(),
       log: game.state.log.slice(-200),
       chat: [...game.state.chatGlobal.slice(-100), ...game.state.noteFeed.slice(-100)].sort((a, b) => a.ts - b.ts),
-      snapshot: game.adminSnapshot(),
+      snapshot,
     });
     return;
   }
@@ -574,7 +631,7 @@ function handleAdminMessage(ws, ip, raw) {
   if (msg.t === 'cmd') {
     const res = game.admin(String(msg.cmd), msg.args && typeof msg.args === 'object' ? msg.args : {});
     send(ws, { t: 'res', ...res, id: msg.id }); // id запроса важнее: в res может быть свой id (созданной записи)
-    send(ws, { t: 'snapshot', snapshot: game.adminSnapshot() });
+    sendSnapshot([ws], game.adminSnapshot());
     for (const [id] of socketsByPlayer) syncLocation(id);
   }
 }
@@ -599,13 +656,30 @@ setInterval(() => {
   }
   if (admins.size) {
     try {
-      const snapshot = game.adminSnapshot();
-      for (const ws of admins) send(ws, { t: 'snapshot', snapshot });
+      sendSnapshot(admins, game.adminSnapshot());
     } catch (err) {
       console.error('[snapshot]', err);
     }
   }
 }, BALANCE.tickMs);
+
+/**
+ * Снимок для Пульта — изменениями: жильцы, у которых ничего не поменялось с прошлой отправки
+ * (а это все погибшие и большинство спящих), не пересылаются каждую секунду.
+ */
+function sendSnapshot(list, snapshot) {
+  const sigs = snapshot.players.map((pl) => [pl.id, JSON.stringify(pl)]);
+  const rest = { ...snapshot, players: undefined };
+  for (const ws of list) {
+    const prev = ws.sentPlayers;
+    const upsert = [];
+    for (let i = 0; i < sigs.length; i++) if (!prev || prev.get(sigs[i][0]) !== sigs[i][1]) upsert.push(snapshot.players[i]);
+    const next = new Map(sigs);
+    const remove = prev ? [...prev.keys()].filter((id) => !next.has(id)) : [];
+    ws.sentPlayers = next;
+    send(ws, { t: 'snapshot', snapshot: rest, upsert, remove, full: !prev });
+  }
+}
 
 // Кто где стоит — рассылаем каждому жильцу состав его сцены (только если что-то изменилось).
 const lastActors = new Map(); // playerId → подпись последней отправки
@@ -650,7 +724,10 @@ function persist() {
   try {
     game.state.savedAt = Date.now();
     storage.save(DATA_FILE, game.state);
+    health.savedAt = game.state.savedAt;
+    health.saveError = null;
   } catch (err) {
+    health.saveError = err.message;
     console.error('[storage] Не удалось сохранить мир:', err.message);
   }
 }
@@ -694,7 +771,7 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
   });
 }
 
-server.listen(PORT, () => {
+server.listen(PORT, HOST, () => {
   console.log(`Гигахрущёвка запущена: http://localhost:${PORT}`);
   console.log(`Админка:               http://localhost:${PORT}/admin`);
   if (!process.env.ADMIN_PASSWORD) console.log(`Пароль админки:        ${ADMIN_PASSWORD}  (задайте свой через ADMIN_PASSWORD)`);

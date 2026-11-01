@@ -105,6 +105,7 @@
         A.log = msg.log || [];
         A.chat = (msg.chat || []).slice();
         A.snap = msg.snapshot;
+        A.players = new Map(msg.snapshot.players.map((p) => [p.id, p]));
         $('#login').hidden = true;
         $('#app').hidden = false;
         if (!A.built) build();
@@ -117,10 +118,15 @@
         renderChat();
         renderSnapshot();
         break;
-      case 'snapshot':
-        A.snap = msg.snapshot;
+      case 'snapshot': {
+        // сервер шлёт только изменившихся жильцов
+        if (msg.full || !A.players) A.players = new Map();
+        for (const p of msg.upsert || []) A.players.set(p.id, p);
+        for (const id of msg.remove || []) A.players.delete(id);
+        A.snap = { ...msg.snapshot, players: [...A.players.values()] };
         renderSnapshot();
         break;
+      }
       case 'watch':
         onWatch(msg.scene);
         break;
@@ -1012,9 +1018,10 @@
     );
 
     // Модерация
+    const renameInp = h('input', { maxlength: '20', placeholder: 'Паспортный стол: новое имя', 'aria-label': 'Новое имя' });
     const muteMin = num(30, { min: 1, max: 10080, 'aria-label': 'Минут заглушки' });
     const banMin = num(0, { min: 0, 'aria-label': 'Минут бана (0 — навсегда)' });
-    const banReason = h('input', { placeholder: 'Причина бана', maxlength: '200', 'aria-label': 'Причина бана' });
+    const banReason = h('input', { placeholder: 'Причина (для бана и смены имени — жилец увидит)', maxlength: '200', 'aria-label': 'Причина' });
     const banIp = h('input', { type: 'checkbox' });
     const modSection = h(
       'div',
@@ -1035,6 +1042,18 @@
         button('Забанить', () => confirm(`Забанить ${p.name}? Его выкинет из игры.`) && cmd('ban', { id, minutes: banMin.value, reason: banReason.value, ip: banIp.checked }), 'small danger'),
         button('Разбанить', () => cmd('unban', { id }), 'small'),
       ),
+      p.alive
+        ? h(
+            'div',
+            { class: 'row' },
+            renameInp,
+            button('Сменить имя', async () => {
+              if (!renameInp.value.trim()) return toast('Впишите новое имя', 'error');
+              const res = await cmd('rename', { id, name: renameInp.value, reason: banReason.value });
+              if (res.ok) renameInp.value = '';
+            }, 'small'),
+          )
+        : null,
     );
 
     // Смерть
