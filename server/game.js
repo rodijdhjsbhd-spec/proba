@@ -108,6 +108,7 @@ function freshState() {
       plan: null, // план дома на неделю { week, target, done, participants }
       honor: null, // доска почёта прошлой недели { week, workers, generous }
       puppets: {}, // марионетки ЖЭК { id: { id, name, preset, lookId, scene, x, y, d, path } }
+      pried: {}, // вскрытые служебные двери: id двери → { by, at }
     },
     players: {},
     trades: {},
@@ -188,6 +189,7 @@ class Game extends EventEmitter {
     s.world.hazards = s.world.hazards || {};
     s.world.scars = s.world.scars || {};
     s.world.barygaClients = s.world.barygaClients || {};
+    s.world.pried = s.world.pried || {};
     s.world.puppets = s.world.puppets && typeof s.world.puppets === 'object' ? s.world.puppets : {};
     s.assignments = Array.isArray(s.assignments) ? s.assignments : [];
     s.petitions = Array.isArray(s.petitions) ? s.petitions : [];
@@ -1659,8 +1661,8 @@ class Game extends EventEmitter {
   }
 
   // =========================================================================
-  // Коллективная жалоба в ЖЭК
-
+  // Квартплата, авоська, честная экономика
+  // =========================================================================
   rentAmount() {
     return this.world.rent == null ? B.rent : this.world.rent;
   }
@@ -1773,6 +1775,118 @@ class Game extends EventEmitter {
     if (p.newbieGifts.money + money > B.newbieGiftLimit) return `Новосёл может отдать не больше ${talons(B.newbieGiftLimit)} в сутки. ЖЭК присматривает.`;
     p.newbieGifts.money += money;
     return null;
+  }
+
+  // =========================================================================
+  // Вылазки на технические этажи: подсобки за служебными дверями
+  // =========================================================================
+  /** Служебная дверь рядом (объект 'locked' в коридоре технического этажа). */
+  stashDoor(p) {
+    if (p.location.place !== 'corridor' || this.map.floorKind(p.location.floor) !== 'technical') return null;
+    const o = this.nearTo(p, (x) => x.type === 'locked');
+    return o ? { o, id: `${p.location.floor}:${Math.round(o.x)}` } : null;
+  }
+
+  /** Что лежит в подсобке: у каждой двери своё, навсегда. */
+  stashLoot(doorId) {
+    const t = C.STASH_LOOT[World.hash(doorId) % C.STASH_LOOT.length];
+    return t === 'paper' ? C.LORE[World.hash(`${doorId}p`) % C.LORE.length].id : t;
+  }
+
+  /** Вскрыть (монтировкой) или обшарить подсобку. Безопасно — но ЖЭК всё видит. */
+  searchStash(p) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    const d = this.stashDoor(p);
+    if (!d) return { ok: false, error: 'Подойдите к служебной двери на техническом этаже.' };
+    const now = this.now();
+    p.techVisits = [...(p.techVisits || []).filter((x) => now - x.ts < 3600 * 1000), { floor: p.location.floor, ts: now }].slice(-20);
+    if (!this.world.pried[d.id]) {
+      if (!this.hasItem(p, 'crowbar')) return { ok: false, error: 'Заперто. Без монтировки не открыть.' };
+      this.world.pried[d.id] = { by: p.name, at: now };
+      this.log(`${p.name} вскрыл подсобку на ${p.location.floor} этаже`, 'social', p.id);
+    }
+    p.stashAt = p.stashAt || {};
+    const wait = (p.stashAt[d.id] || 0) + B.stashCooldownMin * 60000 - now;
+    if (wait > 0) return { ok: false, error: `Здесь вы уже всё перерыли. Загляните через ${Math.ceil(wait / 60000)} мин.` };
+    p.stashAt[d.id] = now;
+    if (this.random() < B.stashEmptyChance) {
+      this.log(`${p.name} обшарил подсобку на ${p.location.floor} этаже — пусто`, 'social', p.id);
+      return { ok: true, message: 'Пыль, ржавые трубы, чей-то старый ватник. Пусто.' };
+    }
+    const item = this.stashLoot(d.id);
+    this.addItem(p, item, 1);
+    this.journal(p, `В подсобке на ${p.location.floor} этаже нашлось: ${C.ITEMS[item].name}.`, 'good');
+    this.log(`${p.name} обшарил подсобку на ${p.location.floor} этаже: ${C.ITEMS[item].name}`, 'social', p.id);
+    return { ok: true, message: `В подсобке нашлось: ${C.ITEMS[item].name}.` };
+  }
+
+  /** Барыга продаёт монтировку — одну в сутки. */
+  barygaBuyCrowbar(p) {
+    if (!this.barygaNear(p)) return { ok: false, error: 'Тут никого нет.' };
+    const b = this.world.baryga;
+    if (b.crowbarDay === this.gameDay()) return { ok: false, error: '«Монтировок больше нет. Завтра».' };
+    if (p.money < B.crowbarPrice) return { ok: false, error: `«${B.crowbarPrice} талонов, и не меньше».` };
+    p.money -= B.crowbarPrice;
+    b.purse = (b.purse || 0) + B.crowbarPrice;
+    b.crowbarDay = this.gameDay();
+    this.addItem(p, 'crowbar', 1);
+    this.world.barygaClients[p.id] = this.now();
+    this.log(`${p.name} купил у барыги монтировку`, 'trade', p.id);
+    return { ok: true, message: '«Держи. Ты её не у меня взял».' };
+  }
+
+  // =========================================================================
+  // Аварийные наряды: жильцы чинят то, что ЖЭК разрешил чинить
+  // =========================================================================
+  /** Что можно чинить рядом с жильцом: ключ поломки или null. */
+  repairHere(p) {
+    const w = this.world;
+    const near = (type) => this.nearTo(p, (o) => o.type === type);
+    let key = null;
+    if (p.location.place === 'corridor' && near('lift')) key = 'lift';
+    else if (p.location.place === 'canteen' && near('counter')) key = 'canteen';
+    else if (p.location.place === 'medpost' && near('window_med')) key = 'medpost';
+    else if (p.location.place === 'factory' && near('station')) key = 'factory';
+    const b = key && w.breakdowns[key];
+    if (!b || !b.repairable || !b.until) return null;
+    return key;
+  }
+
+  repairStart(p) {
+    if (!p.alive) return { ok: false, error: 'Вы мертвы.' };
+    const key = this.repairHere(p);
+    if (!key) return { ok: false, error: 'Тут нечего чинить (или ЖЭК не разрешает).' };
+    if (p.job) return { ok: false, error: 'Вы уже заняты.' };
+    if (this.hasBlock(p, 'work')) return { ok: false, error: 'С такой травмой к ремонту не допустят.' };
+    const now = this.now();
+    if (now - (p.repairAt || 0) < B.repairCooldownSec * 1000) return { ok: false, error: 'Отдышитесь — и снова за дело.' };
+    if (p.stats.energy < B.workEnergyCost) return { ok: false, error: 'Нет сил. Поспите.' };
+    p.repairAt = now;
+    const job = MG.createJob('gauge', 2);
+    job.id = newId('j');
+    job.startedAt = now;
+    job.repair = key;
+    job.publicData = { ...job.publicData, title: `Аварийный наряд: ${C.BREAKDOWNS[key].name}`, rules: 'Стравите давление в аварийной магистрали: жмите «Сброс», когда стрелка в зелёной зоне.' };
+    p.job = job;
+    p.sleeping = false;
+    this.applyStats(p, { energy: -B.workEnergyCost });
+    return { ok: true, job: { id: job.id, game: job.game, data: job.publicData } };
+  }
+
+  repairFinish(p, job, score) {
+    const b = this.world.breakdowns[job.repair];
+    const name = C.BREAKDOWNS[job.repair].name;
+    if (!b || !b.until) return { ok: true, result: { score, reward: 0, text: `${name}: уже починили без вас.` } };
+    if (score < 0.5) return { ok: true, result: { score, reward: 0, text: `${name}: не вышло — качество ${Math.round(score * 100)}%. Попробуйте ещё раз.` } };
+    b.until -= B.repairMinutes * 60000;
+    p.money += B.repairReward;
+    this.markDeed(p, 'care');
+    this.log(`${p.name} на аварийном наряде: ${name} — поломка короче на ${B.repairMinutes} мин`, 'social', p.id);
+    const fixed = b.until <= this.now();
+    if (fixed) this.setBreakdown(job.repair, false, {});
+    const text = fixed ? `${name}: починено! Премия ${talons(B.repairReward)}.` : `${name}: дело пошло, до починки на ${B.repairMinutes} мин меньше. Премия ${talons(B.repairReward)}.`;
+    this.journal(p, text, 'good');
+    return { ok: true, result: { score, reward: B.repairReward, text } };
   }
 
   // =========================================================================
@@ -2805,6 +2919,7 @@ class Game extends EventEmitter {
     else if (roll < 0.3) found = 'bulb';
     else if (roll < 0.38) found = 'fork';
     else if (roll < 0.38 + B.lorePaperChance) found = C.LORE[Math.floor(this.random() * C.LORE.length)].id;
+    else if (roll < 0.40 + B.lorePaperChance) found = 'crowbar';
     if (found) {
       this.addItem(p, found, 1);
       this.journal(p, `В мусоропроводе нашлось: ${C.ITEMS[found].name}.`, 'good');
@@ -3173,6 +3288,7 @@ class Game extends EventEmitter {
     const answers = Array.isArray(rawAnswers) ? rawAnswers.slice(0, 50).map((a) => (typeof a === 'number' ? a : String(a).slice(0, 20))) : [];
     const score = MG.scoreJob(job, answers, this.now() - job.startedAt);
     if (job.side) return this.sideJobFinish(p, job, score);
+    if (job.repair) return this.repairFinish(p, job, score);
     let reward = MG.rewardFor(score);
     const notes = [];
     const hour = this.gameClock().hour;
@@ -3460,6 +3576,11 @@ class Game extends EventEmitter {
         if (!a) return [];
         const inRange = alive.filter((p) => p.apartment.floor >= a.from && p.apartment.floor <= a.to);
         return inRange.filter((p) => !!a.done[p.apartment.number] === (target.type === 'assignmentDone'));
+      }
+      case 'techVisitors': {
+        // кто спускался на технические этажи за последний час
+        const since = this.now() - 3600 * 1000;
+        return alive.filter((p) => (p.techVisits || []).some((x) => x.ts > since));
       }
       case 'barygaClients': {
         const since = this.now() - 24 * 3600 * 1000;
@@ -4599,8 +4720,14 @@ const ADMIN_COMMANDS = {
     return this.endFog();
   },
 
-  breakdown({ key, broken, durationMin, reason }) {
-    return this.setBreakdown(key, broken, { durationMin, reason });
+  breakdown({ key, broken, durationMin, reason, repairable }) {
+    const res = this.setBreakdown(key, broken, { durationMin, reason });
+    // «жильцы могут чинить» — только у поломок со сроком: бессрочные чинит только ЖЭК
+    if (broken && this.world.breakdowns[key] && repairable && this.world.breakdowns[key].until) {
+      this.world.breakdowns[key].repairable = true;
+      this.notify(this.alivePlayers(), { title: 'Аварийный наряд', text: `ЖЭК: «${C.BREAKDOWNS[key].name} — нужны руки. Кто поможет с ремонтом — премия».`, style: 'announce' });
+    }
+    return res;
   },
 
   power({ on, from, to, durationMin }) {
@@ -4789,6 +4916,7 @@ Game.prototype.playerView = function playerView(p) {
       power: w.power ? { from: w.power.from, to: w.power.to } : null,
       dark: this.isDark(p.location.floor),
       lift: { broken: !!w.breakdowns.lift, reason: w.breakdowns.lift?.reason || null },
+      repairs: Object.fromEntries(Object.entries(w.breakdowns).filter(([, b]) => b && b.repairable && b.until).map(([k, b]) => [k, Math.max(0, Math.round((b.until - this.now()) / 60000))])),
       cutleryStolen: w.cutleryStolen,
       online: this.onlineSet.size,
     },
@@ -4913,7 +5041,7 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       fog: w.fog ? { ...w.fog, phase: this.fogPhase(), inSec: Math.max(0, Math.round((w.fog.warnUntil - now) / 1000)), endsInSec: Math.max(0, Math.round((w.fog.until - now) / 1000)) } : null,
       power: w.power ? { ...w.power, endsInSec: w.power.until ? Math.round((w.power.until - now) / 1000) : null } : null,
       breakdowns: Object.fromEntries(
-        Object.entries(w.breakdowns).map(([k, b]) => [k, b ? { reason: b.reason, endsInSec: b.until ? Math.round((b.until - now) / 1000) : null } : null]),
+        Object.entries(w.breakdowns).map(([k, b]) => [k, b ? { reason: b.reason, endsInSec: b.until ? Math.round((b.until - now) / 1000) : null, repairable: !!b.repairable } : null]),
       ),
       cutleryStolen: w.cutleryStolen,
       shiftsToday: w.shiftsToday || 0,
@@ -4980,6 +5108,7 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       deeds: p.deedTotals || {},
       elder: this.elderOf(p.apartment.floor)?.id === p.id,
       rentDebt: p.rentDebt || 0,
+      techVisit: (p.techVisits || []).length ? p.techVisits[p.techVisits.length - 1] : null,
       suspicious: (p.sameIpGifts || 0) >= 2,
       debts: this.state.ious.filter((x) => x.debtorId === p.id && this.iouOverdue(x)).length,
       goodness: Math.round(this.goodness(p) * 10) / 10,

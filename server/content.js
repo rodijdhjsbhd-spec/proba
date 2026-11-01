@@ -88,8 +88,16 @@ const BALANCE = {
   // План дома: премия участникам выполненного недельного плана; сколько смен на жильца в неделю
   planBonus: 5,
   planShiftsPerResident: 10,
-  // Барыга: сколько талонов у него на скупку в сутки
+  // Барыга: сколько талонов у него на скупку в сутки; почём продаёт монтировку (одну в сутки)
   barygaPurse: 30,
+  crowbarPrice: 8,
+  // Подсобки: как часто один жилец может обшарить одну и ту же (мин), шанс найти пусто
+  stashCooldownMin: 15,
+  stashEmptyChance: 0.3,
+  // Аварийный наряд: на сколько минут успешный ремонт сокращает поломку; оплата; как часто
+  repairMinutes: 2,
+  repairReward: 2,
+  repairCooldownSec: 90,
 
   hungerPerMin: -3, // сытость падает: 100 → 0 примерно за 33 минуты
   starvationHpPerMin: -6, // урон здоровью при сытости 0
@@ -164,7 +172,11 @@ const ITEMS = {
   stale_bread: { name: 'Чёрствый хлеб', desc: 'Позавчерашний. Размочить бы.', use: { hunger: 8 } },
   sour_kissel: { name: 'Прокисший кисель', desc: 'Пахнет так себе. Но съедобно.', use: { hunger: 3 } },
   fog_bread: { name: 'Хлеб с серым налётом', desc: 'Лежал за окном, пока шёл туман.', use: { hunger: 8, sanity: -6 } },
+  crowbar: { name: 'Монтировка', desc: 'Вскрывает служебные двери на технических этажах. Пока лежит в кармане.' },
 };
+
+// Подсобки за служебными дверями технических этажей: у каждой двери своя постоянная добыча.
+const STASH_LOOT = ['bulb', 'rusk', 'battery', 'filter', 'paper', 'fork', 'bandage', 'stew', 'rusk', 'bulb'];
 
 // Подработка за паёк: где, у чего, в какие игровые часы и чем платят (по качеству).
 const SIDE_JOBS = {
@@ -409,5 +421,5 @@ const NOTES = {
 module.exports = {
   BUILDING, FACILITIES, BALANCE, ITEMS, SHOPS, CONDITIONS, ACCIDENTS, PLACES, BREAKDOWNS, HALLUCINATIONS,
   HALLUCINATION_VOICES, RESERVED_NAMES, ARCHIVE_DEAD_AFTER_H, NOTES, RANKS, TUTORIAL, ECHO_PHRASES, HAZARDS,
-  LORE, RADIO, DEEDS, SPOIL, FOGGED, SIDE_JOBS, BARYGA_PRICES,
+  LORE, RADIO, DEEDS, SPOIL, FOGGED, SIDE_JOBS, BARYGA_PRICES, STASH_LOOT,
 };

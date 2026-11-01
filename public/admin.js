@@ -220,6 +220,7 @@
         ['assignmentFailed', 'Не сдавшие разнарядку…'],
         ['debtors', 'Должники (квартплата, расписки)'],
         ['barygaClients', 'Клиенты барыги (за сутки)'],
+        ['techVisitors', 'Спускались на технические этажи (за час)'],
         ['elders', 'Старшие по этажам'],
         ['petitionSigners', 'Подписавшие заявление…'],
       ],
@@ -435,14 +436,15 @@
       const reason = h('input', { placeholder: 'причина (необязательно)', maxlength: '200' });
       const dur = num(0, { min: 0, max: 600, title: 'Минут до самопочинки (0 — пока не почините)' });
       const state = h('span', { class: 'state' });
+      const fixable = h('input', { type: 'checkbox', title: 'Жильцы могут чинить: аварийный наряд сокращает поломку' });
       const btn = button('Сломать', () => {
         const broken = !!A.snap.world.breakdowns[key];
-        cmd('breakdown', { key, broken: !broken, reason: reason.value, durationMin: dur.value });
+        cmd('breakdown', { key, broken: !broken, reason: reason.value, durationMin: dur.value, repairable: fixable.checked });
       });
       A.breakdownRows[key] = { state, btn };
-      return h('div', null, h('div', { class: 'bd-row' }, h('b', { text: def.name }), state, btn), h('div', { class: 'row' }, reason, dur));
+      return h('div', null, h('div', { class: 'bd-row' }, h('b', { text: def.name }), state, btn), h('div', { class: 'row' }, reason, dur, h('label', { class: 'check' }, fixable, 'чинят жильцы')));
     });
-    grid.append(card('Поломки оборудования', 'Минуты — через сколько починится само (0 — пока вы не почините).', 'warn-card', bdRows));
+    grid.append(card('Поломки оборудования', 'Минуты — через сколько починится само (0 — пока вы не почините). «Чинят жильцы» — аварийный наряд: каждый удачный ремонт сокращает поломку (только у поломок со сроком).', 'warn-card', bdRows));
 
     const bdKey = select(opts(C.breakdowns));
     const bdDur = num(10, { min: 0, max: 600 });
@@ -932,7 +934,7 @@
     }
     for (const [key, row] of Object.entries(A.breakdownRows || {})) {
       const b = s.world.breakdowns[key];
-      row.state.textContent = b ? `сломано · ${fmtSec(b.endsInSec)}` : 'работает';
+      row.state.textContent = b ? `сломано · ${fmtSec(b.endsInSec)}${b.repairable ? ' · чинят жильцы' : ''}` : 'работает';
       row.state.className = `state${b ? ' broken' : ''}`;
       row.btn.textContent = b ? 'Починить' : 'Сломать';
     }
@@ -1299,7 +1301,7 @@
     const DEED_NAMES = { gift: 'подарки', aid: 'помощь', rescue: 'спас лежачих', shelter: 'пускал переждать', care: 'берёг дом', assignment: 'разнарядки', theft: 'кражи', rob: 'обирал лежачих', cold: 'не открыл в туман' };
     const deeds = Object.entries(p.deeds || {}).map(([k, n]) => `${DEED_NAMES[k] || k}: ${n}`);
     A.card.rumor.textContent = p.alive
-      ? `${p.suspicious ? '⚠ подозрительный: подарки жильцу с того же адреса · ' : ''}${p.elder ? '★ старший по этажу · ' : ''}${p.rentDebt ? `долг за квартиру: ${p.rentDebt} ₸ · ` : ''}${p.debts ? `просрочено расписок: ${p.debts} · ` : ''}Молва: ${p.rumor && p.rumor.length ? p.rumor.join(', ') : 'ничего не говорят'}${deeds.length ? ` · досье — ${deeds.join(', ')}` : ''}${p.goodness ? ` · за сутки ${p.goodness > 0 ? '+' : ''}${p.goodness}` : ''}`
+      ? `${p.techVisit ? `был на техническом ${p.techVisit.floor} этаже ${Math.max(0, Math.round((Date.now() - p.techVisit.ts) / 60000))} мин назад · ` : ''}${p.suspicious ? '⚠ подозрительный: подарки жильцу с того же адреса · ' : ''}${p.elder ? '★ старший по этажу · ' : ''}${p.rentDebt ? `долг за квартиру: ${p.rentDebt} ₸ · ` : ''}${p.debts ? `просрочено расписок: ${p.debts} · ` : ''}Молва: ${p.rumor && p.rumor.length ? p.rumor.join(', ') : 'ничего не говорят'}${deeds.length ? ` · досье — ${deeds.join(', ')}` : ''}${p.goodness ? ` · за сутки ${p.goodness > 0 ? '+' : ''}${p.goodness}` : ''}`
       : '';
     A.card.harm.textContent = p.harmsHour ? `Бед от ЖЭК за час: ${p.harmsHour}${p.harmsHour >= 3 ? ' — не слишком ли часто одному?' : ''}` : '';
     A.card.harm.className = `card-meta${p.harmsHour >= 3 ? ' harm-warn' : ''}`;

@@ -465,9 +465,13 @@
         };
       }
       case 'locked':
+        if (v.here.floorKind === 'technical') {
+          const crowbar = you.inventory.some((i) => i.id === 'crowbar');
+          return { label: 'Служебная дверь', sub: crowbar ? 'за ней подсобка' : 'заперто · нужна монтировка (если не вскрыта)', actions: [{ label: 'Вскрыть и обшарить подсобку', run: async () => { const r = await act('stash'); if (r.ok) say(r.message); } }] };
+        }
         return { label: 'Служебная дверь', actions: [{ label: 'Подёргать ручку', run: () => say('Заперто. За дверью что-то ровно гудит.') }] };
       case 'lift':
-        return { label: 'Лифт', sub: v.world.lift.broken ? 'не работает' : `${v.here.floor} этаж`, actions: [{ label: 'Вызвать лифт', run: () => openTravel('lift', o) }] };
+        return { label: 'Лифт', sub: v.world.lift.broken ? `не работает${repairSub(v, 'lift')}` : `${v.here.floor} этаж`, actions: [{ label: 'Вызвать лифт', run: () => openTravel('lift', o) }, ...repairAction(v, 'lift', o)] };
       case 'stairs':
         return { label: 'Лестница', actions: [{ label: 'Пойти по лестнице', run: () => openTravel('stairs', o) }] };
       case 'facility': {
@@ -508,15 +512,15 @@
           actions: [{ label: 'Слушать', run: () => listenRadio() }],
         };
       case 'counter':
-        return { label: 'Раздача', sub: v.facilities.canteen.open ? sideSub(v) : 'закрыто', actions: [{ label: 'Подойти к раздаче', run: () => openShop('canteen', o) }, ...sideAction(v, o)] };
+        return { label: 'Раздача', sub: v.facilities.canteen.open ? sideSub(v) : `закрыто${repairSub(v, 'canteen')}`, actions: [{ label: 'Подойти к раздаче', run: () => openShop('canteen', o) }, ...sideAction(v, o), ...repairAction(v, 'canteen', o)] };
       case 'window_med':
-        return { label: 'Окошко фельдшера', sub: v.facilities.medpost.open ? sideSub(v) : 'закрыто', actions: [{ label: 'Постучать в окошко', run: () => openShop('medpost', o) }, ...sideAction(v, o)] };
+        return { label: 'Окошко фельдшера', sub: v.facilities.medpost.open ? sideSub(v) : `закрыто${repairSub(v, 'medpost')}`, actions: [{ label: 'Постучать в окошко', run: () => openShop('medpost', o) }, ...sideAction(v, o), ...repairAction(v, 'medpost', o)] };
       case 'jobboard':
         return { label: 'Доска нарядов', sub: 'план дома и доска почёта', actions: [{ label: 'Читать', run: () => openPlan(o) }] };
       case 'station': {
         const job = (v.here.jobs || []).find((j) => j.id === o.game);
         const sub = !v.facilities.factory.open ? 'цех стоит' : `${job ? job.rank : 1} разряд · смен в этот час: ${v.here.shiftsLeft ?? '—'}`;
-        return { label: o.label, sub, actions: [{ label: `Взять наряд: ${job ? job.name : o.game}`, run: () => startWork(o.game) }] };
+        return { label: o.label, sub: `${sub}${repairSub(v, 'factory')}`, actions: [...repairAction(v, 'factory', o), { label: `Взять наряд: ${job ? job.name : o.game}`, run: () => startWork(o.game) }] };
       }
       default: {
         const f = FLAVOR[o.type];
@@ -1967,14 +1971,24 @@
 
   async function startWork(gameId, side = null) {
     if (S.job) return;
-    const res = side ? await act('side_start', { kind: gameId }) : await act('work_start', { game: gameId });
+    const res = gameId === 'repair' ? await act('repair_start') : side ? await act('side_start', { kind: gameId }) : await act('work_start', { game: gameId });
     if (!res.ok) return;
     const job = res.job;
     S.keys.clear();
-    const station = side || S.scene.objects.find((o) => o.type === 'station' && o.game === gameId);
+    const station = side || S.scene.objects.find((o) => o.type === 'station' && o.game === job.game);
     openSheet('work', job.data.title, station);
     S.job = { ...job, gameId, startedAt: performance.now(), state: 'playing', timers: [] };
     ({ sort: playSort, meter: playMeter, gauge: playGauge, serve: playSort, pack: playSort })[job.game](S.job);
+  }
+
+  // ---- аварийный наряд ----
+  function repairSub(v, key) {
+    const left = (v.world.repairs || {})[key];
+    return left != null ? ` · нужен ремонт, ещё ~${left} мин` : '';
+  }
+
+  function repairAction(v, key, o) {
+    return (v.world.repairs || {})[key] != null ? [{ label: 'Аварийный наряд: чинить', run: () => startWork('repair', o) }] : [];
   }
 
   // ---- подработка за паёк ----
@@ -2028,6 +2042,7 @@
             r.items.map((x) => h('li', null, h('span', { class: 'name', text: `${x.name} ×${x.have} — ${x.price} ₸` }), h('button', { class: 'btn small', text: 'Продать 1', onclick: async () => { const res = await act('baryga_sell', { item: x.id, count: 1 }); if (res.ok) { say(res.message); openBaryga(); } } }))),
           )
         : h('p', { class: 'note', text: '«Нечего тебе продать. Приходи с лампочками».' }),
+      h('div', { class: 'actions' }, h('button', { class: 'btn small', text: 'Купить монтировку', title: 'Вскрывает служебные двери на технических этажах', onclick: async () => { const res = await act('baryga_crowbar'); if (res.ok) { say(res.message); openBaryga(); } } })),
     );
   }
 

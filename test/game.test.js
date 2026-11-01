@@ -2026,3 +2026,58 @@ test('журнал богов, роли, снимок перед опасной 
   assert.equal(game.getPlayer(b.id).alive, true);
   assert.ok(game.snapshots.some((x) => x.label === 'перед откатом дома'), 'откат можно отменить');
 });
+
+test('вылазки: служебная дверь на техническом этаже — монтировкой, постоянная добыча, перезарядка, ЖЭК видит', () => {
+  const { game, clock } = makeWorld({ random: () => 0.99 });
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 99 });
+  walkTo(game, p, type('locked'));
+  assert.equal(game.searchStash(p).ok, false, 'без монтировки не открыть');
+  game.admin('give', { id: p.id, item: 'crowbar', count: 1, silent: true });
+  const r = game.searchStash(p);
+  assert.equal(r.ok, true, r.error);
+  const d = game.stashDoor(p);
+  const loot = game.stashLoot(d.id);
+  assert.equal(p.inventory[loot] >= 1, true, 'постоянная добыча этой двери');
+  assert.equal(game.searchStash(p).ok, false, 'перезарядка');
+  clock.t += C.BALANCE.stashCooldownMin * 60000 + 1000;
+  game.removeItem(p, 'crowbar', 1);
+  assert.equal(game.searchStash(p).ok, true, 'вскрытую дверь можно и без монтировки');
+  assert.deepEqual(game.resolveTargets({ type: 'techVisitors' }).map((q) => q.id), [p.id]);
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  assert.equal(game.searchStash(p).ok, false, 'на жилом этаже подсобок нет');
+});
+
+test('аварийный наряд: только у поломок со сроком и с разрешения ЖЭК; ремонт сокращает и чинит', () => {
+  const { game, clock } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  walkTo(game, p, type('lift'));
+  game.admin('breakdown', { key: 'lift', broken: true, durationMin: 0, repairable: true });
+  assert.equal(game.repairStart(p).ok, false, 'бессрочную поломку чинит только ЖЭК');
+  game.admin('breakdown', { key: 'lift', broken: false });
+  game.admin('breakdown', { key: 'lift', broken: true, durationMin: 3, repairable: true });
+  assert.equal(game.playerView(p).world.repairs.lift, 3);
+  const r = game.repairStart(p);
+  assert.equal(r.ok, true, r.error);
+  // идеальные нажатия: моменты, когда стрелка в зелёной зоне
+  const MG = require('../server/minigames');
+  const perfect = () => {
+    const pr = p.job.secret.params;
+    const out = [];
+    for (let t = 0; t < 30000 && out.length < pr.presses; t += 10) if (Math.abs(MG.gaugePos(pr, t) - pr.center) <= (pr.width / 2) * 0.8 && (!out.length || t - out.at(-1) > 300)) out.push(t);
+    return out;
+  };
+  const presses = perfect();
+  clock.t += presses.at(-1) + 500;
+  const res = game.workSubmit(p, r.job.id, presses);
+  assert.equal(res.ok, true);
+  assert.equal(p.money, C.BALANCE.repairReward);
+  assert.ok(game.world.breakdowns.lift.until - game.now() <= 60 * 1000 + 100, 'на 2 минуты короче');
+  clock.t += C.BALANCE.repairCooldownSec * 1000;
+  const r2 = game.repairStart(p);
+  const presses2 = perfect();
+  clock.t += presses2.at(-1) + 500;
+  game.workSubmit(p, r2.job.id, presses2);
+  assert.equal(game.world.breakdowns.lift, null, 'починили');
+});
