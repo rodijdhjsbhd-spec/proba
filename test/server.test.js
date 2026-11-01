@@ -150,7 +150,7 @@ test('PWA и пуши: манифест, service worker, ключ в приве�
   // ключ VAPID создан рядом с миром и пришёл жильцу
   assert.ok(fs.existsSync(path.join(dir, 'vapid.json')));
   const pl = await open('/ws');
-  pl.send(JSON.stringify({ t: 'hello' }));
+  pl.send(JSON.stringify({ t: 'hello', proto: 2 }));
   pl.send(JSON.stringify({ t: 'register', name: 'Пушкин', login: 'pushkin', password: 'secret12' }));
   const welcome = await pl.next((m) => m.t === 'welcome');
   assert.equal(Buffer.from(welcome.push, 'base64url').length, 65);
@@ -171,7 +171,7 @@ test('PWA и пуши: манифест, service worker, ключ в приве�
 test('соседи по сцене: сначала целиком, потом изменениями (шаг — коротко), по просьбе — снова целиком', async () => {
   const join = async (name, login) => {
     const ws = await open('/ws');
-    ws.send(JSON.stringify({ t: 'hello' }));
+    ws.send(JSON.stringify({ t: 'hello', proto: 2 }));
     ws.send(JSON.stringify({ t: 'register', name, login, password: 'secret12' }));
     const w = await ws.next((m) => m.t === 'welcome');
     return { ws, id: w.id };
@@ -201,4 +201,15 @@ test('соседи по сцене: сначала целиком, потом и
   a.ws.send(JSON.stringify({ t: 'actors_resync' }));
   await a.ws.next((m) => m.t === 'actors' && m.base == null && m.seq >= delta.seq, 3000);
   for (const ws of [a.ws, b.ws, ad]) ws.close();
+});
+
+test('старая вкладка (без версии протокола) получает вид и соседей целиком', async () => {
+  const pl = await open('/ws');
+  pl.send(JSON.stringify({ t: 'hello' }));
+  pl.send(JSON.stringify({ t: 'register', name: 'Старовер', login: 'starover', password: 'secret12' }));
+  await pl.next((m) => m.t === 'welcome');
+  await pl.next((m) => m.t === 'view');
+  const second = await pl.next((m) => m.t === 'view' || m.t === 'vpatch', 4000);
+  assert.equal(second.t, 'view', 'изменений старая вкладка не понимает');
+  pl.close();
 });

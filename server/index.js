@@ -288,6 +288,8 @@ function sendBanned(ws, ban) {
 function bind(ws, player) {
   ws.playerId = player.id;
   ws.viewParts = null; // новый жилец в этом сокете — первый вид целиком
+  ws.viewSig = null;
+  ws.viewKey = null;
   player.lastIp = ws.ip;
   if (!socketsByPlayer.has(player.id)) socketsByPlayer.set(player.id, new Set());
   socketsByPlayer.get(player.id).add(ws);
@@ -332,6 +334,19 @@ function pushView(id) {
 
 /** Вид жильца уходит изменениями (public/shared/viewpatch.js): первый раз целиком, дальше — что поменялось. */
 function viewMessage(ws, view) {
+  // сцена сменилась (перенёс ЖЭК, выставили, приехал лифт) — соседей пришлём целиком уже после вида
+  const key = view.here && view.here.key;
+  if (ws.viewKey !== key) {
+    ws.viewKey = key;
+    if (ws.playerId) lastActors.delete(ws.playerId);
+  }
+  if (!(ws.proto >= 2)) {
+    // старый клиент: вид целиком, если что-то поменялось
+    const sig = JSON.stringify(view);
+    if (sig === ws.viewSig) return null;
+    ws.viewSig = sig;
+    return { t: 'view', view };
+  }
   const { parts, patch } = ViewPatch.diff(ws.viewParts, view);
   ws.viewParts = parts;
   if (!patch) return null;
@@ -391,9 +406,11 @@ async function deliverPush(p, message, { urgent = false, tag = null } = {}) {
     else if (r === 'error') console.warn('[push] служба не приняла уведомление:', new URL(sub.endpoint).host);
   }
 }
+// «в игре» — есть соединение с видимой вкладкой; свёрнутая игра на телефоне получает пуши
+game.inGame = (id) => [...(socketsByPlayer.get(id) || [])].some((ws) => ws.readyState === ws.OPEN && !ws.hidden);
 game.on('push', ({ to, title, body, tag, urgent }) => {
   const p = game.getPlayer(to);
-  if (!p || socketsByPlayer.has(to)) return;
+  if (!p || game.inGame(to)) return;
   deliverPush(p, { title, body, tag, url: '/' }, { urgent, tag }).catch((err) => console.error('[push]', err));
 });
 const pushTests = new Map(); // жилец → когда проверял связь
@@ -633,6 +650,8 @@ function handlePlayerMessage(ws, raw) {
   if (!msg || typeof msg !== 'object') return;
 
   if (msg.t === 'hello') {
+    // версия протокола клиента: старые вкладки (до выкладки) понимают только вид и соседей целиком
+    ws.proto = Number(msg.proto) || 1;
     let p = game.playerByToken(msg.token);
     if (!p) {
       send(ws, { t: 'need_register' });
@@ -797,6 +816,12 @@ function handleRest(ws, msg) {
       registrations.get(ws.ip).push(Date.now());
     }
     bind(ws, res.player);
+    return;
+  }
+
+  if (msg.t === 'visibility') {
+    // вкладку свернули или вернули: свёрнутая игра — повод для пуша
+    ws.hidden = !!msg.hidden;
     return;
   }
 
@@ -1087,11 +1112,12 @@ function broadcastActors() {
     for (const id of ids) {
       const had = lastActors.get(id);
       if (had === now) continue;
-      let raw;
-      if (had === `${key}#${base}` && st.seq === base + 1) raw = delta = delta || JSON.stringify({ t: 'actors', key, seq: st.seq, base, actors: changed, moves, gone });
-      else raw = full = full || JSON.stringify({ t: 'actors', key, seq: st.seq, actors });
+      const canDelta = had === `${key}#${base}` && st.seq === base + 1;
+      if (canDelta) delta = delta || JSON.stringify({ t: 'actors', key, seq: st.seq, base, actors: changed, moves, gone });
+      if (!canDelta || [...(socketsByPlayer.get(id) || [])].some((ws) => !(ws.proto >= 2))) full = full || JSON.stringify({ t: 'actors', key, seq: st.seq, actors });
       lastActors.set(id, now);
-      for (const ws of socketsByPlayer.get(id) || []) if (ws.readyState === ws.OPEN) ws.send(raw);
+      // старым вкладкам — всегда целиком (они не знают изменений)
+      for (const ws of socketsByPlayer.get(id) || []) if (ws.readyState === ws.OPEN) ws.send(canDelta && ws.proto >= 2 ? delta : full);
     }
   }
 }

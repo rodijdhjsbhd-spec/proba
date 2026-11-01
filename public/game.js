@@ -94,7 +94,8 @@
     ws.onopen = () => {
       S.retry = 0;
       $('#conn').hidden = true;
-      if (!S.banned) send({ t: 'hello', token: S.token });
+      if (!S.banned) send({ t: 'hello', token: S.token, proto: 2 });
+      send({ t: 'visibility', hidden: document.hidden });
     };
     ws.onmessage = (e) => {
       let msg;
@@ -272,6 +273,10 @@
       renderer.setScene(S.scene);
       S.actors.clear();
       S.actorsKey = null; // соседи новой сцены придут целиком
+      // а если не пришли (сообщение обогнало вид и было отброшено) — попросить ещё раз
+      setTimeout(() => {
+        if (S.sceneKey === key && S.actorsKey !== key) send({ t: 'actors_resync' });
+      }, 500);
       S.hover = null;
       if (S.sheet && S.sheet.kind !== 'work') closeSheet();
     }
@@ -2552,6 +2557,10 @@
       ],
     });
   });
+
+  // Свёрнутая вкладка — не «в игре»: сервер шлёт пуши (сирена, стук) на телефон
+  document.addEventListener('visibilitychange', () => send({ t: 'visibility', hidden: document.hidden }));
+  window.addEventListener('pagehide', () => send({ t: 'visibility', hidden: true }));
 
   // Для автотестов и отладки из консоли (сервер всё равно проверяет каждое действие).
   window.ghDebug = { S, renderer, walkTo, objectInfo, setPocket };

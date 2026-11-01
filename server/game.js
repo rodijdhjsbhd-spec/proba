@@ -24,6 +24,7 @@ const PUSH_STYLES = { siren: 'urgent', fog: 'urgent', danger: 'urgent', death: '
 const PUSH_TAG_GAP_MS = 10 * 60000;
 const PUSH_URGENT_GAP_MS = 30000;
 const PUSH_PER_HOUR = 12;
+const PUSH_URGENT_PER_HOUR = 30;
 const PEOPLE_SHOWN = 30; // сколько соседей по сцене попадает в вид жильца (остальные — числом)
 /** Цена вещей по прилавкам (для лимита подарков новосёла: что сверх цены — подарок). */
 function bundleWorth(b) {
@@ -323,6 +324,14 @@ class Game extends EventEmitter {
 
   isOnline(id) {
     return this.onlineSet.has(id);
+  }
+
+  /**
+   * Смотрит ли жилец в игру прямо сейчас (тогда пуш не нужен). server/index.js подменяет это на
+   * «есть живое соединение с видимой вкладкой»: свёрнутое приложение и оборванная связь — не «в игре».
+   */
+  inGame(id) {
+    return this.isOnline(id);
   }
 
   /** Жилец у себя в квартире. */
@@ -660,14 +669,18 @@ class Game extends EventEmitter {
    * не больше PUSH_PER_HOUR в час. Сама отправка — в server/index.js (событие 'push').
    */
   pushOffline(p, { title, body, tag = 'zhek', urgent = false }) {
-    if (!p || !p.push || !p.push.length || this.isOnline(p.id)) return false;
+    if (!p || !p.push || !p.push.length || this.inGame(p.id)) return false;
     const now = this.now();
-    const lim = this.pushLimits.get(p.id) || { tags: {}, hour: [] };
+    const lim = this.pushLimits.get(p.id) || { tags: {}, hour: [], urgentHour: [] };
     lim.hour = lim.hour.filter((t) => now - t < 3600000);
+    lim.urgentHour = (lim.urgentHour || []).filter((t) => now - t < 3600000);
     const gap = urgent ? PUSH_URGENT_GAP_MS : PUSH_TAG_GAP_MS;
-    if (now - (lim.tags[tag] || 0) < gap || lim.hour.length >= PUSH_PER_HOUR) return false;
+    if (now - (lim.tags[tag] || 0) < gap) return false;
+    // срочное (сирена, туман, смерть) не глушится обычными стуками и записками: у него свой бюджет
+    const bucket = urgent ? lim.urgentHour : lim.hour;
+    if (bucket.length >= (urgent ? PUSH_URGENT_PER_HOUR : PUSH_PER_HOUR)) return false;
     lim.tags[tag] = now;
-    lim.hour.push(now);
+    bucket.push(now);
     this.pushLimits.set(p.id, lim);
     this.emit('push', { to: p.id, title: String(title).slice(0, 80), body: String(body || '').slice(0, 240), tag, urgent: !!urgent });
     return true;

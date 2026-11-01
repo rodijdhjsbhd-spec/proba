@@ -97,7 +97,7 @@ function startBot(port, token, i) {
     bot.pending = true;
     ws.send(JSON.stringify({ t: 'act', id: ++reqId, action, args: a }));
   };
-  ws.on('open', () => ws.send(JSON.stringify({ t: 'hello', token })));
+  ws.on('open', () => ws.send(JSON.stringify({ t: 'hello', token, proto: 2 })));
   ws.on('message', (raw) => {
     traffic.bytes += raw.length;
     traffic.msgs++;
