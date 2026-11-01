@@ -188,6 +188,12 @@
       case 'chat':
         addChat(msg.msg);
         break;
+      case 'radio':
+        // передача радиоточки: облачко над ней и строка в «Здесь»
+        S.radioBubble = { text: msg.text, until: Date.now() + 8000, ghost: msg.garbled };
+        addChat({ id: `radio${Date.now()}`, channel: 'local', radio: true, garbled: msg.garbled, from: { system: true, name: 'Радиоточка' }, text: msg.text });
+        playTone(msg.garbled ? 180 : 660, 0.08, msg.garbled ? 'sawtooth' : 'square', 0.02);
+        break;
       case 'notify':
         notify(msg);
         break;
@@ -266,6 +272,10 @@
       e.preventDefault();
       if (S.hazardNear) {
         fenceNear();
+        return;
+      }
+      if (S.lastWordNear) {
+        readLastWord(S.lastWordNear);
         return;
       }
       if (S.lampNear != null) {
@@ -448,6 +458,8 @@
       }
       case 'board':
         return { label: 'Доска объявлений', actions: [{ label: 'Читать', run: () => openBoard(o) }] };
+      case 'memorial':
+        return { label: 'Стена памяти', sub: 'имена выбывших жильцов', actions: [{ label: 'Прочитать имена', run: () => openMemorial() }] };
       case 'chute':
         return {
           label: 'Мусоропровод',
@@ -472,7 +484,7 @@
       case 'radio':
         return {
           label: 'Радиоточка',
-          actions: [{ label: 'Слушать', run: () => { selectTab('global'); say('Радиоточка хрипит голосом диктора. Новости дома — во вкладке «Весь дом».'); } }],
+          actions: [{ label: 'Слушать', run: () => listenRadio() }],
         };
       case 'counter':
         return { label: 'Раздача', sub: v.facilities.canteen.open ? null : 'закрыто', actions: [{ label: 'Подойти к раздаче', run: () => openShop('canteen', o) }] };
@@ -517,6 +529,39 @@
     return null;
   }
 
+  /** Бумага, записка, листок: текст в окне. */
+  function showPaper(title, text) {
+    openModal({ title, style: 'paper', body: h('div', { class: 'paper-text' }, String(text).split('\n').map((l) => h('p', { text: l }))), actions: [{ label: 'Отложить', primary: true }] });
+  }
+
+  async function listenRadio() {
+    const r = await act('radio_listen');
+    if (!r.ok) return;
+    const body = openSheet('radio', 'Радиоточка');
+    body.replaceChildren(
+      h('p', { class: 'hint', text: 'Передачи слышно, пока вы рядом с радиоточкой — дома или в столовой.' }),
+      r.radio && r.radio.length
+        ? h('ul', { class: 'radio-log' }, r.radio.map((l) => h('li', { class: l.garbled ? 'garbled' : '' }, h('span', { class: 'clock-s', text: l.clock }), l.text)))
+        : h('p', { class: 'note', text: r.silence }),
+    );
+  }
+
+  async function openMemorial() {
+    const r = await act('memorial');
+    if (!r.ok) return;
+    const body = openSheet('memorial', 'Стена памяти');
+    body.replaceChildren(
+      h('p', { class: 'hint', text: r.total ? `Выбыло жильцов: ${r.total}. Здесь — последние.` : 'Пока ни одного имени. Пусть так и будет.' }),
+      h(
+        'ul',
+        { class: 'memorial' },
+        r.memorial.map((m) =>
+          h('li', null, h('b', { text: m.name }), h('span', { text: ` · кв. ${m.apt}` }), h('small', { text: ` · прожито ${m.lived}, смен ${m.shifts}${m.helped ? `, помощь соседям: ${m.helped}` : ''} · ${m.ago} назад` })),
+        ),
+      ),
+    );
+  }
+
   function fenceNear() {
     if (!S.hazardNear) return;
     act('fence', { id: S.hazardNear }).then((r) => r.ok && say(r.message));
@@ -538,8 +583,34 @@
     return best;
   }
 
+  /** Листок с последней записью погибшего рядом. */
+  function nearestLastWord() {
+    const v = S.view;
+    if (!v || !S.me) return null;
+    return (v.here.scars || []).find((sc) => sc.kind === 'lastword' && Math.hypot(S.me.x - sc.x, S.me.y - sc.y) <= 1.2) || null;
+  }
+
+  function readLastWord(sc) {
+    showPaper('Листок на полу', `Почерк: ${sc.by || 'соседа'}. Последние слова:\n\n«${sc.text}»`);
+  }
+
   function renderPrompt() {
     const busy = !S.view || S.view.you.travel || S.view.you.down;
+    const lw = busy ? null : nearestLastWord();
+    S.lastWordNear = lw;
+    if (lw && !nearestHazard()) {
+      S.near = null;
+      S.lampNear = null;
+      S.hazardNear = null;
+      const sig = `lw${lw.id}`;
+      if (S.memo.prompt === sig) return;
+      S.memo.prompt = sig;
+      $('#prompt').replaceChildren(
+        h('span', { class: 'label' }, 'Листок на полу', h('small', { text: ` · последние слова: ${lw.by}` })),
+        h('button', { class: 'btn small primary', onclick: () => readLastWord(lw) }, h('kbd', { text: 'E' }), 'Прочитать'),
+      );
+      return;
+    }
     const hz = busy ? null : nearestHazard();
     if (hz) {
       S.near = null;
@@ -1188,6 +1259,7 @@
               : null,
           ),
           it.usable ? h('button', { class: 'btn small', text: 'Исп.', title: `Использовать: ${it.name}`, onclick: () => act('use', { item: it.id }) }) : null,
+          it.readable ? h('button', { class: 'btn small', text: 'Читать', title: `Прочитать: ${it.name}`, onclick: () => act('use', { item: it.id }).then((r) => r.read && showPaper(r.read.title, r.read.text)) }) : null,
         ),
       ),
     );
@@ -1306,6 +1378,8 @@
       night: isNight(v),
       lampsOut: v.here.lampsOut || [],
       hazards: v.here.hazards || [],
+      scars: v.here.scars || [],
+      radioBubble: S.radioBubble,
       marker: tutorialMarker(v),
       flashlight: has('flashlight') && you.flashCharge > 0,
       fog,
@@ -1344,7 +1418,7 @@
     log.replaceChildren(
       ...(list.length
         ? list.map((m) => {
-            if (m.from && m.from.system) return h('li', { class: 'sys' }, h('span', { class: 'from', text: `📻 ${m.from.name}: ` }), m.text);
+            if (m.from && m.from.system) return h('li', { class: `sys${m.radio ? ' radio' : ''}${m.garbled ? ' garbled' : ''}` }, h('span', { class: 'from', text: `📻 ${m.from.name}: ` }), m.text);
             const tools =
               m.from && m.from.id && m.from.id !== myId
                 ? h(

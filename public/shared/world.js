@@ -89,7 +89,7 @@
     canteen: {
       rows: [
         '##################',
-        '###P####MM####P###',
+        '###P####MM###XP#r#',
         '#.CCCCCCCCCC.....#',
         '#................#',
         '#..TT...TT...TT..#',
@@ -103,6 +103,8 @@
       legend: {
         P: { type: 'poster', label: 'Плакат', wall: true, decor: true },
         M: { type: 'menu', label: 'Меню', wall: true, decor: true },
+        X: { type: 'memorial', label: 'Стена памяти', wall: true },
+        r: { type: 'radio', label: 'Радиоточка', wall: true },
         C: { type: 'counter', label: 'Раздача', shop: 'canteen' },
         T: { type: 'dtable', label: 'Стол', decor: true },
         D: { type: 'exit', label: 'Выход в коридор', wall: true, bottom: true },

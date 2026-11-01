@@ -1409,3 +1409,91 @@ test('паспортный стол: смена имени, занятые и з
   assert.ok(game.nameTaken('Иван') === null, 'старое имя освободилось');
   assert.ok(a.journal.some((j) => j.text.includes('Паспортный стол')));
 });
+
+test('шрамы дома: копоть от провода, налёт после тумана, мел и последние слова; выцветают', () => {
+  const { game, clock, advance } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  for (const p of [a, b]) game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  game.admin('accident', { id: a.id, accident: 'shock' });
+  const key = 'corridor:101';
+  assert.ok(game.world.scars[key].some((sc) => sc.kind === 'soot'), 'копоть');
+  // последние слова
+  clock.t += 1000;
+  assert.equal(game.chat(b, 'local', 'Если что — ключ под ковриком').ok, true);
+  game.admin('kill', { id: b.id, cause: 'Обвал' });
+  const lw = game.world.scars[key].find((sc) => sc.kind === 'lastword');
+  assert.equal(lw.text, 'Если что — ключ под ковриком');
+  assert.ok(game.world.scars[key].some((sc) => sc.kind === 'chalk'));
+  assert.ok(game.playerView(a).here.scars.some((sc) => sc.kind === 'lastword' && sc.by === 'Мария'));
+  // туман оставляет налёт
+  game.admin('fog', { from: 102, to: 103, warnSec: 0, durationMin: 1 });
+  advance(70 * 1000);
+  assert.ok((game.world.scars['corridor:102'] || []).some((sc) => sc.kind === 'film'), 'налёт');
+  // стереть
+  assert.equal(game.admin('scarsClear', { scene: 'corridor:102' }).ok, true);
+  assert.equal(game.world.scars['corridor:102'], undefined);
+  // выцветают за scarHours
+  clock.t += C.BALANCE.scarHours * 3600 * 1000 + 1000;
+  advance(60 * 1000);
+  assert.equal(game.world.scars[key], undefined);
+});
+
+test('бумаги: читаются и не тратятся; записка от ЖЭК под дверь', () => {
+  const { game } = makeWorld();
+  const p = join(game, 'Иван');
+  game.admin('give', { id: p.id, item: 'paper_walker', count: 1, silent: true });
+  const r = game.useItem(p, 'paper_walker');
+  assert.equal(r.ok, true);
+  assert.match(r.read.text, /обход/i);
+  assert.equal(p.inventory.paper_walker, 1, 'бумага осталась');
+  assert.equal(game.playerView(p).you.inventory.find((i) => i.id === 'paper_walker').readable, true);
+  game.admin('teleport', { id: p.id, place: 'corridor', floor: 101 });
+  assert.equal(game.admin('plantNote', { id: p.id, text: 'Не выходи завтра.', from: 'Доброжелатель' }).ok, true);
+  game.admin('teleport', { id: p.id, place: 'home' });
+  game.collectDrops(p);
+  assert.ok(p.journal.some((j) => j.text.includes('от Доброжелатель') && j.text.includes('Не выходи завтра')));
+});
+
+test('радиоточка: эфир слышат только у радиоточки, тишина и очередь ЖЭК', () => {
+  const { game, advance } = makeWorld();
+  const home = join(game, 'Иван');
+  const out = join(game, 'Мария');
+  game.admin('teleport', { id: out.id, place: 'corridor', floor: 101 });
+  const heard = [];
+  game.on('radio', (e) => heard.push(e));
+  game.admin('radio', { text: 'Говорит ЖЭК. Проверка связи.', now: true });
+  assert.deepEqual(heard.map((e) => e.to), [home.id], 'в коридоре радиоточки нет');
+  assert.equal(heard[0].text, 'Говорит ЖЭК. Проверка связи.');
+  // очередь уходит в ближайшую передачу
+  game.admin('radio', { text: 'Из очереди' });
+  advance(C.BALANCE.radioEveryMin * 1000 + 1000);
+  assert.ok(heard.some((e) => e.text === 'Из очереди'));
+  // тишина
+  game.admin('radioSilence', { minutes: 30 });
+  const n = heard.length;
+  advance(C.BALANCE.radioEveryMin * 3000);
+  assert.equal(heard.length, n, 'в тишине эфира нет');
+  game.admin('teleport', { id: home.id, place: 'home' });
+  home.pos = { ...game.map.scene(`home:${home.apartment.number}`).objects.find((o) => o.type === 'radio').spot, d: 'up' };
+  assert.equal(game.listenRadio(home).silence, C.RADIO.silence);
+  // низкий рассудок — эфир сбоит
+  game.admin('radioSilence', { minutes: 0 });
+  home.stats.sanity = 5;
+  let garbled = 0;
+  for (let i = 0; i < 20; i++) if (game.radioFor(home, 'Обычная передача о каше и тушёнке').garbled) garbled++;
+  assert.ok(garbled >= 15);
+});
+
+test('стена памяти в столовой: имена выбывших', () => {
+  const { game } = makeWorld();
+  const a = join(game, 'Иван');
+  const b = join(game, 'Мария');
+  game.admin('kill', { id: b.id, cause: 'Туман' });
+  game.admin('teleport', { id: a.id, place: 'canteen' });
+  assert.equal(game.memorial(a).ok, false, 'надо подойти');
+  a.pos = { ...game.map.scene('canteen').objects.find((o) => o.type === 'memorial').spot, d: 'up' };
+  const m = game.memorial(a);
+  assert.equal(m.ok, true);
+  assert.equal(m.memorial[0].name, 'Мария');
+});

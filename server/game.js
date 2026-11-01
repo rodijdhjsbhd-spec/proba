@@ -96,6 +96,8 @@ function freshState() {
       supplyNext: 1, // множитель следующего завоза (ЖЭК может устроить недовоз)
       lampsOut: {}, // этаж → номера погасших ламп в коридоре
       hazards: {}, // сцена → опасности на клетках [{ id, kind, x, y, fenced, until }]
+      scars: {}, // сцена → следы событий [{ id, kind, x, y, at, text? }], выцветают за B.scarHours
+      radio: { queue: [], silenceUntil: null, lastAirMin: 0, lastNewsTs: 0, slot: 0, log: [] },
     },
     players: {},
     trades: {},
@@ -161,6 +163,8 @@ class Game extends EventEmitter {
     s.world = { ...fresh.world, ...(state.world || {}) };
     s.world.lampsOut = s.world.lampsOut || {};
     s.world.hazards = s.world.hazards || {};
+    s.world.scars = s.world.scars || {};
+    s.world.radio = { ...fresh.world.radio, ...(s.world.radio || {}) };
     s.world.breakdowns = { ...fresh.world.breakdowns, ...((state.world || {}).breakdowns || {}) };
     for (const p of Object.values(s.players || {})) {
       p.inventory = p.inventory || {};
@@ -656,6 +660,7 @@ class Game extends EventEmitter {
       p.hazardHits[hz.id] = now;
       const def = C.HAZARDS[hz.kind];
       const acc = C.ACCIDENTS[def.accident];
+      this.accidentScar(p, def.accident, hz);
       this.notify([p], { title: def.name, text: acc.text, style: 'danger' });
       this.markHarm(p);
       this.applyEffect(p, { ...acc.effect, condition: acc.condition }, acc.name);
@@ -1020,6 +1025,10 @@ class Game extends EventEmitter {
       for (const o of scene.objects.filter((x) => x.type === 'apt')) {
         const r = this.ownerOf(o.number);
         if (r) residents[o.number] = { number: o.number, name: r.name, online: this.isOnline(r.id) };
+        else {
+          const dead = this.players().find((q) => !q.alive && q.apartment.number === o.number && q.diedAt && this.now() - q.diedAt < B.tombstoneMin * 60000);
+          if (dead) residents[o.number] = { number: o.number, name: `† ${dead.name}`, dead: true };
+        }
       }
     }
     return {
@@ -1027,6 +1036,7 @@ class Game extends EventEmitter {
       title: this.sceneTitle(key),
       actors: this.sceneActors(key),
       hazards: (this.world.hazards[key] || []).map((hz) => ({ id: hz.id, kind: hz.kind, x: hz.x, y: hz.y, fenced: !!hz.fenced })),
+      scars: this.scarsView(key),
       lampsOut: scene.kind === 'corridor' ? this.world.lampsOut[floor] || [] : [],
       dark: floor != null && this.isDark(floor),
       fog: fog ? (apt ? (this.doorSealed(apt) ? 'window' : 'leak') : 'outside') : null,
@@ -1126,6 +1136,161 @@ class Game extends EventEmitter {
       if (left.length) this.world.hazards[key] = left;
       else delete this.world.hazards[key];
     }
+    if (this.world.tick % 30 === 0) {
+      const ttl = B.scarHours * 3600 * 1000;
+      for (const [key, list] of Object.entries(this.world.scars)) {
+        const left = list.filter((sc) => now - sc.at < ttl);
+        if (left.length) this.world.scars[key] = left;
+        else delete this.world.scars[key];
+      }
+    }
+    this.radioTick(now);
+  }
+
+  // =========================================================================
+  // Шрамы дома: следы событий на полу, выцветают за B.scarHours
+  // =========================================================================
+  scar(key, kind, x, y, extra = {}) {
+    if (!key || x == null || y == null) return null;
+    const list = this.world.scars[key] || [];
+    // одно пятно на одном месте не плодим (кроме записей погибших)
+    if (kind !== 'lastword' && list.some((sc) => sc.kind === kind && Math.hypot(sc.x - x, sc.y - y) < 0.6)) return null;
+    const sc = { id: newId('s'), kind, x: Math.round(x * 100) / 100, y: Math.round(y * 100) / 100, at: this.now(), ...extra };
+    list.push(sc);
+    this.world.scars[key] = list.slice(-40);
+    return sc;
+  }
+
+  /** Следы сцены для отрисовки: fade — насколько выцвел (0 — свежий, 1 — почти исчез). */
+  scarsView(key) {
+    const ttl = B.scarHours * 3600 * 1000;
+    const now = this.now();
+    return (this.world.scars[key] || []).map((sc) => ({ id: sc.id, kind: sc.kind, x: sc.x, y: sc.y, fade: Math.min(1, Math.max(0, (now - sc.at) / ttl)), ...(sc.text ? { text: sc.text, by: sc.by } : {}) }));
+  }
+
+  /** След от несчастного случая там, где стоит жилец. */
+  accidentScar(p, accidentId, at = null) {
+    const acc = C.ACCIDENTS[accidentId];
+    if (!acc || !acc.scar || p.travel) return;
+    const pos = at || p.pos;
+    if (pos) this.scar(this.locationKey(p), acc.scar, pos.x, pos.y);
+  }
+
+  /** После тумана на этажах остаётся серый налёт. */
+  fogScars(f) {
+    const last = Math.min(f.to, f.from + 40);
+    for (let floor = f.from; floor <= last; floor++) {
+      if (this.map.floorKind(floor) !== 'residential') continue;
+      const key = `corridor:${floor}`;
+      let sc;
+      try {
+        sc = this.map.scene(key);
+      } catch {
+        continue;
+      }
+      for (let i = 0; i < 3; i++) {
+        const x = 1 + Math.floor(this.random() * (sc.w - 2)) + 0.5;
+        const y = 1 + Math.floor(this.random() * (sc.h - 2)) + 0.5;
+        if (!World.isSolidTile(sc, Math.floor(x), Math.floor(y))) this.scar(key, 'film', x, y);
+      }
+    }
+  }
+
+  /** Стена памяти в столовой: кого уже нет. */
+  memorial(p) {
+    if (!this.nearTo(p, (o) => o.type === 'memorial')) return { ok: false, error: 'Подойдите к стене памяти.' };
+    const recent = this.players()
+      .filter((q) => !q.alive && q.diedAt)
+      .map((q) => ({ name: q.name, apt: q.apartment.number, createdAt: q.createdAt, diedAt: q.diedAt, shifts: q.shifts || 0, helped: (q.deeds && q.deeds.helped) || 0 }));
+    const old = this.state.archive.map((a) => ({ name: a.name, apt: a.apartment, createdAt: a.createdAt, diedAt: a.diedAt, shifts: a.shifts || 0, helped: a.helped || 0 }));
+    const list = [...recent, ...old]
+      .sort((a, b) => b.diedAt - a.diedAt)
+      .slice(0, 40)
+      .map((x) => ({ name: x.name, apt: x.apt, lived: fmtDuration((x.diedAt || 0) - (x.createdAt || x.diedAt || 0)), shifts: x.shifts, helped: x.helped, ago: fmtDuration(this.now() - x.diedAt) }));
+    return { ok: true, memorial: list, total: recent.length + old.length };
+  }
+
+  // =========================================================================
+  // Радиоточка со своим эфиром
+  // =========================================================================
+  /** Слышит ли жилец радиоточку: в сети и в помещении, где она висит. */
+  hearsRadio(p) {
+    if (!p.alive || p.travel || !this.isOnline(p.id)) return false;
+    try {
+      return this.map.scene(this.locationKey(p)).objects.some((o) => o.type === 'radio');
+    } catch {
+      return false;
+    }
+  }
+
+  radioTick(now) {
+    const r = this.world.radio;
+    if (r.silenceUntil) {
+      if (now < r.silenceUntil) return;
+      r.silenceUntil = null;
+    }
+    const hour = this.gameClock().hour;
+    const every = hour >= 22 || hour < 6 ? B.radioEveryMin * 3 : B.radioEveryMin;
+    if (this.world.gameMinutes - (r.lastAirMin || 0) < every) return;
+    r.lastAirMin = this.world.gameMinutes;
+    r.slot = (r.slot || 0) + 1;
+    if (r.queue.length) {
+      const item = r.queue.shift();
+      this.airRadio(item.text, 'zhek');
+      return;
+    }
+    // каждая вторая передача — новости дома (только то, что жильцы и так могли знать)
+    if (r.slot % 2 === 0) {
+      const fresh = this.state.log.filter((e) => e.public && e.ts > (r.lastNewsTs || 0));
+      if (fresh.length) {
+        const e = fresh[fresh.length - 1];
+        r.lastNewsTs = e.ts;
+        this.airRadio(`Новости дома: ${e.public}.`, 'news');
+        return;
+      }
+    }
+    this.airRadio(C.RADIO.lines[Math.floor(this.random() * C.RADIO.lines.length)], 'line');
+  }
+
+  /** Что услышит конкретный жилец: в сирену и при низком рассудке эфир сбоит. */
+  radioFor(p, text) {
+    const f = this.world.fog;
+    const siren = f && this.fogPhase() === 'warning' && p.location.floor >= f.from && p.location.floor <= f.to;
+    const sanity = p.stats.sanity;
+    if (sanity < 25 && this.random() < 0.4) {
+      const line = C.RADIO.eerie[Math.floor(this.random() * C.RADIO.eerie.length)];
+      return { text: line.replace(/\{name\}/g, p.name), garbled: true };
+    }
+    if (siren || sanity < 40) {
+      const rate = siren ? 0.45 : 0.25;
+      const words = text.split(' ').map((w) => (this.random() < rate ? '…ш-ш…' : w));
+      return { text: words.join(' ').replace(/(…ш-ш… )+…ш-ш…/g, '…ш-ш-ш…'), garbled: true };
+    }
+    return { text, garbled: false };
+  }
+
+  airRadio(rawText, kind = 'line') {
+    const text = sanitizeText(rawText, 300);
+    if (!text) return 0;
+    const r = this.world.radio;
+    r.log = [...(r.log || []), { ts: this.now(), clock: this.gameClock().time, text, kind }].slice(-8);
+    let n = 0;
+    for (const p of this.alivePlayers()) {
+      if (!this.hearsRadio(p)) continue;
+      const heard = this.radioFor(p, text);
+      this.emit('radio', { to: p.id, text: heard.text, garbled: heard.garbled, kind });
+      n++;
+    }
+    return n;
+  }
+
+  /** «Слушать» у радиоточки: последние передачи (или тишина). */
+  listenRadio(p) {
+    if (!this.nearTo(p, (o) => o.type === 'radio')) return { ok: false, error: 'Подойдите к радиоточке.' };
+    const r = this.world.radio;
+    if (r.silenceUntil && this.now() < r.silenceUntil) return { ok: true, radio: [], silence: C.RADIO.silence };
+    const lines = (r.log || []).slice(-5).map((l) => ({ clock: l.clock, ...this.radioFor(p, l.text) }));
+    return { ok: true, radio: lines, silence: lines.length ? null : 'Радиоточка потрескивает. Передач пока не было.' };
   }
 
   /** Полный запас на сутки с множителем factor (null у позиций без ограничений). */
@@ -1253,7 +1418,7 @@ class Game extends EventEmitter {
     const limit = C.ARCHIVE_DEAD_AFTER_H * 3600 * 1000;
     for (const p of this.players()) {
       if (p.alive || !p.diedAt || now - p.diedAt < limit) continue;
-      this.state.archive.push({ id: p.id, name: p.name, apartment: p.apartment.number, createdAt: p.createdAt, diedAt: p.diedAt, deathCause: p.deathCause, shifts: p.shifts || 0 });
+      this.state.archive.push({ id: p.id, name: p.name, apartment: p.apartment.number, createdAt: p.createdAt, diedAt: p.diedAt, deathCause: p.deathCause, shifts: p.shifts || 0, helped: (p.deeds && p.deeds.helped) || 0 });
       if (this.state.archive.length > 5000) this.state.archive.splice(0, this.state.archive.length - 5000);
       delete this.state.players[p.id];
       this.byToken.delete(p.token);
@@ -1602,6 +1767,7 @@ class Game extends EventEmitter {
     const def = C.ITEMS[itemId];
     if (!def || !this.hasItem(p, itemId)) return { ok: false, error: 'У вас этого нет.' };
     if (def.equip) return { ok: false, error: 'Работает сам, пока лежит у вас в кармане.' };
+    if (def.read) return { ok: true, read: { title: def.name, text: def.read } }; // бумага не тратится
     if (!def.use) return { ok: false, error: 'Это не используется. Зато можно обменять.' };
     if (!this.itemUseful(p, itemId)) {
       if (def.use.refill) return { ok: false, error: def.use.refill === 'gasmask' ? 'Нужен противогаз — или фильтр в нём ещё свежий.' : 'Нужен фонарик — или он и так заряжен.' };
@@ -1813,6 +1979,7 @@ class Game extends EventEmitter {
     if (roll < 0.2) found = 'rusk';
     else if (roll < 0.3) found = 'bulb';
     else if (roll < 0.38) found = 'fork';
+    else if (roll < 0.38 + B.lorePaperChance) found = C.LORE[Math.floor(this.random() * C.LORE.length)].id;
     if (found) {
       this.addItem(p, found, 1);
       this.journal(p, `В мусоропроводе нашлось: ${C.ITEMS[found].name}.`, 'good');
@@ -1976,7 +2143,7 @@ class Game extends EventEmitter {
     delete this.state.doorDrops[p.apartment.number];
     const lines = [];
     for (const d of drops) {
-      const who = d.anon ? 'без подписи' : `от ${d.fromName} (кв. ${d.fromApt})`;
+      const who = d.anon ? 'без подписи' : d.byZhek ? `от ${d.fromName}` : `от ${d.fromName} (кв. ${d.fromApt})`;
       if (d.kind === 'note') {
         lines.push(`Записка ${who}: «${d.text}»`);
       } else {
@@ -2168,6 +2335,7 @@ class Game extends EventEmitter {
     if (now - (this.lastChatAt.get(p.id) || 0) < 700) return { ok: false, error: 'Не так быстро.' };
     this.lastChatAt.set(p.id, now);
     const msg = { id: newId('m'), ts: now, channel, from: { id: p.id, name: p.name, apt: p.apartment.number }, text };
+    p.lastSaid = { text, ts: now };
     this.tutorialStep(p, 'talk');
     if (channel === 'global') {
       this.pushGlobal(msg);
@@ -2322,6 +2490,12 @@ class Game extends EventEmitter {
       this.log(`${p.name} погиб в тумане после того, как ${refusal.kind === 'evicted' ? 'его выставил' : 'ему не открыл'} ${refusal.owner}`, 'social', p.id);
     }
     this.refusals.delete(p.id);
+    // мел на полу, а рядом — последнее, что жилец успел сказать
+    if (p.pos && !p.travel) {
+      const key = this.locationKey(p);
+      this.scar(key, 'chalk', p.pos.x, p.pos.y);
+      if (p.lastSaid && this.now() - p.lastSaid.ts < 6 * 3600 * 1000) this.scar(key, 'lastword', p.pos.x + 0.6, p.pos.y + 0.2, { text: p.lastSaid.text, by: p.name });
+    }
     this.evictAllGuests(p.apartment.number, p.apartment.floor);
     this.dirty([p.id, ...this.othersAt(p).map((q) => q.id)]);
   }
@@ -2470,6 +2644,7 @@ class Game extends EventEmitter {
     if (!this.world.fog) return { ok: false, error: 'Тумана нет.' };
     const f = this.world.fog;
     this.world.fog = null;
+    if (f.arrived) this.fogScars(f);
     if (!silent) {
       this.notify(this.alivePlayers(), { title: 'Отбой', text: `Туман на этажах ${f.from}–${f.to} рассеялся.`, style: 'good' });
       this.systemChat(`Отбой тревоги. Туман на этажах ${f.from}–${f.to} рассеялся.`);
@@ -2638,6 +2813,7 @@ const ADMIN_COMMANDS = {
     if (!acc) throw new Error('Нет такого несчастного случая');
     const victims = id ? [this.requirePlayer(id)] : this.resolveTargets(target);
     for (const p of victims) {
+      this.accidentScar(p, accident);
       this.notify([p], { title: acc.name, text: acc.text, style: 'danger' });
       const parts = this.applyEffect(p, { ...acc.effect, condition: acc.condition }, acc.name);
       this.log(`Несчастный случай с ${p.name}: ${acc.name} (${parts.join(', ') || '—'})`, 'accident', p.id);
@@ -2846,6 +3022,62 @@ const ADMIN_COMMANDS = {
     this.world.hazards[key] = [...(this.world.hazards[key] || []), hz].slice(-20);
     this.log(`Опасность «${C.HAZARDS[kind].name}» — ${key}`, 'event');
     return { ok: true, message: `${C.HAZARDS[kind].name}: ${key}`, id: hz.id };
+  },
+
+  /** Радиоточка: сказать в эфир сейчас или поставить в очередь (уйдёт в ближайшую передачу). */
+  radio({ text, now = false }) {
+    const clean = sanitizeText(text, 300);
+    if (!clean) throw new Error('Пустая передача');
+    const r = this.world.radio;
+    if (now) {
+      if (r.silenceUntil && this.now() < r.silenceUntil) throw new Error('В эфире тишина — сначала верните эфир');
+      const n = this.airRadio(clean, 'zhek');
+      this.log(`Радиоточка (в эфир): «${clean}»`, 'admin');
+      return { ok: true, message: `В эфире. Слышат у радиоточек: ${n}` };
+    }
+    if (r.queue.length >= 20) throw new Error('Очередь эфира полна (20)');
+    r.queue.push({ id: newId('r'), text: clean });
+    this.log(`Радиоточка (в очередь): «${clean}»`, 'admin');
+    return { ok: true, message: 'Поставлено в очередь эфира' };
+  },
+
+  radioRemove({ id }) {
+    const r = this.world.radio;
+    r.queue = r.queue.filter((x) => x.id !== id);
+    return { ok: true };
+  },
+
+  /** «Тишина в эфире» — предвестник. minutes 0 — вернуть эфир. */
+  radioSilence({ minutes = 10 }) {
+    const min = Math.max(0, Math.min(1440, Number(minutes) || 0));
+    this.world.radio.silenceUntil = min > 0 ? this.now() + min * 60000 : null;
+    this.log(min > 0 ? `Тишина в эфире на ${min} мин` : 'Эфир радиоточки возвращён', 'admin');
+    return { ok: true, message: min > 0 ? `Радиоточки замолчали на ${min} мин` : 'Эфир вернулся' };
+  },
+
+  /** Подбросить жильцу записку под дверь — от кого угодно или без подписи. */
+  plantNote({ id, text, from }) {
+    const p = this.requirePlayer(id);
+    const clean = sanitizeText(text, C.NOTES.maxLength);
+    if (!clean) throw new Error('Пустая записка');
+    const sign = sanitizeText(from, 40);
+    const apt = p.apartment.number;
+    if (!this.state.doorDrops[apt]) this.state.doorDrops[apt] = [];
+    this.state.doorDrops[apt].push({ id: newId('d'), ts: this.now(), fromId: null, fromName: sign || '', fromApt: '—', kind: 'note', text: clean, anon: !sign, byZhek: true });
+    if (this.isOnline(p.id) && this.isOwnHome(p)) this.collectDrops(p);
+    this.log(`Записка под дверь ${p.name}${sign ? ` от «${sign}»` : ' без подписи'}: «${clean}»`, 'admin', p.id);
+    return { ok: true, message: this.isOwnHome(p) ? 'Записка у жильца' : 'Записка ждёт под дверью' };
+  },
+
+  /** Стереть следы (копоть, налёт, мел) — в одной сцене или во всём доме. */
+  scarsClear({ scene }) {
+    let n = 0;
+    for (const key of Object.keys(this.world.scars)) {
+      if (scene && key !== scene) continue;
+      n += this.world.scars[key].length;
+      delete this.world.scars[key];
+    }
+    return { ok: true, message: `Стёрто следов: ${n}` };
   },
 
   hazardClear({ scene, id }) {
@@ -3090,6 +3322,7 @@ Game.prototype.playerView = function playerView(p) {
       name: C.ITEMS[id]?.name || id,
       desc: C.ITEMS[id]?.desc || '',
       usable: !!C.ITEMS[id]?.use,
+      readable: !!C.ITEMS[id]?.read,
       equip: !!C.ITEMS[id]?.equip,
     })),
     gasmaskCharge: Math.round(p.gasmaskCharge),
@@ -3200,6 +3433,7 @@ Game.prototype.describePlace = function describePlace(p) {
   }));
   const here = { key: this.locationKey(p), place: l.place, floor: l.floor, title: this.placeTitle(p), text: '', people, shop: null, residents: null, closed: null };
   here.hazards = (this.world.hazards[here.key] || []).map((hz) => ({ id: hz.id, kind: hz.kind, name: C.HAZARDS[hz.kind].name, x: hz.x, y: hz.y, fenced: !!hz.fenced }));
+  here.scars = this.scarsView(here.key);
 
   switch (l.place) {
     case 'home': {
@@ -3298,6 +3532,8 @@ Game.prototype.adminSnapshot = function adminSnapshot() {
       supplyNext: w.supplyNext ?? 1,
       lampsOutFloors: Object.keys(w.lampsOut).length,
       stock: this.state.stock,
+      radio: { queue: w.radio.queue, silenceSec: w.radio.silenceUntil ? Math.max(0, Math.round((w.radio.silenceUntil - now) / 1000)) : 0, log: w.radio.log },
+      scarsCount: Object.values(w.scars).reduce((n, l) => n + l.length, 0),
     },
     online: this.onlineSet.size,
     archived: this.state.archive.length,

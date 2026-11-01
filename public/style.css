@@ -423,3 +423,18 @@ body.sanity-critical .place h1 { animation: flicker 2s infinite; }
 .echo-box { border-top: 1px dashed var(--line); margin-top: 10px; padding-top: 8px; }
 .echo-h { font-size: 13px; color: var(--violet); margin: 0 0 6px; }
 .echo-box .actions { flex-wrap: wrap; }
+
+/* Радиоточка, стена памяти, бумаги */
+.chat-log .sys.radio { color: #e3c98a; }
+.chat-log .sys.radio .from { color: #e3a13b; }
+.chat-log .sys.garbled { color: #b59ad8; font-style: italic; }
+.radio-log, .memorial { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 6px; }
+.radio-log li { padding: 6px 8px; background: #1c1f1e; border-left: 3px solid var(--amber-dim); border-radius: var(--radius); }
+.radio-log li.garbled { border-color: var(--violet); color: #cdbbe6; font-style: italic; }
+.radio-log .clock-s, .memorial small { color: var(--muted); font-family: var(--mono); font-size: 11px; margin-right: 8px; }
+.memorial li { padding: 6px 8px; border-bottom: 1px solid var(--line); }
+.memorial b { color: var(--text); }
+.modal.paper .modal-card { background: #e9e3d0; color: #222; }
+.modal.paper h3 { color: #3a2f1c; }
+.modal.paper .paper-text { font-family: var(--mono); font-size: 14px; line-height: 1.5; }
+.modal.paper .btn { color: #222; }

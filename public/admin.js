@@ -605,11 +605,57 @@
         actions(button('Поставить', () => {
           const a = hzArgs();
           if (a) cmd('hazard', a);
-        }, 'primary'), button('Убрать все', () => cmd('hazardClear', {}))),
+        }, 'primary'), button('Убрать все', () => cmd('hazardClear', {})), button('Стереть все следы', () => confirm('Стереть копоть, налёт, мел и записки погибших во всём доме?') && cmd('scarsClear', {}))),
         A.hazardList,
       ),
     );
     withSchedule(grid.lastElementChild, { label: () => `Опасность: ${C.hazards[hzKind.value]}`, cmd: 'hazard', args: hzArgs });
+
+    // --- Радиоточка ---
+    const radioText = h('textarea', { maxlength: '300', placeholder: 'Говорит ЖЭК. Сегодня в 22:00 — проверка гермодверей.' });
+    const radioSilence = num(10, { min: 1, max: 1440 });
+    A.radioInfo = h('div', { class: 'radio-info' });
+    grid.append(
+      card(
+        'Радиоточка',
+        'Свой эфир: слышат только те, кто сейчас у радиоточки (дома или в столовой). Между передачами — новости дома и обычные реплики. У кого пошатнулся рассудок — эфир сбоит. «Тишина в эфире» — хороший предвестник.',
+        'warn-card',
+        field('Текст передачи', radioText),
+        actions(
+          button('В эфир сейчас', () => radioText.value.trim() && cmd('radio', { text: radioText.value, now: true }).then((r) => r.ok && (radioText.value = '')), 'primary'),
+          button('В очередь', () => radioText.value.trim() && cmd('radio', { text: radioText.value }).then((r) => r.ok && (radioText.value = ''))),
+        ),
+        h('div', { class: 'row' }, 'Тишина на', radioSilence, 'мин', button('Тишина в эфире', () => cmd('radioSilence', { minutes: radioSilence.value }), 'small'), button('Вернуть эфир', () => cmd('radioSilence', { minutes: 0 }), 'small')),
+        A.radioInfo,
+      ),
+    );
+    withSchedule(grid.lastElementChild, { label: () => `Радиоточка: ${radioText.value.slice(0, 40)}`, cmd: 'radio', args: () => (radioText.value.trim() ? { text: radioText.value, now: true } : (toast('Сначала напишите текст передачи', 'error'), null)) });
+
+    // --- Записка под дверь ---
+    const noteTarget = targetPicker('player');
+    noteTarget.el.querySelector('select').disabled = true; // только конкретному жильцу
+    const noteFrom = h('input', { maxlength: '40', placeholder: 'пусто — без подписи' });
+    const noteText = h('textarea', { maxlength: '300', placeholder: 'Не выходи завтра на смену.' });
+    const noteArgs = () => {
+      const t = noteTarget.get();
+      if (!noteText.value.trim()) return toast('Сначала напишите записку', 'error'), null;
+      return { id: t.id, text: noteText.value, from: noteFrom.value };
+    };
+    grid.append(
+      card(
+        'Записка под дверь',
+        'Жилец найдёт её, когда будет дома. Подпись — любая или никакой; в журнале видно, что это ЖЭК.',
+        'whisper-card',
+        noteTarget.el,
+        field('Подпись', noteFrom),
+        field('Текст', noteText),
+        actions(button('Подбросить', () => {
+          const a = noteArgs();
+          if (a) cmd('plantNote', a).then((r) => r.ok && (noteText.value = ''));
+        }, 'primary')),
+      ),
+    );
+    withSchedule(grid.lastElementChild, { label: () => `Записка: ${noteText.value.slice(0, 40)}`, cmd: 'plantNote', args: noteArgs });
 
     // --- Произвольное событие ---
     grid.append(buildCustomEvent());
@@ -717,6 +763,7 @@
     renderCard();
     renderDirector();
     renderHazards();
+    renderRadio();
     renderEyeSide();
     for (const picker of A.pickers) picker.refresh();
     for (const [key, row] of Object.entries(A.breakdownRows || {})) {
@@ -1241,6 +1288,20 @@
     });
   }
 
+  function renderRadio() {
+    const r = A.snap.world.radio;
+    if (!A.radioInfo || !r) return;
+    memo('radio', [r.queue.map((q) => q.id), r.silenceSec > 0, (r.log || []).map((l) => l.ts)], () => {
+      A.radioInfo.replaceChildren(
+        r.silenceSec > 0 ? h('p', { class: 'note bad', text: 'В эфире тишина.' }) : null,
+        r.queue.length
+          ? h('ul', { class: 'hazard-list' }, r.queue.map((q) => h('li', null, h('span', { class: 'txt', text: `В очереди: ${q.text}` }), button('✕', () => cmd('radioRemove', { id: q.id }), 'small'))))
+          : null,
+        (r.log || []).length ? h('ul', { class: 'hazard-list' }, r.log.slice(-4).map((l) => h('li', { class: 'fenced' }, h('span', { class: 'txt' }, h('small', { text: `${l.clock} ` }), l.text)))) : null,
+      );
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // Опасности на клетках
   // ---------------------------------------------------------------------------
@@ -1314,6 +1375,7 @@
     });
     canvas.addEventListener('mouseleave', () => (E.hover = null));
     $('#eye-clear').addEventListener('click', () => E.key && cmd('hazardClear', { scene: E.key }));
+    $('#eye-scars').addEventListener('click', () => E.key && cmd('scarsClear', { scene: E.key }));
     fillEyeTools();
     requestAnimationFrame(eyeFrame);
   }
@@ -1366,6 +1428,7 @@
     if (snap.fog) bits.push(snap.fog === 'window' ? 'туман за окном' : 'туман!');
     if (snap.sealed) bits.push('гермодверь задраена');
     if (snap.hazards.length) bits.push(`опасностей: ${snap.hazards.length}`);
+    if ((snap.scars || []).length) bits.push(`следов: ${snap.scars.length}`);
     $('#eye-meta').textContent = bits.join(' · ');
   }
 
@@ -1394,6 +1457,7 @@
         night: hour >= 22 || hour < 6,
         lampsOut: sc ? sc.lampsOut : [],
         hazards: sc ? sc.hazards : [],
+        scars: sc ? sc.scars || [] : [],
         fog: sc ? sc.fog : null,
         fogOutside: !!(sc && sc.fog),
         liftBroken: !!(sc && sc.liftBroken),

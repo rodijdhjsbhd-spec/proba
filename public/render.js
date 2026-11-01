@@ -60,6 +60,84 @@
   }
 
   /** Кисть в клеточных координатах: всё рисуем в долях клетки. */
+  /** Шрамы дома: копоть, ржавые потёки, трещины, погрызы, налёт после тумана, мел, последняя запись. */
+  function drawScar(b, sc) {
+    const x = sc.x, y = sc.y;
+    const a = Math.max(0.08, 1 - (sc.fade || 0) * 0.9); // выцветает
+    const g = b.g;
+    g.save();
+    g.globalAlpha = a;
+    const blob = (rx, ry, color, rot = 0) => {
+      g.fillStyle = color;
+      g.beginPath();
+      g.ellipse(x * b.T, y * b.T, rx * b.T, ry * b.T, rot, 0, Math.PI * 2);
+      g.fill();
+    };
+    const seed = (x * 7.3 + y * 3.1) % 1;
+    switch (sc.kind) {
+      case 'soot':
+        blob(0.42, 0.3, 'rgba(15,12,10,0.55)', seed);
+        blob(0.22, 0.16, 'rgba(5,4,3,0.6)', -seed);
+        for (let k = 0; k < 5; k++) {
+          const an = k * 1.3 + seed * 6;
+          b.line(x, y, x + Math.cos(an) * 0.5, y + Math.sin(an) * 0.35, 'rgba(10,8,6,0.45)', 0.03);
+        }
+        break;
+      case 'stain':
+        blob(0.4, 0.24, 'rgba(120,70,30,0.35)', seed * 2);
+        blob(0.25, 0.14, 'rgba(90,50,20,0.35)', seed);
+        break;
+      case 'crack':
+        g.strokeStyle = 'rgba(10,10,10,0.7)';
+        g.lineWidth = Math.max(1, 0.03 * b.T);
+        g.beginPath();
+        g.moveTo((x - 0.45) * b.T, (y - 0.1) * b.T);
+        g.lineTo((x - 0.15) * b.T, (y + 0.08) * b.T);
+        g.lineTo((x + 0.05) * b.T, (y - 0.12) * b.T);
+        g.lineTo((x + 0.4) * b.T, (y + 0.15) * b.T);
+        g.moveTo((x + 0.05) * b.T, (y - 0.12) * b.T);
+        g.lineTo((x + 0.15) * b.T, (y - 0.38) * b.T);
+        g.stroke();
+        break;
+      case 'gnaw':
+        for (let k = 0; k < 7; k++) b.circle(x - 0.35 + k * 0.1, y + Math.sin(k * 1.7 + seed * 5) * 0.12, 0.025, 'rgba(30,22,16,0.7)');
+        break;
+      case 'film':
+        blob(0.48, 0.34, 'rgba(150,165,155,0.28)', seed * 3);
+        blob(0.3, 0.2, 'rgba(120,140,128,0.25)', -seed * 2);
+        break;
+      case 'chalk':
+        // контур мелом
+        g.strokeStyle = 'rgba(235,235,225,0.7)';
+        g.lineWidth = Math.max(1, 0.025 * b.T);
+        g.beginPath();
+        g.arc((x - 0.42) * b.T, y * b.T, 0.13 * b.T, 0, Math.PI * 2);
+        g.moveTo((x - 0.28) * b.T, (y - 0.12) * b.T);
+        g.lineTo((x + 0.15) * b.T, (y - 0.16) * b.T);
+        g.lineTo((x + 0.5) * b.T, (y - 0.3) * b.T);
+        g.moveTo((x + 0.15) * b.T, (y - 0.16) * b.T);
+        g.lineTo((x + 0.52) * b.T, (y + 0.05) * b.T);
+        g.moveTo((x - 0.28) * b.T, (y + 0.12) * b.T);
+        g.lineTo((x + 0.15) * b.T, (y + 0.14) * b.T);
+        g.lineTo((x + 0.42) * b.T, (y + 0.32) * b.T);
+        g.moveTo((x - 0.15) * b.T, (y - 0.14) * b.T);
+        g.lineTo((x - 0.05) * b.T, (y - 0.42) * b.T);
+        g.moveTo((x - 0.15) * b.T, (y + 0.13) * b.T);
+        g.lineTo((x - 0.02) * b.T, (y + 0.4) * b.T);
+        g.stroke();
+        break;
+      case 'lastword':
+        g.translate(x * b.T, y * b.T);
+        g.rotate(0.3 - seed * 0.6);
+        b.rect(-0.16, -0.11, 0.32, 0.22, '#e9e3d0');
+        for (let k = 0; k < 4; k++) b.rect(-0.12, -0.07 + k * 0.045, 0.24 - (k === 3 ? 0.1 : 0), 0.012, 'rgba(40,40,60,0.6)');
+        break;
+      default:
+        blob(0.3, 0.2, 'rgba(0,0,0,0.3)');
+    }
+    g.restore();
+  }
+
   /** Опасность на клетке (её поставил ЖЭК): кипяток, провод, провал, крысы. Огороженная — с барьером. */
   function drawHazard(b, hz, t) {
     const x = hz.x, y = hz.y;
@@ -935,6 +1013,20 @@
             const label = r.you ? 'ВЫ' : r.name.length > 9 ? `${r.name.slice(0, 8)}…` : r.name;
             b.rrect(o.x - 0.12, o.y - 1.02, 1.24, 0.28, 0.06, 'rgba(20,20,18,0.8)');
             b.text(label, o.x + 0.5, o.y - 0.875, 0.19, r.you ? '#e3a13b' : r.dead ? '#d79a92' : r.online ? '#cfe9c8' : '#a8a597');
+            if (r.dead) {
+              // дверь погибшего опечатана: бумажная лента крест-накрест
+              b.g.save();
+              b.g.translate((o.x + 0.5) * b.T, (o.y - 0.15) * b.T);
+              for (const a of [-0.5, 0.5]) {
+                b.g.save();
+                b.g.rotate(a);
+                b.rect(-0.55, -0.07, 1.1, 0.14, 'rgba(233,227,208,0.92)');
+                b.g.restore();
+              }
+              b.rect(-0.36, -0.09, 0.72, 0.18, '#e9e3d0');
+              b.text('ОПЕЧАТАНО', 0, 0, 0.11, '#b22');
+              b.g.restore();
+            }
           }
         } else if (o.type === 'hermodoor') {
           const a = s.sealed ? 0.6 : 0;
@@ -989,6 +1081,7 @@
         for (let k = 0; k < 5; k++) b.rect(l[0] - 0.2 + ((k * 37) % 40) / 100, l[1] - 0.12 + ((k * 23) % 25) / 100, 0.06, 0.03, 'rgba(210,230,235,0.8)');
         b.g.restore();
       }
+      for (const sc of s.scars || []) drawScar(b, sc);
       for (const hz of s.hazards || []) drawHazard(b, hz, t);
       if (s.marker) {
         // стрелка памятки новосёла над нужным объектом
@@ -1131,29 +1224,39 @@
       const now = s.now;
       const bubbleFont = Math.max(11 * this.dpr, 0.26 * TD);
       g.font = `400 ${bubbleFont}px "PT Sans", Arial, sans-serif`;
-      for (const a of people) {
-        const bub = s.bubbles && s.bubbles.get(a.id);
-        if (!bub || bub.until < now) continue;
+      const bubble = (ax, tipY, bub, below = false) => {
         const fade = Math.min(1, (bub.until - now) / 600);
         const lines = wrapText(g, bub.text, 3.6 * TD);
         const lh = bubbleFont * 1.2;
         const bw = Math.max(...lines.map((l) => g.measureText(l).width)) + 14 * this.dpr;
         const bh = lines.length * lh + 10 * this.dpr;
-        const bx = a.x * TD - bw / 2, by = (a.y - 1.5) * TD - bh - fontPx;
+        const bx = ax * TD - bw / 2, by = below ? tipY + 7 * this.dpr : tipY - bh;
         g.globalAlpha = fade;
-        g.fillStyle = bub.ghost ? 'rgba(40,20,50,0.92)' : 'rgba(236,232,220,0.95)';
+        g.fillStyle = bub.radio ? 'rgba(58,50,32,0.94)' : bub.ghost ? 'rgba(40,20,50,0.92)' : 'rgba(236,232,220,0.95)';
         roundRect(g, bx, by, bw, bh, 6 * this.dpr);
         g.fill();
         g.beginPath();
-        g.moveTo(a.x * TD - 5 * this.dpr, by + bh);
-        g.lineTo(a.x * TD + 5 * this.dpr, by + bh);
-        g.lineTo(a.x * TD, by + bh + 7 * this.dpr);
+        const baseY = below ? by : by + bh;
+        g.moveTo(ax * TD - 5 * this.dpr, baseY);
+        g.lineTo(ax * TD + 5 * this.dpr, baseY);
+        g.lineTo(ax * TD, below ? tipY : by + bh + 7 * this.dpr);
         g.fill();
-        g.fillStyle = bub.ghost ? '#d9cbe8' : '#1d1f1e';
+        g.fillStyle = bub.radio ? (bub.ghost ? '#d9cbe8' : '#f0d9a0') : bub.ghost ? '#d9cbe8' : '#1d1f1e';
         g.textBaseline = 'top';
-        lines.forEach((l, i) => g.fillText(l, a.x * TD, by + 5 * this.dpr + i * lh));
+        lines.forEach((l, i) => g.fillText(l, ax * TD, by + 5 * this.dpr + i * lh));
         g.textBaseline = 'bottom';
         g.globalAlpha = 1;
+      };
+      for (const a of people) {
+        const bub = s.bubbles && s.bubbles.get(a.id);
+        if (!bub || bub.until < now) continue;
+        bubble(a.x, (a.y - 1.5) * TD - fontPx, bub);
+      }
+      // радиоточка говорит облачком над собой
+      if (s.radioBubble && s.radioBubble.until > now) {
+        const o = this.scene.objects.find((x) => x.type === 'radio');
+        // радиоточки висят на верхней стене — облачко под ней, чтобы не уходило за край
+        if (o) bubble(o.x + 0.5, (o.y + o.h - 0.1) * TD, { ...s.radioBubble, radio: true }, true);
       }
     }
   }

@@ -329,6 +329,9 @@ game.on('content_changed', () => {
   for (const [pid] of socketsByPlayer) sendToPlayer(pid, { t: 'catalog', catalog: ITEM_CATALOG });
 });
 
+// Радиоточка: передача доходит только до тех, кто сейчас у радиоточки
+game.on('radio', ({ to, text, garbled, kind }) => sendToPlayer(to, { t: 'radio', text, garbled, kind }));
+
 // Удалённое сообщение исчезает у всех
 game.on('chat_delete', ({ id }) => {
   for (const [pid] of socketsByPlayer) sendToPlayer(pid, { t: 'chat_delete', id });
@@ -344,6 +347,8 @@ const PLAYER_ACTIONS = {
   move: (p, a) => game.move(p, a),
   knock: (p, a) => game.knock(p, a.apt),
   search: (p) => game.searchChute(p),
+  memorial: (p) => game.memorial(p),
+  radio_listen: (p) => game.listenRadio(p),
   board: (p) => game.readBoard(p),
   open_door: (p, a) => game.openDoor(p, a.guest),
   aid: (p, a) => game.aid(p, a.target, a.item),
